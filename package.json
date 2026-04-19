@@ -1,0 +1,73 @@
+{
+  "name": "@yawlabs/fetch-mcp",
+  "version": "0.1.0",
+  "description": "Comprehensive HTTP fetch MCP server with SSRF protection, redirect control, HTML-to-markdown conversion, and robots.txt awareness",
+  "license": "MIT",
+  "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    }
+  },
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "bin": {
+    "fetch-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "typecheck": "tsc --noEmit",
+    "test:ci": "npm run build && npm test",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "turndown": "^7.2.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.11",
+    "@types/node": "^25.6.0",
+    "@types/turndown": "^5.0.5",
+    "tsup": "^8.4.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "fetch",
+    "http",
+    "web",
+    "scraping",
+    "markdown",
+    "ssrf",
+    "robots",
+    "mcp-server",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YawLabs/fetch-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YawLabs/fetch-mcp/issues"
+  },
+  "homepage": "https://github.com/YawLabs/fetch-mcp"
+}
