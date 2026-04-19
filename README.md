@@ -10,6 +10,11 @@ A comprehensive HTTP fetch MCP server for AI assistants. Bring-your-own client: 
 | `http_post` / `http_put` / `http_patch` / `http_delete` | Write-method HTTP with JSON or raw body |
 | `fetch_html_to_markdown` | GET a page and convert to clean markdown (3–8× smaller than raw HTML) |
 | `fetch_html_to_text` | GET a page and convert to plain text with block structure preserved |
+| `fetch_reader` | Reader-mode extraction — isolates the article body and returns title + markdown |
+| `fetch_meta` | Extract `<head>` metadata: title, description, OpenGraph, Twitter cards, JSON-LD, feeds, icons |
+| `fetch_links` | Extract every outbound link, resolved to absolute URLs, classified internal/external |
+| `fetch_sitemap` | Parse `sitemap.xml` (including gzipped and sitemap-index chaining) |
+| `fetch_feed` | Parse an RSS 2.0 or Atom 1.0 feed into entries |
 | `fetch_robots` | Parse a site's `robots.txt`, return the verdict for a given path & user-agent |
 
 ## Safety
@@ -116,6 +121,92 @@ GET the URL, strip scripts/styles/iframes/svg/canvas plus `<nav>`, `<footer>`, `
 ### `fetch_html_to_text`
 
 Same fetch, but emits plain text with block-level structure preserved as newlines. Useful when the model doesn't need markdown formatting.
+
+### `fetch_reader`
+
+Isolates the main article body using, in order: `<article>`, `<main>`, `itemprop="articleBody"`, common CMS class names (`post-content`, `entry-content`, etc.), then `<body>` as fallback. Returns:
+
+```ts
+{
+  url: string;          // final URL after redirects
+  title?: string;       // og:title, then <title>, then <h1>
+  byline?: string;      // meta[name=author] / article:author
+  wordCount: number;
+  markdown: string;     // main content converted to markdown
+}
+```
+
+### `fetch_meta`
+
+GET a URL and return its head metadata without downloading the full body (caps at 2 MiB by default):
+
+```ts
+{
+  url: string;
+  title?: string;
+  description?: string;
+  canonical?: string;
+  language?: string;
+  robots?: string;
+  og:      Record<string, string>;     // og:title, og:image, og:type, ...
+  twitter: Record<string, string>;     // twitter:card, twitter:site, ...
+  article: Record<string, string>;     // article:author, article:published_time, ...
+  icons:   Array<{ rel: string; href: string; sizes?: string }>;
+  feeds:   Array<{ href: string; title?: string; type?: string }>;   // RSS/Atom
+  jsonLd:  unknown[];                  // parsed application/ld+json blocks
+}
+```
+
+### `fetch_links`
+
+GET a page and return every `<a href>` with text, resolved to absolute URLs. Respects `<base href>`. Skips `#`, `javascript:`, `mailto:`, `tel:`, `data:`, `file:`. Each link is classified `internal` or `external` vs. the page host. Optional `filter`/`dedupe`/`limit`.
+
+### `fetch_sitemap`
+
+Fetch a `sitemap.xml` or sitemap-index and return the URL list:
+
+```ts
+{
+  sitemaps: string[];       // indexes followed, in order
+  urlCount: number;
+  truncated: boolean;       // hit max_urls
+  urls: Array<{
+    loc: string;
+    lastmod?: string;
+    changefreq?: string;
+    priority?: number;
+  }>;
+}
+```
+
+Gzipped `.xml.gz` sitemaps are auto-decompressed. `max_depth` controls how many levels of sitemap-index to follow (default 1).
+
+### `fetch_feed`
+
+Parse an RSS 2.0 or Atom 1.0 feed:
+
+```ts
+{
+  kind: "rss" | "atom" | "unknown";
+  title?: string;
+  description?: string;
+  link?: string;
+  updated?: string;
+  entryCount: number;
+  truncated: boolean;       // hit limit
+  entries: Array<{
+    title?: string;
+    link?: string;
+    id?: string;
+    published?: string;
+    updated?: string;
+    author?: string;
+    summary?: string;
+    content?: string;
+    categories?: string[];
+  }>;
+}
+```
 
 ### `fetch_robots`
 
