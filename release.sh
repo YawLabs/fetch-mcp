@@ -146,16 +146,26 @@ else
 fi
 
 step 5 "Publish to npm"
-PUBLISHED_VERSION=$(npm view @yawlabs/fetch-mcp version 2>/dev/null || echo "")
-if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
-  info "v${VERSION} already on npm — skipping"
+if [ "$IS_CI" = "true" ]; then
+  npm publish --access public --provenance
+  info "Published @yawlabs/fetch-mcp@${VERSION} (CI, with provenance)"
 else
-  if [ "$IS_CI" = "true" ]; then
-    npm publish --access public --provenance
-  else
-    npm publish --access public
-  fi
-  info "Published @yawlabs/fetch-mcp@${VERSION}"
+  # Local runs never publish directly — the YawLabs hook blocks `npm publish` and
+  # the 2FA-bound local session 404s in headless mode. Wait for release.yml in CI
+  # (fired by the tag push in step 4) to publish instead.
+  info "Waiting for release.yml in CI to publish v${VERSION}..."
+  GATE_MAX=60  # 10 minutes at 10s/poll
+  PUBLISHED_VERSION=""
+  for i in $(seq 1 $GATE_MAX); do
+    PUBLISHED_VERSION=$(npm view @yawlabs/fetch-mcp version 2>/dev/null || echo "")
+    if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
+      info "v${VERSION} live on npm"
+      break
+    fi
+    echo "    npm view latest: ${PUBLISHED_VERSION:-none} (attempt $i/$GATE_MAX)..."
+    sleep 10
+  done
+  [ "$PUBLISHED_VERSION" = "$VERSION" ] || fail "release.yml did not publish v${VERSION} within 10 minutes. Inspect: gh run list --workflow=release.yml --limit 3"
 fi
 
 step 6 "Create GitHub release"
