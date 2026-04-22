@@ -2,7 +2,14 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer as createHttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { httpRequest, setHttpContext } from "../http.js";
+import {
+  decodeBytes,
+  extractCharset,
+  httpRequest,
+  parseRetryAfter,
+  setHttpContext,
+  shouldDecodeAsText,
+} from "../http.js";
 
 setHttpContext({ version: "test" });
 
@@ -32,7 +39,7 @@ function setHandler(h: Handler) {
   handler = h;
 }
 
-describe("httpRequest — SSRF pre-flight", () => {
+describe("httpRequest -- SSRF pre-flight", () => {
   it("blocks non-http schemes", async () => {
     const res = await httpRequest({ method: "GET", url: "file:///etc/passwd" });
     expect(res.ok).toBe(false);
@@ -57,7 +64,7 @@ describe("httpRequest — SSRF pre-flight", () => {
   });
 });
 
-describe("httpRequest — happy path", () => {
+describe("httpRequest -- happy path", () => {
   it("performs a GET and returns status, headers, body", async () => {
     setHandler((_req, res) => {
       res.statusCode = 200;
@@ -179,7 +186,7 @@ describe("httpRequest — happy path", () => {
   });
 });
 
-describe("httpRequest — response size cap", () => {
+describe("httpRequest -- response size cap", () => {
   it("truncates when max_bytes is exceeded", async () => {
     setHandler((_req, res) => {
       res.statusCode = 200;
@@ -213,7 +220,7 @@ describe("httpRequest — response size cap", () => {
   });
 });
 
-describe("httpRequest — redirects", () => {
+describe("httpRequest -- redirects", () => {
   it("follows redirects and records the chain", async () => {
     setHandler((_req, res, url) => {
       if (url.pathname === "/start") {
@@ -254,9 +261,184 @@ describe("httpRequest — redirects", () => {
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/redirects/);
   });
+
+  it("downgrades POST to GET on 303", async () => {
+    let secondMethod = "";
+    let secondBody = "";
+    setHandler((req, res, url) => {
+      if (url.pathname === "/redirect") {
+        res.statusCode = 303;
+        res.setHeader("location", "/target");
+        res.end();
+        return;
+      }
+      secondMethod = req.method ?? "";
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        secondBody = Buffer.concat(chunks).toString("utf8");
+        res.statusCode = 200;
+        res.end("ok");
+      });
+    });
+    const res = await httpRequest({
+      method: "POST",
+      url: `${baseUrl}/redirect`,
+      body: '{"x":1}',
+      contentType: "application/json",
+      allowPrivateHosts: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(secondMethod).toBe("GET");
+    expect(secondBody).toBe("");
+  });
+
+  it("downgrades POST to GET on 301/302 per WHATWG fetch", async () => {
+    let secondMethod = "";
+    setHandler((req, res, url) => {
+      if (url.pathname === "/redirect") {
+        res.statusCode = 302;
+        res.setHeader("location", "/target");
+        res.end();
+        return;
+      }
+      secondMethod = req.method ?? "";
+      res.statusCode = 200;
+      res.end("ok");
+    });
+    const res = await httpRequest({
+      method: "POST",
+      url: `${baseUrl}/redirect`,
+      body: '{"x":1}',
+      contentType: "application/json",
+      allowPrivateHosts: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(secondMethod).toBe("GET");
+  });
+
+  it("preserves POST method and body on 307", async () => {
+    let secondMethod = "";
+    let secondBody = "";
+    setHandler((req, res, url) => {
+      if (url.pathname === "/redirect") {
+        res.statusCode = 307;
+        res.setHeader("location", "/target");
+        res.end();
+        return;
+      }
+      secondMethod = req.method ?? "";
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        secondBody = Buffer.concat(chunks).toString("utf8");
+        res.statusCode = 200;
+        res.end("ok");
+      });
+    });
+    const res = await httpRequest({
+      method: "POST",
+      url: `${baseUrl}/redirect`,
+      body: '{"x":1}',
+      contentType: "application/json",
+      allowPrivateHosts: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(secondMethod).toBe("POST");
+    expect(secondBody).toBe('{"x":1}');
+  });
 });
 
-describe("httpRequest — timeout", () => {
+describe("httpRequest -- cross-origin auth leakage", () => {
+  it("strips Authorization from bearerToken on cross-origin redirect", async () => {
+    // First server sends a redirect to a second server on a different port.
+    let secondServer: Server;
+    let secondAuth: string | undefined;
+    await new Promise<void>((resolve) => {
+      secondServer = createHttpServer((req, res) => {
+        secondAuth = req.headers.authorization;
+        res.statusCode = 200;
+        res.end("landed");
+      });
+      secondServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    try {
+      const secondAddr = secondServer!.address() as AddressInfo;
+      const secondUrl = `http://127.0.0.1:${secondAddr.port}`;
+      setHandler((_req, res) => {
+        res.statusCode = 302;
+        res.setHeader("location", secondUrl);
+        res.end();
+      });
+      const res = await httpRequest({
+        method: "GET",
+        url: baseUrl,
+        bearerToken: "sk-secret",
+        allowPrivateHosts: true,
+      });
+      expect(res.ok).toBe(true);
+      expect(secondAuth).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => secondServer!.close(() => resolve()));
+    }
+  });
+
+  it("preserves Authorization on same-origin redirect", async () => {
+    let secondAuth: string | undefined;
+    setHandler((req, res, url) => {
+      if (url.pathname === "/start") {
+        res.statusCode = 302;
+        res.setHeader("location", "/next");
+        res.end();
+        return;
+      }
+      secondAuth = req.headers.authorization;
+      res.statusCode = 200;
+      res.end("ok");
+    });
+    const res = await httpRequest({
+      method: "GET",
+      url: `${baseUrl}/start`,
+      bearerToken: "sk-secret",
+      allowPrivateHosts: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(secondAuth).toBe("Bearer sk-secret");
+  });
+
+  it("strips Authorization from custom headers on cross-origin", async () => {
+    let secondServer: Server;
+    let secondAuth: string | undefined;
+    await new Promise<void>((resolve) => {
+      secondServer = createHttpServer((req, res) => {
+        secondAuth = req.headers.authorization;
+        res.statusCode = 200;
+        res.end("landed");
+      });
+      secondServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    try {
+      const secondAddr = secondServer!.address() as AddressInfo;
+      const secondUrl = `http://127.0.0.1:${secondAddr.port}`;
+      setHandler((_req, res) => {
+        res.statusCode = 302;
+        res.setHeader("location", secondUrl);
+        res.end();
+      });
+      await httpRequest({
+        method: "GET",
+        url: baseUrl,
+        headers: { Authorization: "Basic abc=" },
+        allowPrivateHosts: true,
+      });
+      expect(secondAuth).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => secondServer!.close(() => resolve()));
+    }
+  });
+});
+
+describe("httpRequest -- timeout", () => {
   it("aborts when the server is slow", async () => {
     setHandler(() => {
       // never respond
@@ -272,7 +454,7 @@ describe("httpRequest — timeout", () => {
   });
 });
 
-describe("httpRequest — retries", () => {
+describe("httpRequest -- retries", () => {
   it("retries on 503 and eventually succeeds", async () => {
     let count = 0;
     setHandler((_req, res) => {
@@ -310,9 +492,65 @@ describe("httpRequest — retries", () => {
     expect(res.ok).toBe(false);
     expect(res.status).toBe(503);
   });
+
+  it("resets redirect chain between retry attempts", async () => {
+    let attempt = 0;
+    setHandler((_req, res, url) => {
+      if (url.pathname === "/start") {
+        res.statusCode = 302;
+        res.setHeader("location", "/target");
+        res.end();
+        return;
+      }
+      attempt++;
+      if (attempt < 2) {
+        res.statusCode = 503;
+        res.end("retry me");
+      } else {
+        res.statusCode = 200;
+        res.end("final");
+      }
+    });
+    const res = await httpRequest({
+      method: "GET",
+      url: `${baseUrl}/start`,
+      retries: 2,
+      allowPrivateHosts: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.bodyText).toBe("final");
+    // After a successful attempt, redirects should reflect only that attempt's hops (exactly one).
+    expect(res.redirects).toHaveLength(1);
+  });
+
+  it("honors Retry-After in seconds form", async () => {
+    let first = 0;
+    let secondAt = 0;
+    setHandler((_req, res) => {
+      const now = Date.now();
+      if (first === 0) {
+        first = now;
+        res.statusCode = 429;
+        res.setHeader("retry-after", "1");
+        res.end("slow down");
+      } else {
+        secondAt = now;
+        res.statusCode = 200;
+        res.end("ok");
+      }
+    });
+    const res = await httpRequest({
+      method: "GET",
+      url: baseUrl,
+      retries: 1,
+      allowPrivateHosts: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(secondAt - first).toBeGreaterThanOrEqual(900);
+  });
 });
 
-describe("httpRequest — HEAD", () => {
+describe("httpRequest -- HEAD", () => {
   it("returns headers without body", async () => {
     setHandler((_req, res) => {
       res.statusCode = 200;
@@ -327,7 +565,7 @@ describe("httpRequest — HEAD", () => {
   });
 });
 
-describe("httpRequest — binary", () => {
+describe("httpRequest -- binary / charset", () => {
   it("returns base64 when decodeText is false", async () => {
     setHandler((_req, res) => {
       res.statusCode = 200;
@@ -342,6 +580,87 @@ describe("httpRequest — binary", () => {
     });
     expect(res.bodyBase64).toBe(Buffer.from([0, 1, 2, 255]).toString("base64"));
     expect(res.bodyText).toBeUndefined();
+  });
+
+  it("auto-mode returns base64 for binary content types", async () => {
+    setHandler((_req, res) => {
+      res.statusCode = 200;
+      res.setHeader("content-type", "image/png");
+      res.end(Buffer.from([137, 80, 78, 71]));
+    });
+    const res = await httpRequest({ method: "GET", url: baseUrl, allowPrivateHosts: true });
+    expect(res.bodyBase64).toBe(Buffer.from([137, 80, 78, 71]).toString("base64"));
+    expect(res.bodyText).toBeUndefined();
+  });
+
+  it("auto-mode returns text for text/html", async () => {
+    setHandler((_req, res) => {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.end("<p>hi</p>");
+    });
+    const res = await httpRequest({ method: "GET", url: baseUrl, allowPrivateHosts: true });
+    expect(res.bodyText).toBe("<p>hi</p>");
+  });
+
+  it("decodes iso-8859-1 bodies", async () => {
+    setHandler((_req, res) => {
+      res.statusCode = 200;
+      res.setHeader("content-type", "text/html; charset=iso-8859-1");
+      // 0xE9 = 'é' in iso-8859-1
+      res.end(Buffer.from([0x63, 0x61, 0x66, 0xe9])); // café
+    });
+    const res = await httpRequest({ method: "GET", url: baseUrl, allowPrivateHosts: true });
+    expect(res.bodyText).toBe("café");
+  });
+});
+
+describe("helpers", () => {
+  it("shouldDecodeAsText picks right category", () => {
+    expect(shouldDecodeAsText("text/html")).toBe(true);
+    expect(shouldDecodeAsText("text/plain; charset=utf-8")).toBe(true);
+    expect(shouldDecodeAsText("application/json")).toBe(true);
+    expect(shouldDecodeAsText("application/vnd.api+json")).toBe(true);
+    expect(shouldDecodeAsText("application/xml")).toBe(true);
+    expect(shouldDecodeAsText("application/atom+xml")).toBe(true);
+    expect(shouldDecodeAsText("application/javascript")).toBe(true);
+    expect(shouldDecodeAsText("application/x-www-form-urlencoded")).toBe(true);
+    expect(shouldDecodeAsText("application/octet-stream")).toBe(false);
+    expect(shouldDecodeAsText("image/png")).toBe(false);
+    expect(shouldDecodeAsText("application/pdf")).toBe(false);
+  });
+
+  it("extractCharset reads from Content-Type", () => {
+    expect(extractCharset("text/html; charset=utf-8")).toBe("utf-8");
+    expect(extractCharset("text/html; charset=ISO-8859-1")).toBe("iso-8859-1");
+    expect(extractCharset('text/html; charset="utf-8"')).toBe("utf-8");
+    expect(extractCharset("text/html")).toBe("utf-8");
+  });
+
+  it("decodeBytes falls back to utf-8 on unknown label", () => {
+    const bytes = Buffer.from("hi", "utf8");
+    expect(decodeBytes(bytes, "text/html; charset=not-a-real-charset")).toBe("hi");
+  });
+
+  it("parseRetryAfter accepts seconds", () => {
+    expect(parseRetryAfter("5")).toBe(5000);
+    expect(parseRetryAfter("0")).toBe(0);
+  });
+
+  it("parseRetryAfter accepts HTTP-date", () => {
+    const now = Date.parse("2026-04-21T12:00:00Z");
+    const then = "Tue, 21 Apr 2026 12:00:05 GMT";
+    expect(parseRetryAfter(then, now)).toBe(5000);
+  });
+
+  it("parseRetryAfter clamps to 60 seconds", () => {
+    expect(parseRetryAfter("600")).toBe(60_000);
+  });
+
+  it("parseRetryAfter returns undefined on garbage", () => {
+    expect(parseRetryAfter("not-a-delay")).toBeUndefined();
+    expect(parseRetryAfter(undefined)).toBeUndefined();
+    expect(parseRetryAfter("")).toBeUndefined();
   });
 });
 

@@ -101,6 +101,46 @@ describe("parseFeedXml — Atom 1.0", () => {
   });
 });
 
+describe("parseFeedXml — Atom content types", () => {
+  it("preserves content type=html", () => {
+    const xml = `<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>F</title>
+  <entry>
+    <title>E</title>
+    <content type="html">&lt;p&gt;hi&lt;/p&gt;</content>
+  </entry>
+</feed>`;
+    const parsed = parseFeedXml(xml);
+    expect(parsed.entries[0]?.contentType).toBe("html");
+    expect(parsed.entries[0]?.content).toContain("<p>hi</p>");
+  });
+
+  it("preserves content type=text", () => {
+    const xml = `<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>F</title>
+  <entry>
+    <title>E</title>
+    <content type="text">plain</content>
+  </entry>
+</feed>`;
+    const parsed = parseFeedXml(xml);
+    expect(parsed.entries[0]?.contentType).toBe("text");
+    expect(parsed.entries[0]?.content).toBe("plain");
+  });
+
+  it("does not set contentType for RSS entries", () => {
+    const xml = `<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>X</title>
+  <item><title>One</title><description>plain rss</description></item>
+</channel></rss>`;
+    const parsed = parseFeedXml(xml);
+    expect(parsed.entries[0]?.contentType).toBeUndefined();
+  });
+});
+
 describe("parseFeedXml — edge cases", () => {
   it("returns kind=unknown for non-feed XML", () => {
     const parsed = parseFeedXml('<?xml version="1.0"?><root/>');

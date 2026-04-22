@@ -38,6 +38,32 @@ describe("parseHtmlMeta", () => {
     });
   });
 
+  it("keeps first og value in `og` and all values in `ogAll`", () => {
+    const html = `
+      <head>
+        <meta property="og:image" content="https://ex.com/one.png">
+        <meta property="og:image" content="https://ex.com/two.png">
+        <meta property="og:image" content="https://ex.com/three.png">
+      </head>
+    `;
+    const meta = parseHtmlMeta(html, "https://example.com/");
+    expect(meta.og.image).toBe("https://ex.com/one.png");
+    expect(meta.ogAll.image).toEqual(["https://ex.com/one.png", "https://ex.com/two.png", "https://ex.com/three.png"]);
+  });
+
+  it("only populates *All for repeated keys (single-value keys omitted)", () => {
+    const html = `
+      <head>
+        <meta property="og:title" content="Solo">
+        <meta property="og:image" content="a.png">
+        <meta property="og:image" content="b.png">
+      </head>
+    `;
+    const meta = parseHtmlMeta(html, "https://example.com/");
+    expect("title" in meta.ogAll).toBe(false);
+    expect(meta.ogAll.image).toEqual(["a.png", "b.png"]);
+  });
+
   it("extracts Twitter card properties", () => {
     const html = `
       <head>
@@ -134,5 +160,20 @@ describe("parseHtmlMeta", () => {
     const meta = parseHtmlMeta(html, "https://example.com/");
     expect(meta.title).toBe("A & B");
     expect(meta.description).toBe("Prices < 100");
+  });
+
+  it("preserves '>' characters inside quoted meta content", () => {
+    // The old regex stopped at the first `>` and lost the rest of the tag.
+    const html = `<head><meta name="description" content="Best reviews > 4 stars and <100ms"></head>`;
+    const meta = parseHtmlMeta(html, "https://example.com/");
+    expect(meta.description).toBe("Best reviews > 4 stars and <100ms");
+  });
+
+  it("does not break when a meta tag attribute contains '>' before other attrs", () => {
+    const html = `<head><meta property="og:description" content="arrow > pointing" >
+      <meta property="og:title" content="Real title"></head>`;
+    const meta = parseHtmlMeta(html, "https://example.com/");
+    expect(meta.og.description).toBe("arrow > pointing");
+    expect(meta.og.title).toBe("Real title");
   });
 });

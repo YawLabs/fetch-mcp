@@ -17,6 +17,8 @@ export interface ParsedSitemap {
   childSitemaps: string[];
 }
 
+const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
+
 /**
  * Decode a sitemap byte payload. Many sitemaps are served gzipped, either via
  * Content-Encoding (which node fetch unwraps) or as a .xml.gz file served with
@@ -65,10 +67,15 @@ export function parseSitemapXml(xml: string): ParsedSitemap {
   return { urls, childSitemaps };
 }
 
+interface SitemapWarning {
+  url: string;
+  error: string;
+}
+
 export function registerSitemapTools(server: McpServer) {
   server.tool(
     "fetch_sitemap",
-    "Fetch a sitemap.xml (or sitemap-index) and return the contained URLs with their lastmod / changefreq / priority. Follows sitemap-index chaining up to max_depth levels. Gzipped .xml.gz payloads are auto-decompressed. SSRF-protected by default.",
+    "Fetch a sitemap.xml (or sitemap-index) and return the contained URLs with their lastmod / changefreq / priority. Follows sitemap-index chaining up to max_depth levels. Gzipped .xml.gz payloads are auto-decompressed. Partial failures (one child sitemap 500s while others work) are returned under 'warnings' without aborting the whole request. SSRF-protected by default.",
     {
       url: z.string().url().describe("Sitemap URL (sitemap.xml, sitemap.xml.gz, or a sitemap index)"),
       max_depth: z
@@ -77,19 +84,31 @@ export function registerSitemapTools(server: McpServer) {
         .min(0)
         .max(3)
         .optional()
-        .describe("How many sitemap-index levels to follow (default 1)"),
+        .describe(
+          "How many sitemap-index levels to follow (default 1). 0 keeps the top-level index flat and only returns its childSitemaps list.",
+        ),
       max_urls: z.number().int().min(1).max(50_000).optional().describe("Cap on total URLs returned (default 5000)"),
+      max_bytes: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Max bytes to read per sitemap response (default 20MiB)"),
       timeout_ms: z.number().int().positive().max(60_000).optional(),
+      max_redirects: z.number().int().min(0).max(20).optional(),
       allow_private_hosts: z.boolean().optional(),
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, max_depth, max_urls, timeout_ms, allow_private_hosts, user_agent }) => {
+    async ({ url, max_depth, max_urls, max_bytes, timeout_ms, max_redirects, allow_private_hosts, user_agent }) => {
       const depth = max_depth ?? 1;
       const cap = max_urls ?? 5000;
+      const byteCap = max_bytes ?? DEFAULT_MAX_BYTES;
       const seen = new Set<string>();
       const allUrls: SitemapUrl[] = [];
       const visitedIndexes: string[] = [];
+      const unvisitedChildren: string[] = [];
+      const warnings: SitemapWarning[] = [];
 
       const fetchOne = async (
         u: string,
@@ -98,7 +117,8 @@ export function registerSitemapTools(server: McpServer) {
           method: "GET",
           url: u,
           timeoutMs: timeout_ms,
-          maxBytes: 20 * 1024 * 1024,
+          maxBytes: byteCap,
+          maxRedirects: max_redirects,
           allowPrivateHosts: allow_private_hosts,
           userAgent: user_agent,
           decodeText: false,
@@ -122,15 +142,25 @@ export function registerSitemapTools(server: McpServer) {
         if (seen.has(next.url)) continue;
         seen.add(next.url);
         const result = await fetchOne(next.url);
-        if (!result.ok) return formatError(`${next.url}: ${result.error}`);
+        if (!result.ok) {
+          // If the very first fetch fails, the whole tool is meaningless -- surface as error.
+          if (visitedIndexes.length === 0 && allUrls.length === 0) {
+            return formatError(`${next.url}: ${result.error}`);
+          }
+          warnings.push({ url: next.url, error: result.error });
+          continue;
+        }
         visitedIndexes.push(next.url);
         for (const child of result.parsed.urls) {
           if (allUrls.length >= cap) break;
           allUrls.push(child);
         }
-        if (next.depth < depth) {
-          for (const c of result.parsed.childSitemaps) {
-            if (!seen.has(c)) queue.push({ url: c, depth: next.depth + 1 });
+        for (const c of result.parsed.childSitemaps) {
+          if (seen.has(c)) continue;
+          if (next.depth < depth) {
+            queue.push({ url: c, depth: next.depth + 1 });
+          } else {
+            unvisitedChildren.push(c);
           }
         }
       }
@@ -139,6 +169,8 @@ export function registerSitemapTools(server: McpServer) {
         urlCount: allUrls.length,
         truncated: allUrls.length >= cap,
         urls: allUrls,
+        childSitemaps: unvisitedChildren,
+        warnings,
       });
     },
   );

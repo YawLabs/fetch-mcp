@@ -46,21 +46,23 @@ export function stripHtmlToText(html: string): string {
     .trim();
 }
 
+const commonPageSchema = {
+  url: z.string().url().describe("URL to fetch"),
+  timeout_ms: z.number().int().positive().max(120_000).optional().describe("Request timeout in ms (default 10000)"),
+  max_bytes: z.number().int().positive().optional().describe("Max response size in bytes (default 5MiB)"),
+  max_redirects: z.number().int().min(0).max(20).optional().describe("Max redirect hops (default 5)"),
+  allow_private_hosts: z
+    .boolean()
+    .optional()
+    .describe("Allow loopback / private / link-local addresses (default false)"),
+  user_agent: z.string().optional().describe("User-Agent override"),
+};
+
 export function registerContentTools(server: McpServer) {
   server.tool(
     "fetch_html_to_markdown",
-    "GET a URL, decode the HTML, and convert to clean markdown (headings, lists, links, code fences). Scripts, styles, iframes, nav, footer, and aside elements are stripped. Intended for feeding web pages into an LLM cheaply — markdown is usually 3–8× smaller than raw HTML. Follows redirects, respects size/timeout limits, and blocks private-host requests by default.",
-    {
-      url: z.string().url().describe("URL to fetch"),
-      timeout_ms: z.number().int().positive().max(120_000).optional().describe("Request timeout in ms (default 10000)"),
-      max_bytes: z.number().int().positive().optional().describe("Max response size in bytes (default 5MiB)"),
-      max_redirects: z.number().int().min(0).max(20).optional().describe("Max redirect hops (default 5)"),
-      allow_private_hosts: z
-        .boolean()
-        .optional()
-        .describe("Allow loopback / private / link-local addresses (default false)"),
-      user_agent: z.string().optional().describe("User-Agent override"),
-    },
+    "GET a URL, decode the HTML, and convert to clean markdown (headings, lists, links, code fences). Scripts, styles, iframes, nav, footer, and aside elements are stripped. Intended for feeding web pages into an LLM cheaply -- markdown is usually 3-8x smaller than raw HTML. Follows redirects, respects size/timeout limits, and blocks private-host requests by default.",
+    commonPageSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
       const res = await httpRequest({
@@ -88,14 +90,7 @@ export function registerContentTools(server: McpServer) {
   server.tool(
     "fetch_html_to_text",
     "GET a URL, decode the HTML, and return plain text with block-level structure preserved as newlines. Scripts, styles, and comments stripped; HTML entities decoded. Lighter than markdown when you only need the reading content.",
-    {
-      url: z.string().url().describe("URL to fetch"),
-      timeout_ms: z.number().int().positive().max(120_000).optional(),
-      max_bytes: z.number().int().positive().optional(),
-      max_redirects: z.number().int().min(0).max(20).optional(),
-      allow_private_hosts: z.boolean().optional(),
-      user_agent: z.string().optional(),
-    },
+    commonPageSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
       const res = await httpRequest({

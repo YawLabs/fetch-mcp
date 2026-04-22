@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import { httpRequest } from "../http.js";
+import { decodeHtmlEntities, findTags, parseAttrs } from "./html.js";
 
 export interface ExtractedLink {
   href: string;
@@ -11,58 +12,36 @@ export interface ExtractedLink {
   type: "internal" | "external";
 }
 
-function decodeHtmlEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h: string) => {
-      const n = Number.parseInt(h, 16);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : "";
-    })
-    .replace(/&#(\d+);/g, (_, d: string) => {
-      const n = Number.parseInt(d, 10);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : "";
-    });
-}
-
-function parseAttrs(s: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
-  const re = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"'`]+))/g;
-  for (const m of s.matchAll(re)) {
-    attrs[m[1]!.toLowerCase()] = decodeHtmlEntities(m[2] ?? m[3] ?? m[4] ?? "");
-  }
-  return attrs;
+/** Strip a single leading `www.` for internal/external comparison. */
+function normalizeHost(h: string): string {
+  const lower = h.toLowerCase();
+  return lower.startsWith("www.") ? lower.slice(4) : lower;
 }
 
 export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
-  // Respect <base href="..."> if present
-  const baseTag = html.match(/<base\s+[^>]*\bhref\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>"'`]+))/i);
-  const baseHref = baseTag ? (baseTag[1] ?? baseTag[2] ?? baseTag[3]) : undefined;
   let base = baseUrl;
-  if (baseHref) {
-    try {
-      base = new URL(baseHref, baseUrl).toString();
-    } catch {
-      // fall back to baseUrl
+  for (const baseTag of findTags(html, "base")) {
+    const attrs = parseAttrs(baseTag.attrsText);
+    if (attrs.href) {
+      try {
+        base = new URL(attrs.href, baseUrl).toString();
+      } catch {
+        /* ignore */
+      }
     }
+    break;
   }
 
-  let baseHost: string;
+  let baseHost = "";
   try {
-    baseHost = new URL(base).host;
+    baseHost = normalizeHost(new URL(base).host);
   } catch {
-    baseHost = "";
+    /* no baseHost -- everything classified external */
   }
 
   const links: ExtractedLink[] = [];
-  const re = /<a\b([^>]*?)>([\s\S]*?)<\/a>/gi;
-  for (const m of html.matchAll(re)) {
-    const attrs = parseAttrs(m[1]!);
+  for (const tag of findTags(html, "a")) {
+    const attrs = parseAttrs(tag.attrsText);
     const href = attrs.href;
     if (!href) continue;
     const trimmed = href.trim();
@@ -84,14 +63,18 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
       continue;
     }
 
-    const text = m[2]!
+    // Extract inner text: find the end of this <a> by searching from contentStart
+    // for the next </a>. Keep it simple -- nested <a> is invalid HTML.
+    const closeIdx = html.toLowerCase().indexOf("</a>", tag.contentStart);
+    const innerHtml = closeIdx >= 0 ? html.slice(tag.contentStart, closeIdx) : "";
+    const text = innerHtml
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
     let host: string;
     try {
-      host = new URL(abs).host;
+      host = normalizeHost(new URL(abs).host);
     } catch {
       continue;
     }
@@ -111,7 +94,7 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
 export function registerLinksTools(server: McpServer) {
   server.tool(
     "fetch_links",
-    "Extract every outbound link from an HTML page, resolved to absolute URLs. Each entry includes href, anchor text, optional rel/title, and an internal/external classification based on matching the page host. Anchors (#), javascript:, mailto:, tel:, data:, and file: URIs are skipped. Respects <base href>.",
+    "Extract every outbound link from an HTML page, resolved to absolute URLs. Each entry includes href, anchor text, optional rel/title, and an internal/external classification (bare-domain and www. treated as the same host). Anchors (#), javascript:, mailto:, tel:, data:, and file: URIs are skipped. Respects <base href>.",
     {
       url: z.string().url(),
       timeout_ms: z.number().int().positive().max(60_000).optional(),

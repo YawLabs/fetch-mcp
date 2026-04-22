@@ -34,6 +34,28 @@ describe("extractLinks", () => {
     expect(links[1]?.type).toBe("external");
   });
 
+  it("treats www.site.com as internal when page host is site.com", () => {
+    const html = `
+      <a href="https://www.site.com/a">A</a>
+      <a href="https://site.com/b">B</a>
+      <a href="https://other.com/c">C</a>
+    `;
+    const links = extractLinks(html, "https://site.com/");
+    expect(links[0]?.type).toBe("internal");
+    expect(links[1]?.type).toBe("internal");
+    expect(links[2]?.type).toBe("external");
+  });
+
+  it("treats site.com as internal when page host is www.site.com", () => {
+    const html = `
+      <a href="https://site.com/a">A</a>
+      <a href="https://www.site.com/b">B</a>
+    `;
+    const links = extractLinks(html, "https://www.site.com/");
+    expect(links[0]?.type).toBe("internal");
+    expect(links[1]?.type).toBe("internal");
+  });
+
   it("skips javascript:, mailto:, tel:, data:, file:, and fragment links", () => {
     const html = `
       <a href="#section">Anchor</a>
@@ -80,6 +102,14 @@ describe("extractLinks", () => {
     const html = `<a href="/a">A &amp; B</a>`;
     const links = extractLinks(html, "https://site.com/");
     expect(links[0]?.text).toBe("A & B");
+  });
+
+  it("preserves '>' inside quoted href and title attributes", () => {
+    const html = `<a href="/search?q=a>b" title="greater > than">link</a>`;
+    const links = extractLinks(html, "https://site.com/");
+    expect(links).toHaveLength(1);
+    expect(links[0]?.href).toBe("https://site.com/search?q=a%3Eb");
+    expect(links[0]?.title).toBe("greater > than");
   });
 
   it("returns an empty array when no anchors exist", () => {

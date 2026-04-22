@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/fetch-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Comprehensive HTTP fetch MCP server: SSRF protection, HTML-to-markdown, reader-mode, metadata / link / sitemap / RSS-Atom extraction, robots.txt verdicts",
   "license": "MIT",
   "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
@@ -38,6 +38,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "fast-xml-parser": "^5.7.1",
     "turndown": "^7.2.1",
+    "undici": "^8.1.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

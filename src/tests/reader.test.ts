@@ -120,4 +120,37 @@ describe("isolateMainContent", () => {
     expect(content).toContain("real content");
     expect(content).not.toContain("Short");
   });
+
+  it("picks the longest <article> when multiple cards exist", () => {
+    const shortCard =
+      "<p>Card 1. Has enough padding text to barely squeeze past the two hundred character minimum that otherwise filters short navigation style decoys. Short intro only.</p>";
+    const longArticle =
+      "<p>The real article body is substantially longer than any single card preview and carries the full narrative that a reader would want extracted. It comfortably clears the two-hundred-character threshold and represents the true main content of the page.</p><p>With a second paragraph to make the length difference obvious.</p>";
+    const html = `
+      <section>
+        <article>${shortCard}</article>
+        <article>${shortCard}</article>
+      </section>
+      <article>${longArticle}</article>
+    `;
+    const content = isolateMainContent(html);
+    expect(content).toContain("real article body");
+    expect(content).not.toContain("Card 1.");
+  });
+
+  it("handles nested <article> tags without truncating at the inner closer", () => {
+    const html = `
+      <article>
+        <h1>Outer</h1>
+        <article>
+          <p>This is an embedded card article whose closing tag must not be treated as the outer article's closer. The page should still extract the outer body in full including this nested piece as part of its content.</p>
+        </article>
+        <p>Trailing paragraph of the outer article that lives after the nested article closes. The block needs to be more than two hundred characters so the candidate passes the length threshold.</p>
+      </article>
+    `;
+    const content = isolateMainContent(html);
+    expect(content).toContain("Outer");
+    expect(content).toContain("Trailing paragraph");
+    expect(content).toContain("embedded card article");
+  });
 });

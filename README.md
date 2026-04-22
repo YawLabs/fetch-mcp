@@ -31,7 +31,7 @@ SSRF protection is on by default. The server refuses requests to:
 - Non-`http`/`https` schemes (`file://`, `gopher://`, `javascript:`, …)
 - Hostname `localhost` and any `*.localhost`
 
-DNS is resolved once per redirect hop and the same check runs on every hop, so a 302 to `http://127.0.0.1` through a public host gets caught. Set `allow_private_hosts: true` per-request when you really do need internal access (e.g. development).
+DNS is resolved once per redirect hop, every returned address is checked, and the verified IP is pinned into the HTTP dispatcher so the subsequent TCP connection dials that exact address — closing the DNS-rebinding TOCTOU window. `Authorization` headers are stripped on cross-origin redirects. A 302 to `http://127.0.0.1` through a public host gets caught. Set `allow_private_hosts: true` per-request when you really do need internal access (e.g. development).
 
 ## Install & run
 
@@ -85,7 +85,7 @@ Common parameters:
 | `basic_auth` | `{username,password}` | — | Injects `Authorization: Basic …` |
 | `bearer_token` | string | — | Injects `Authorization: Bearer …` |
 | `allow_private_hosts` | bool | `false` | Bypass SSRF block |
-| `decode_text` | bool | `true` | `false` returns `body_base64` instead of `body_text` |
+| `decode_text` | bool | *auto* | When unset, auto-detects by response Content-Type (text for text/*, JSON, XML, JS, form-urlencoded; binary otherwise). Set explicitly `true` to force text decoding, `false` to force base64 in `body_base64`. |
 
 Body-capable tools (POST/PUT/PATCH/DELETE) also take:
 
@@ -148,12 +148,15 @@ GET a URL and return its head metadata without downloading the full body (caps a
   canonical?: string;
   language?: string;
   robots?: string;
-  og:      Record<string, string>;     // og:title, og:image, og:type, ...
-  twitter: Record<string, string>;     // twitter:card, twitter:site, ...
-  article: Record<string, string>;     // article:author, article:published_time, ...
+  og:      Record<string, string>;       // first value per key (og:title, og:image, og:type, ...)
+  twitter: Record<string, string>;       // first value per key
+  article: Record<string, string>;       // first value per key
+  ogAll:      Record<string, string[]>;  // only keys that appear > once (e.g. multiple og:image)
+  twitterAll: Record<string, string[]>;
+  articleAll: Record<string, string[]>;
   icons:   Array<{ rel: string; href: string; sizes?: string }>;
   feeds:   Array<{ href: string; title?: string; type?: string }>;   // RSS/Atom
-  jsonLd:  unknown[];                  // parsed application/ld+json blocks
+  jsonLd:  unknown[];                    // parsed application/ld+json blocks
 }
 ```
 
@@ -179,7 +182,7 @@ Fetch a `sitemap.xml` or sitemap-index and return the URL list:
 }
 ```
 
-Gzipped `.xml.gz` sitemaps are auto-decompressed. `max_depth` controls how many levels of sitemap-index to follow (default 1).
+Gzipped `.xml.gz` sitemaps are auto-decompressed. `max_depth` controls how many levels of sitemap-index to follow (default 1). Setting `max_depth: 0` on a sitemap-index returns the index's `childSitemaps` list without fetching any child (useful to discover structure cheaply). Partial failures — one child sitemap 500s while others succeed — are returned under `warnings` rather than aborting the whole call.
 
 ### `fetch_feed`
 
@@ -214,16 +217,19 @@ Fetches `<origin>/robots.txt`, parses it, and returns:
 
 ```ts
 {
-  origin: string;
+  robotsUrl: string;
+  status: number;
+  userAgent: string;
+  path: string;
   allowed: boolean;
-  matchedRule?: string;     // the longest-match Allow/Disallow that decided it
-  crawlDelay?: number;      // from the matched group
-  sitemaps: string[];       // top-level Sitemap: declarations
-  rawRobotsText: string;    // first 512KB
+  matchedRule: string | null;  // the longest-match Allow/Disallow that decided it
+  crawlDelay: number | null;   // from the matched group
+  sitemaps: string[];          // top-level Sitemap: declarations
+  rawRobotsText: string;       // first 512KB
 }
 ```
 
-The parser follows Google's rules: longest match wins, `*` is a wildcard segment, `$` anchors the end of the path, specific user-agent group beats the `*` wildcard group when the UA matches.
+The parser follows Google's rules: longest match wins, `*` is a wildcard segment, `$` anchors the end of the path, specific user-agent group beats the `*` wildcard group when the UA matches (comparison uses the length of the actually-matched agent token, not the group's first agent). Allow beats Disallow on equal-length ties.
 
 ## Development
 

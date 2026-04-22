@@ -13,6 +13,8 @@ export interface FeedEntry {
   author?: string;
   summary?: string;
   content?: string;
+  /** Atom content type (text / html / xhtml) when declared. */
+  contentType?: string;
   categories?: string[];
 }
 
@@ -65,6 +67,20 @@ function extractAtomLink(link: unknown): string | undefined {
     }
   }
   return fallback;
+}
+
+function extractAtomContent(content: unknown): { value?: string; type?: string } {
+  if (typeof content === "string") return { value: content.trim() || undefined };
+  if (content && typeof content === "object") {
+    const o = content as Record<string, unknown>;
+    const type = typeof o["@_type"] === "string" ? (o["@_type"] as string) : undefined;
+    const value = toStr(o);
+    const out: { value?: string; type?: string } = {};
+    if (value) out.value = value;
+    if (type) out.type = type;
+    return out;
+  }
+  return {};
 }
 
 function extractAtomAuthor(author: unknown): string | undefined {
@@ -137,6 +153,7 @@ export function parseFeedXml(xml: string): ParsedFeed {
             return toStr(c);
           })
           .filter((s): s is string => !!s);
+        const { value: contentValue, type: contentType } = extractAtomContent(e.content);
         const entry: FeedEntry = {
           title: toStr(e.title),
           link: extractAtomLink(e.link),
@@ -145,8 +162,9 @@ export function parseFeedXml(xml: string): ParsedFeed {
           updated: toStr(e.updated),
           author: extractAtomAuthor(e.author),
           summary: toStr(e.summary),
-          content: toStr(e.content),
+          content: contentValue,
         };
+        if (contentType) entry.contentType = contentType;
         if (cats.length > 0) entry.categories = cats;
         return entry;
       }),
@@ -159,21 +177,24 @@ export function parseFeedXml(xml: string): ParsedFeed {
 export function registerFeedTools(server: McpServer) {
   server.tool(
     "fetch_feed",
-    "Fetch and parse an RSS 2.0 or Atom 1.0 feed. Returns feed-level metadata (title, description, link, updated) plus a list of entries (title, link, id, published, updated, author, summary, content, categories). Auto-detects RSS vs Atom.",
+    "Fetch and parse an RSS 2.0 or Atom 1.0 feed. Returns feed-level metadata (title, description, link, updated) plus a list of entries (title, link, id, published, updated, author, summary, content, contentType, categories). Auto-detects RSS vs Atom.",
     {
       url: z.string().url(),
       limit: z.number().int().min(1).max(500).optional().describe("Max entries to return (default 50)"),
       timeout_ms: z.number().int().positive().max(60_000).optional(),
+      max_bytes: z.number().int().positive().optional().describe("Max bytes to read (default 10MiB)"),
+      max_redirects: z.number().int().min(0).max(20).optional(),
       allow_private_hosts: z.boolean().optional(),
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, limit, timeout_ms, allow_private_hosts, user_agent }) => {
+    async ({ url, limit, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
       const res = await httpRequest({
         method: "GET",
         url,
         timeoutMs: timeout_ms,
-        maxBytes: 10 * 1024 * 1024,
+        maxBytes: max_bytes ?? 10 * 1024 * 1024,
+        maxRedirects: max_redirects,
         allowPrivateHosts: allow_private_hosts,
         userAgent: user_agent,
         decodeText: true,

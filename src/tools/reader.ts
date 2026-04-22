@@ -3,69 +3,97 @@ import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import { httpRequest } from "../http.js";
 import { makeTurndown, stripHtmlToText } from "./content.js";
+import { decodeHtmlEntities, findBalancedTagContents, findTags, parseAttrs } from "./html.js";
 
-function decodeHtmlEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h: string) => {
-      const n = Number.parseInt(h, 16);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : "";
-    })
-    .replace(/&#(\d+);/g, (_, d: string) => {
-      const n = Number.parseInt(d, 10);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : "";
-    });
+const MIN_CANDIDATE_LENGTH = 200;
+
+/**
+ * Pull out the main article body. Tries, in order:
+ *   1. <article> whose text length passes the 200-char threshold
+ *   2. <main>
+ *   3. element with itemprop="articleBody"
+ *   4. common CMS class names (post-content, entry-content, ...)
+ *   5. <body> as ultimate fallback
+ *
+ * When multiple candidates exist at the same level, the longest one wins
+ * so card lists don't hijack the real article.
+ */
+export function isolateMainContent(html: string): string {
+  const pickLongestAbove = (tag: string): string | null => {
+    const candidates = findBalancedTagContents(html, tag)
+      .map((c) => c.trim())
+      .filter((c) => c.length > MIN_CANDIDATE_LENGTH);
+    if (candidates.length === 0) return null;
+    return candidates.reduce((a, b) => (b.length > a.length ? b : a));
+  };
+
+  const article = pickLongestAbove("article");
+  if (article) return article;
+
+  const main = pickLongestAbove("main");
+  if (main) return main;
+
+  const itemprop = findAttrContainerContent(html, /\bitemprop\s*=\s*["']articleBody["']/i);
+  if (itemprop && itemprop.length > MIN_CANDIDATE_LENGTH) return itemprop;
+
+  const cms = findAttrContainerContent(
+    html,
+    /\bclass\s*=\s*["'][^"']*\b(?:post-content|entry-content|article-content|article-body|story-body|article__body|markdown-body)\b[^"']*["']/i,
+  );
+  if (cms && cms.length > MIN_CANDIDATE_LENGTH) return cms;
+
+  const body = findBalancedTagContents(html, "body")[0];
+  if (body) return body;
+  return html;
 }
 
 /**
- * Pull out the main article body from an HTML document. Tries, in order:
- *  1. <article> (schema.org/HTML5)
- *  2. <main>
- *  3. element with itemprop="articleBody"
- *  4. common CMS class names (post-content, entry-content, article-body, etc.)
- *  5. the densest <div>/<section> — heuristic: the node with the largest text/markup ratio
- *  6. <body> as ultimate fallback
+ * Find the balanced content of the first element whose opening tag's attribute
+ * section satisfies `attrPredicate`. Looks at div, section, article, main --
+ * the tags that typically host article-body markers.
  */
-export function isolateMainContent(html: string): string {
-  const candidates: RegExp[] = [
-    /<article\b[^>]*>([\s\S]*?)<\/article>/i,
-    /<main\b[^>]*>([\s\S]*?)<\/main>/i,
-    /<[a-z]+\b[^>]*\bitemprop\s*=\s*["']articleBody["'][^>]*>([\s\S]*?)<\/[a-z]+>/i,
-    /<[a-z]+\b[^>]*\bclass\s*=\s*["'][^"']*\b(?:post-content|entry-content|article-content|article-body|story-body|article__body|markdown-body)\b[^"']*["'][^>]*>([\s\S]*?)<\/[a-z]+>/i,
-  ];
-  for (const re of candidates) {
-    const m = html.match(re);
-    if (m?.[1] && m[1].trim().length > 200) return m[1];
+function findAttrContainerContent(html: string, attrPredicate: RegExp): string | null {
+  const tags = ["div", "section", "article", "main"];
+  let best: { content: string; start: number } | null = null;
+  for (const t of tags) {
+    for (const opener of findTags(html, t)) {
+      if (!attrPredicate.test(opener.attrsText)) continue;
+      const all = findBalancedTagContents(html.slice(opener.start), t);
+      const content = all[0];
+      if (!content) continue;
+      if (!best || content.length > best.content.length) best = { content, start: opener.start };
+    }
   }
-  const body = html.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i);
-  return body ? body[1]! : html;
+  return best?.content ?? null;
 }
 
 export function extractTitle(html: string): string | undefined {
-  const og = html.match(/<meta\b[^>]*\bproperty\s*=\s*["']og:title["'][^>]*\bcontent\s*=\s*["']([^"']+)["']/i);
-  if (og) return decodeHtmlEntities(og[1]!.trim());
-  const ogRev = html.match(/<meta\b[^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*\bproperty\s*=\s*["']og:title["']/i);
-  if (ogRev) return decodeHtmlEntities(ogRev[1]!.trim());
+  for (const tag of findTags(html, "meta")) {
+    const attrs = parseAttrs(tag.attrsText);
+    const property = (attrs.property ?? attrs.name ?? "").toLowerCase();
+    if (property === "og:title" && attrs.content) return decodeHtmlEntities(attrs.content.trim());
+  }
   const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   if (t) return decodeHtmlEntities(t[1]!.trim().replace(/\s+/g, " "));
-  const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-  if (h1) return stripHtmlToText(h1[1]!);
+  const h1Contents = findBalancedTagContents(html, "h1");
+  if (h1Contents.length > 0) {
+    const text = stripHtmlToText(h1Contents[0]!);
+    if (text) return text;
+  }
   return undefined;
 }
 
 export function extractByline(html: string): string | undefined {
-  const author = html.match(/<meta\b[^>]*\bname\s*=\s*["']author["'][^>]*\bcontent\s*=\s*["']([^"']+)["']/i);
-  if (author) return decodeHtmlEntities(author[1]!.trim());
-  const article = html.match(
-    /<meta\b[^>]*\bproperty\s*=\s*["']article:author["'][^>]*\bcontent\s*=\s*["']([^"']+)["']/i,
-  );
-  if (article) return decodeHtmlEntities(article[1]!.trim());
+  for (const tag of findTags(html, "meta")) {
+    const attrs = parseAttrs(tag.attrsText);
+    const name = (attrs.name ?? "").toLowerCase();
+    if (name === "author" && attrs.content) return decodeHtmlEntities(attrs.content.trim());
+  }
+  for (const tag of findTags(html, "meta")) {
+    const attrs = parseAttrs(tag.attrsText);
+    const property = (attrs.property ?? "").toLowerCase();
+    if (property === "article:author" && attrs.content) return decodeHtmlEntities(attrs.content.trim());
+  }
   return undefined;
 }
 

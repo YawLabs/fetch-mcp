@@ -2,6 +2,40 @@
 
 All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm with OIDC provenance.
 
+## 0.3.0 — 2026-04-21
+
+Hardens the HTTP client, fixes several parser correctness bugs, and rounds out tool-parameter consistency. 155 tests pass; 37 new tests were added to lock in the fixes.
+
+### Security
+
+- **Cross-origin Authorization stripping.** `bearer_token`, `basic_auth`, and any explicit `Authorization` header are now dropped when a redirect crosses origins. Previously a 302 from a trusted host to an attacker-controlled one would resend the bearer token.
+- **DNS-rebinding TOCTOU closed.** Hosts are resolved once via `dns.lookup`, every address is checked, and the verified IP is pinned into an undici dispatcher so the subsequent TCP connection dials that exact IP. Previous behavior let `fetch` do its own lookup that a low-TTL rebinding attack could race.
+- **Request-method downgrade on redirect.** 303 always downgrades to GET and drops the body. 301/302 from POST downgrade to GET per the WHATWG fetch standard. 307/308 preserve method and body.
+- **Retry-loop state reset.** Each retry attempt starts fresh (original URL, original method, empty redirect chain). Previously a retry after N hops would retry against the final URL and append new hops to the old chain, potentially blowing past `max_redirects`.
+
+### Correctness
+
+- **HTML tag parsing tolerates `>` inside quoted attribute values.** `meta`, `link`, `a`, `base`, and article-isolation tags no longer break on `<meta content="reviews > 4 stars">` or `<a href="/search?q=a>b">`.
+- **Nested `<article>` tags.** Reader-mode extraction walks balanced tag pairs with a depth-aware scanner instead of a non-greedy regex, so an inner article card no longer truncates the outer article at the inner's closing tag. When multiple article candidates exist, the longest one wins.
+- **Multiple `og:*` / `twitter:*` / `article:*` values.** Keys that appear more than once (e.g. several `og:image` tags) are now returned under `ogAll` / `twitterAll` / `articleAll` arrays. The single-value `og` / `twitter` / `article` objects retain first-wins semantics.
+- **Robots longest-match across groups.** The agent-specificity comparison now uses the length of the actually-matched agent token, not the group's first-agent length. `googlebot-news` in a multi-agent group no longer loses to a less-specific match. Allow beats Disallow on equal-length ties.
+- **Empty `Disallow:` no longer silently dropped.** Per RFC 9309 an empty Disallow is an explicit no-op marker; the parser now records it even though it doesn't match any path.
+- **Sitemap partial-failure returns warnings.** When a sitemap-index contains one child that 500s and others that succeed, the tool returns what it could parse plus a `warnings` array, instead of aborting the whole request. The top-level fetch still errors as before.
+- **Sitemap `max_depth: 0` exposes `childSitemaps`.** Calling the tool against an index with `max_depth: 0` now returns the list of children it won't fetch, so callers can discover structure without committing to a full crawl.
+- **`www.` vs bare host link classification.** `extractLinks` normalizes away a leading `www.` before the internal/external comparison, so `https://site.com/x` and `https://www.site.com/y` classify as internal when the page host is either form.
+
+### Ergonomics
+
+- **`decode_text` auto-detection.** When unset, the client now inspects the response `Content-Type`: text/* / JSON / XML / form-urlencoded return `body_text`, everything else returns `body_base64`. The README's "auto" behavior is real now. Explicit `true` / `false` still force a specific mode.
+- **Charset-aware text decoding.** Bodies declared as `charset=iso-8859-1` (or any other TextDecoder-supported label) are decoded with that encoding. Falls back to UTF-8 when the label is missing or unrecognized.
+- **`Retry-After` HTTP-date form accepted.** Previously only delta-seconds worked; HTTP-date values silently fell back to exponential backoff. Both now work and are clamped to ≤60s.
+- **Atom entries expose `contentType`.** `<content type="html">` / `text` / `xhtml` is preserved on each entry so consumers can tell markup from plain text.
+- **Uniform tool parameters.** `fetch_meta`, `fetch_feed`, `fetch_sitemap`, `fetch_robots` all accept `max_redirects` and (where applicable) `max_bytes` + `allow_private_hosts`. Previously an LLM that learned the parameter from `http_get` would get a zod error when using it on a different tool.
+
+### Performance
+
+- **Response body drain on HEAD and redirect.** HEAD responses and 3xx bodies are now cancelled via `body.cancel()` instead of buffered into memory. A hostile 302 with a giant body can no longer balloon the process.
+
 ## 0.2.0 — 2026-04-19
 
 Fifteen tools total (up from ten). The five new tools make this a full "web understanding" server rather than just an HTTP client — agents can read pages, extract structure, and discover content with per-tool-bounded responses that don't blow the context budget.

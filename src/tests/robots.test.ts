@@ -60,6 +60,17 @@ Disallow: /
     const parsed = parseRobots(text);
     expect(parsed.groups[0]?.crawlDelay).toBe(10);
   });
+
+  it("preserves empty Disallow as no-op", () => {
+    const text = `User-agent: Bot
+Disallow:
+`;
+    const parsed = parseRobots(text);
+    // Rule is recorded (spec-compliant) but it must not match any real path.
+    expect(parsed.groups[0]?.rules).toHaveLength(1);
+    expect(parsed.groups[0]?.rules[0]?.path).toBe("");
+    expect(isAllowed(parsed, "Bot", "/anything").allowed).toBe(true);
+  });
 });
 
 describe("isAllowed", () => {
@@ -108,5 +119,29 @@ Disallow: /
   it("returns allowed=true when no group matches at all", () => {
     const r = parseRobots("");
     expect(isAllowed(r, "Bot", "/").allowed).toBe(true);
+  });
+
+  it("picks the group matching the longest specific UA token, not the group's first agent", () => {
+    // Two groups both match "googlebot-news". The old code compared against
+    // the group's first-agent length and picked the wrong group.
+    const text = `User-agent: googlebot
+User-agent: bingbot
+Disallow: /wrong
+
+User-agent: googlebot-news
+Disallow: /right
+`;
+    const r = parseRobots(text);
+    const v = isAllowed(r, "Googlebot-News/1.0", "/right/page");
+    expect(v.allowed).toBe(false);
+    expect(v.rule).toContain("/right");
+  });
+
+  it("Allow beats Disallow when paths are the same length", () => {
+    const r = parseRobots(`User-agent: *
+Disallow: /x
+Allow: /x
+`);
+    expect(isAllowed(r, "Bot", "/x").allowed).toBe(true);
   });
 });
