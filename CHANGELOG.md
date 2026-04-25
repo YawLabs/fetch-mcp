@@ -1,6 +1,21 @@
 # Changelog
 
-All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org) and a CI-gated release flow: pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which publishes to npm with OIDC provenance.
+All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship from `release.sh` running locally -- there is no CI.
+
+## 0.3.1 — 2026-04-24
+
+Security patch. No API changes; existing callers can upgrade in place.
+
+### Security
+
+- **Closed `fe80::/10` IPv6 SSRF gap.** The IPv6 block list used a string-prefix check with `"fe80"`, which only catches `fe80::/16`. The full link-local range is `fe80::-febf::`, so addresses like `fe85::1`, `fe9*::1`, `fea0::1`, `febf::1` were not blocked. The check now parses IPv6 to its 16 raw bytes and applies bit-level range tests for all reserved prefixes.
+- **Closed hex-form IPv4-mapped bypass.** `::ffff:127.0.0.1` was caught by a dotted-quad regex, but `::ffff:7f00:1` (the same address in hex form) was not -- a caller who knew the hex encoding could route around the v4 block list. IPv4-mapped detection now runs on the parsed bytes, so any textual form is normalized before the embedded v4 is re-checked.
+
+### Internal
+
+- Removed GitHub Actions (`ci.yml`, `release.yml`) and disabled Dependabot vulnerability alerts on the repo.
+- `release.sh` rewritten for local publish: `npm whoami` pre-flight, `npm publish --access public` with EOTP retry, tag-after-publish.
+- Hoisted `html.toLowerCase()` out of the per-anchor loop in `extractLinks` -- avoids O(N*K) string allocation on large pages.
 
 ## 0.3.0 — 2026-04-21
 
