@@ -33,20 +33,25 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 ## Convention quick-list
 
 - Use npm, keep the lockfile committed.
-- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit (CI enforces the same).
+- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit. There is no CI — local checks are the only gate.
 - zod schemas describe tool input; the exported TypeScript type is derived from the zod shape, not hand-written.
 - Tool callbacks always return a `formatX()` result — never throw. Upstream errors get caught and returned as `formatError(...)`.
 
 ## Release
 
-`release.sh X.Y.Z` from a clean tree. It:
+This repo has no GitHub Actions and no Dependabot. Releases ship from `release.sh` running locally.
 
-1. lints + typechecks + builds + tests
-2. bumps `package.json`, commits `vX.Y.Z`
-3. pushes `main`, **waits for ci.yml green on that SHA**, then tags
-4. pushes the tag — `.github/workflows/release.yml` runs with `secrets.NPM_TOKEN` (YawLabs org-level secret) and publishes
+`release.sh X.Y.Z` from a clean tree, with an active `npm login --auth-type=web` session in `~/.npmrc` (Jeff runs the login in his own terminal — WebAuthn requires a browser; Claude cannot). It:
 
-Do **not** run `npm publish` or `npm login` locally — the YawLabs-global hook blocks it.
+1. lints + typechecks
+2. builds + tests
+3. bumps `package.json`
+4. commits and pushes `main`
+5. `npm publish --access public` (auto-retries on EOTP since fresh WebAuthn sessions take ~30s to propagate)
+6. tags `vX.Y.Z` and pushes the tag (only after publish succeeds — a tag means "shipped")
+7. `gh release create`
+
+Pre-flight aborts the script if `npm whoami` 401s, so a stale session fails fast instead of mid-publish.
 
 ## Sibling repos
 
