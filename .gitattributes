@@ -1,0 +1,11 @@
+# Force LF line endings for all text files. Biome lints CRLF as wrong-EOL,
+# so without this, Windows checkouts (autocrlf=true) re-introduce CRLF on
+# every clone and break the lint gate.
+* text=auto eol=lf
+
+# Always-binary (defensive; Git usually detects these correctly anyway)
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.gz  binary
