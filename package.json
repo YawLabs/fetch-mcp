@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/fetch-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Comprehensive HTTP fetch MCP server: SSRF protection, HTML-to-markdown, reader-mode, metadata / link / sitemap / RSS-Atom extraction, robots.txt verdicts",
   "license": "MIT",
   "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
