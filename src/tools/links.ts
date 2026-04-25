@@ -39,6 +39,11 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     /* no baseHost -- everything classified external */
   }
 
+  // Lowercased view of the source, computed once. extractLinks is hot on large
+  // pages with thousands of anchors; computing this inside the loop allocates
+  // an N-byte string per anchor and turns link extraction into O(N*K) memory churn.
+  const htmlLower = html.toLowerCase();
+
   const links: ExtractedLink[] = [];
   for (const tag of findTags(html, "a")) {
     const attrs = parseAttrs(tag.attrsText);
@@ -65,7 +70,7 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
 
     // Extract inner text: find the end of this <a> by searching from contentStart
     // for the next </a>. Keep it simple -- nested <a> is invalid HTML.
-    const closeIdx = html.toLowerCase().indexOf("</a>", tag.contentStart);
+    const closeIdx = htmlLower.indexOf("</a>", tag.contentStart);
     const innerHtml = closeIdx >= 0 ? html.slice(tag.contentStart, closeIdx) : "";
     const text = innerHtml
       .replace(/<[^>]+>/g, " ")
