@@ -43,10 +43,29 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # No post-publish smoke test: src/index.ts has no --version handling,
-      # so `npx @yawlabs/fetch-mcp@VERSION --version` would block on stdin
-      # waiting for MCP JSON-RPC. release.sh's step 7 verifies via
-      # `npm view` instead, which catches the "tarball didn't reach the
-      # registry" failure mode. Add a `--version` subcommand to
-      # src/index.ts later, then re-add a smoke test step here that
-      # matches the tailscale-mcp / aws-mcp pattern.
+      # Post-publish smoke test: the release is live on npm, so we confirm
+      # that a fresh install via npx can execute the binary and respond to
+      # --version. Catches packaging regressions (missing bin shebang, bad
+      # "files" entry, broken esbuild/tsup output) before they hit real
+      # users.
+      - name: Smoke test published package
+        # Run npx from a temp dir -- if run from the checkout root, npx sees
+        # our own package.json `bin` entry and tries to resolve the local
+        # (unbuilt) path instead of installing the published tarball.
+        working-directory: ${{ runner.temp }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Registry propagation can lag a few seconds after publish succeeds.
+          for i in 1 2 3 4 5; do
+            if npm view "@yawlabs/fetch-mcp@${VERSION}" version >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for @yawlabs/fetch-mcp@${VERSION} to appear on the registry (attempt $i)..."
+            sleep 5
+          done
+          OUTPUT=$(npx -y "@yawlabs/fetch-mcp@${VERSION}" --version)
+          echo "npx output: $OUTPUT"
+          if [ "$OUTPUT" != "$VERSION" ]; then
+            echo "Expected $VERSION, got $OUTPUT" >&2
+            exit 1
+          fi
