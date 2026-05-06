@@ -33,25 +33,28 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 ## Convention quick-list
 
 - Use npm, keep the lockfile committed.
-- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit. There is no CI — local checks are the only gate.
+- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit. CI also runs these on push/PR (`.github/workflows/ci.yml`, Node 20 + 22 matrix), but the pre-commit local pass is still the primary gate.
 - zod schemas describe tool input; the exported TypeScript type is derived from the zod shape, not hand-written.
 - Tool callbacks always return a `formatX()` result — never throw. Upstream errors get caught and returned as `formatError(...)`.
 
 ## Release
 
-This repo has no GitHub Actions and no Dependabot. Releases ship from `release.sh` running locally.
+CI publish via `.github/workflows/release.yml`, fired on `v*` tag push. Uses the org-level `NPM_TOKEN` secret (no local `npm login` needed). The workflow runs the same `release.sh` with `CI=true` set; release.sh detects CI mode, skips the local-only steps (npm whoami check, dirty-tree check, interactive prompt, commit/tag/push), and goes straight to publish + GitHub release.
 
-`release.sh X.Y.Z` from a clean tree, with an active `npm login --auth-type=web` session in `~/.npmrc` (Jeff runs the login in his own terminal — WebAuthn requires a browser; Claude cannot). It:
+**To cut a release** (preferred path — matches every other CI-publish YawLabs MCP repo):
 
-1. lints + typechecks
-2. builds + tests
-3. bumps `package.json`
-4. commits and pushes `main`
-5. `npm publish --access public` (auto-retries on EOTP since fresh WebAuthn sessions take ~30s to propagate)
-6. tags `vX.Y.Z` and pushes the tag (only after publish succeeds — a tag means "shipped")
-7. `gh release create`
+```bash
+npm version X.Y.Z         # bumps package.json + package-lock.json
+git add package.json package-lock.json
+git commit -m "vX.Y.Z"
+git tag vX.Y.Z
+git push origin main --follow-tags
+gh run watch              # CI fires on the tag push, publishes within ~40s
+```
 
-Pre-flight aborts the script if `npm whoami` 401s, so a stale session fails fast instead of mid-publish.
+**Local fallback** (only when CI is unavailable, e.g. GitHub outage): `release.sh X.Y.Z` from a clean tree with an active `npm login --auth-type=web` session. Pre-flight aborts if `npm whoami` 401s. Same script, just runs every step locally instead of letting CI handle steps 4-6. Tag-meaning shifts here from "shipped" to "intent to ship" -- the CI flow tags BEFORE publish (the tag triggers the publish), so don't rely on tag-existence as proof of registry presence; check `npm view @yawlabs/fetch-mcp version` instead.
+
+**Known gap:** `src/index.ts` has no `--version` handling, so the post-publish smoke test in `release.yml` is intentionally absent (`npx @yawlabs/fetch-mcp@VERSION --version` would block on stdin). Add a `--version` subcommand and re-add the smoke step matching `~/yaw/mcp_servers/aws-mcp/.github/workflows/release.yml` -- worth doing the next time someone touches the entrypoint.
 
 ## Sibling repos
 

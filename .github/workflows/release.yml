@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Release
+        run: bash release.sh
+        env:
+          CI: true
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # No post-publish smoke test: src/index.ts has no --version handling,
+      # so `npx @yawlabs/fetch-mcp@VERSION --version` would block on stdin
+      # waiting for MCP JSON-RPC. release.sh's step 7 verifies via
+      # `npm view` instead, which catches the "tarball didn't reach the
+      # registry" failure mode. Add a `--version` subcommand to
+      # src/index.ts later, then re-add a smoke test step here that
+      # matches the tailscale-mcp / aws-mcp pattern.

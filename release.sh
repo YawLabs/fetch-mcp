@@ -1,18 +1,20 @@
 #!/bin/bash
-# Local release flow for @yawlabs/fetch-mcp.
+# =============================================================================
+# Release flow for @yawlabs/fetch-mcp -- builds, publishes to npm, creates
+# GitHub release. Supports both local and CI execution.
+# =============================================================================
+# Usage:
+#   ./release.sh <new-version>    -- full release from local machine
+#   CI=true bash release.sh       -- CI mode (derives version from git tag,
+#                                    skips commit/tag/push since the tag
+#                                    push triggered the run)
 #
-# Prereq: an active npm session in ~/.npmrc (Jeff runs `npm login --auth-type=web`
-# in his own terminal -- WebAuthn requires a browser). This script does NOT log in.
+# Local mode requires an active npm session in ~/.npmrc (`npm login
+# --auth-type=web` -- WebAuthn requires a browser; Claude cannot run this).
+# CI mode reads NODE_AUTH_TOKEN from the workflow secret instead.
 #
-# Steps:
-#   1. lint + typecheck
-#   2. build + test
-#   3. bump package.json
-#   4. commit + push
-#   5. npm publish --access public (with EOTP retry -- fresh sessions need ~30s
-#      to propagate through npm's auth backend)
-#   6. tag + push tag (only after publish succeeds, so the tag means "shipped")
-#   7. gh release create
+# If interrupted, re-run with the same version -- each step is idempotent.
+# =============================================================================
 
 set -euo pipefail
 trap 'echo -e "\n\033[0;31m  x Release failed at line $LINENO (exit code $?)\033[0m"' ERR
@@ -23,14 +25,27 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-TOTAL_STEPS=7
 step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
 info() { echo -e "${GREEN}  + $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
+TOTAL_STEPS=7
+
 VERSION="${1:-}"
-[ -n "$VERSION" ] || { echo "Usage: ./release.sh <version>"; echo "  e.g. ./release.sh 0.4.0"; exit 1; }
+IS_CI="${CI:-false}"
+
+if [ -z "$VERSION" ]; then
+  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+    VERSION="${GITHUB_REF_NAME#v}"
+    info "CI mode -- version $VERSION from tag $GITHUB_REF_NAME"
+  else
+    echo "Usage: ./release.sh <version>"
+    echo "  e.g. ./release.sh 0.4.0"
+    exit 1
+  fi
+fi
+
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Invalid version format: $VERSION (expected X.Y.Z)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,10 +56,12 @@ command -v node >/dev/null || fail "node not installed"
 command -v npm  >/dev/null || fail "npm not installed"
 command -v gh   >/dev/null || fail "gh CLI not installed"
 
-# Verify npm session is alive. `npm whoami` returns 401 / "ENEEDAUTH" when the
-# session is missing or expired, which is the most common failure mode here.
-WHOAMI=$(npm whoami 2>&1) || fail "npm session missing or expired -- run: npm login --auth-type=web"
-info "npm: logged in as $WHOAMI"
+# Local mode requires an active npm session. CI mode uses NODE_AUTH_TOKEN
+# wired in via the workflow env -- npm whoami isn't load-bearing there.
+if [ "$IS_CI" != "true" ]; then
+  WHOAMI=$(npm whoami 2>&1) || fail "npm session missing or expired -- run: npm login --auth-type=web"
+  info "npm: logged in as $WHOAMI"
+fi
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 RESUMING=false
@@ -52,20 +69,22 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   RESUMING=true
   info "Already at v${VERSION} -- resuming"
 else
-  [ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes first"
+  if [ "$IS_CI" != "true" ]; then
+    [ -z "$(git status --porcelain)" ] || fail "Working directory not clean -- commit or stash changes first"
+  fi
   info "Current: v${CURRENT_VERSION} -> v${VERSION}"
 fi
 
-if [ "$RESUMING" != "true" ]; then
+if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
   echo "  1. Lint + typecheck"
   echo "  2. Build + test"
   echo "  3. Bump version in package.json"
-  echo "  4. Commit + push to main"
+  echo "  4. Commit, tag, and push"
   echo "  5. Publish to npm"
-  echo "  6. Tag + push tag"
-  echo "  7. Create GitHub release"
+  echo "  6. Create GitHub release"
+  echo "  7. Verify"
   echo ""
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -90,46 +109,57 @@ else
   info "Version bumped"
 fi
 
-step 4 "Commit + push"
-if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-  git add package.json package-lock.json
-  git commit -m "v${VERSION}"
-  info "Committed v${VERSION}"
+step 4 "Commit, tag, and push"
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode -- skipping commit/tag/push (already tagged)"
 else
-  info "Nothing to commit"
+  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
+    git add package.json package-lock.json
+    git commit -m "v${VERSION}"
+    info "Committed v${VERSION}"
+  else
+    info "Nothing to commit"
+  fi
+
+  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+    info "Tag v${VERSION} already exists"
+  else
+    git tag "v${VERSION}"
+    info "Tag v${VERSION} created"
+  fi
+  git push origin main --tags
+  info "Pushed to origin"
 fi
-git push origin main
-info "Pushed v${VERSION} commit to main"
 
 step 5 "Publish to npm"
-# A freshly-issued WebAuthn session needs ~30s to propagate through npm's auth
-# backend. The first one or two publishes can EOTP/401 even though the session
-# is valid; a humble retry wins. Cap at 3 attempts.
-PUBLISHED=false
-for attempt in 1 2 3; do
-  if npm publish --access public; then
-    info "Published @yawlabs/fetch-mcp@${VERSION}"
-    PUBLISHED=true
-    break
-  fi
-  if [ "$attempt" -lt 3 ]; then
-    warn "publish attempt $attempt failed -- waiting 30s for npm auth to propagate"
-    sleep 30
-  fi
-done
-[ "$PUBLISHED" = "true" ] || fail "npm publish failed after 3 attempts"
-
-step 6 "Tag + push tag"
-if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
-  info "Tag v${VERSION} already exists locally -- skipping create"
+PUBLISHED_VERSION=$(npm view @yawlabs/fetch-mcp version 2>/dev/null || echo "")
+if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
+  info "v${VERSION} already published on npm -- skipping"
 else
-  git tag "v${VERSION}"
-  info "Tag v${VERSION} created"
+  if [ "$IS_CI" = "true" ]; then
+    npm publish --access public --provenance
+    info "Published @yawlabs/fetch-mcp@${VERSION}"
+  else
+    # A freshly-issued WebAuthn session needs ~30s to propagate through npm's
+    # auth backend. The first one or two publishes can EOTP/401 even though
+    # the session is valid; a humble retry wins. Cap at 3 attempts.
+    PUBLISHED=false
+    for attempt in 1 2 3; do
+      if npm publish --access public; then
+        info "Published @yawlabs/fetch-mcp@${VERSION}"
+        PUBLISHED=true
+        break
+      fi
+      if [ "$attempt" -lt 3 ]; then
+        warn "publish attempt $attempt failed -- waiting 30s for npm auth to propagate"
+        sleep 30
+      fi
+    done
+    [ "$PUBLISHED" = "true" ] || fail "npm publish failed after 3 attempts"
+  fi
 fi
-git push origin "v${VERSION}"
-info "Pushed tag v${VERSION}"
 
-step 7 "Create GitHub release"
+step 6 "Create GitHub release"
 if gh release view "v${VERSION}" >/dev/null 2>&1; then
   info "GitHub release v${VERSION} already exists -- skipping"
 else
@@ -143,14 +173,32 @@ else
   info "GitHub release created"
 fi
 
-# Sanity check
+step 7 "Verify"
 sleep 3
+
 NPM_VERSION=$(npm view @yawlabs/fetch-mcp version 2>/dev/null || echo "")
 if [ "$NPM_VERSION" = "$VERSION" ]; then
-  info "npm verify: @yawlabs/fetch-mcp@${NPM_VERSION}"
+  info "npm: @yawlabs/fetch-mcp@${NPM_VERSION}"
 else
-  warn "npm verify: latest is ${NPM_VERSION:-nothing} (registry may still be propagating)"
+  warn "npm shows ${NPM_VERSION:-nothing} (expected $VERSION -- may still be propagating)"
 fi
 
-echo -e "\n${GREEN}  v${VERSION} released successfully!${NC}"
-echo -e "${GREEN}  npm i -g @yawlabs/fetch-mcp@${VERSION}${NC}\n"
+PKG_VERSION=$(node -p "require('./package.json').version")
+if [ "$PKG_VERSION" = "$VERSION" ]; then
+  info "package.json: ${PKG_VERSION}"
+else
+  warn "package.json shows ${PKG_VERSION} (expected $VERSION)"
+fi
+
+if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+  info "git tag: v${VERSION}"
+else
+  warn "git tag v${VERSION} not found"
+fi
+
+echo ""
+echo -e "${GREEN}  v${VERSION} released successfully!${NC}"
+echo ""
+echo -e "  npm: https://www.npmjs.com/package/@yawlabs/fetch-mcp"
+echo -e "  git: https://github.com/YawLabs/fetch-mcp/releases/tag/v${VERSION}"
+echo ""
