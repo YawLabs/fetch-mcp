@@ -1,6 +1,15 @@
 # Changelog
 
-All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship from `release.sh` running locally -- there is no CI.
+All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh` -- in CI on tag push (`.github/workflows/release.yml`, the canonical path) or locally as a fallback.
+
+## Unreleased
+
+### Internal
+
+- **CI publish flow re-added.** Re-introduced `.github/workflows/release.yml` (fires on `v*` tag push, runs `release.sh` with `CI=true`) and `.github/workflows/ci.yml` (lint + typecheck + build + test on Node 20 + 22 for every push to main and every PR). Reverses the deliberate removal noted in 0.3.1's "Internal" section -- alignment with the rest of the YawLabs MCP repos that publish via CI on tag push using the org-level `NPM_TOKEN`. Local `release.sh X.Y.Z` still works as a fallback path.
+- `release.sh` now dual-mode: detects `CI=true` and skips local-only steps (npm whoami pre-flight, dirty-tree check, interactive prompt, commit/tag/push -- the tag push triggered the run, so commit/tag/push is already done). Local mode keeps the EOTP retry loop and the npm whoami gate from the previous version.
+- Annotated tags (`git tag -a "v${VERSION}" -m "v${VERSION}"`) so `git push --follow-tags` actually picks them up. Lightweight tags are silently skipped by `--follow-tags` and the release commit lands but the tag never reaches origin -- closes a latent bug that would have wedged the next release.
+- Idempotency check in release.sh queries the versioned form `npm view "@yawlabs/fetch-mcp@${VERSION}" version` instead of the bare `npm view @yawlabs/fetch-mcp version`. The bare query returns whichever version is `latest` on the registry; a higher out-of-band version would make the script try to re-publish the current one and abort with "cannot publish over previously published version". The versioned form returns `$VERSION` exactly when it exists and empty otherwise.
 
 ## 0.3.1 — 2026-04-24
 
