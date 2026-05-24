@@ -40,8 +40,8 @@ DNS is resolved once per redirect hop, every returned address is checked, and th
 ## Install & run
 
 ```bash
-# One-off
-npx -y @yawlabs/fetch-mcp
+# One-off (auto-updates each spawn via @latest)
+npx -y @yawlabs/fetch-mcp@latest
 
 # Or globally
 npm i -g @yawlabs/fetch-mcp
@@ -59,7 +59,7 @@ Add to your client's MCP config (usually `claude_desktop_config.json` or `~/.cla
   "mcpServers": {
     "fetch": {
       "command": "npx",
-      "args": ["-y", "@yawlabs/fetch-mcp"]
+      "args": ["-y", "@yawlabs/fetch-mcp@latest"]
     }
   }
 }
