@@ -33,7 +33,7 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 ## Convention quick-list
 
 - Use npm, keep the lockfile committed.
-- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit. CI also runs these on push/PR (`.github/workflows/ci.yml`, Node 20 + 22 matrix), but the pre-commit local pass is still the primary gate.
+- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit -- there is no push/PR CI gate, the pre-commit local pass is the only check before the release workflow fires on tag push.
 - zod schemas describe tool input; the exported TypeScript type is derived from the zod shape, not hand-written.
 - Tool callbacks always return a `formatX()` result — never throw. Upstream errors get caught and returned as `formatError(...)`.
 
