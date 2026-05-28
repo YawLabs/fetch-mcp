@@ -15,7 +15,7 @@
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
   "bin": {
-    "fetch-mcp": "./dist/index.js"
+    "fetch-mcp": "dist/index.js"
   },
   "files": [
     "dist",

@@ -87,12 +87,16 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo "  7. Publish to MCP Registry"
   echo "  8. Verify"
   echo ""
-  read -p "Continue? (y/N) " -n 1 -r
-  echo
-  [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-fi
-
-step 1 "Lint + typecheck"
+  if [ -t 0 ]; then
+    read -p "Continue? (y/N) " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+  fi
+  
+  step 1 "Lint + typecheck"
+  else
+    info "Non-interactive shell -- proceeding without confirmation"
+  fi
 npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
 info "Lint + typecheck passed"
