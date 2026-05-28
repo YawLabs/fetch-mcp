@@ -30,7 +30,7 @@ info() { echo -e "${GREEN}  + $1${NC}"; }
 warn() { echo -e "${YELLOW}  ! $1${NC}"; }
 fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
 
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 
 VERSION="${1:-}"
 IS_CI="${CI:-false}"
@@ -84,7 +84,8 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
   echo "  4. Commit, tag, and push"
   echo "  5. Publish to npm"
   echo "  6. Create GitHub release"
-  echo "  7. Verify"
+  echo "  7. Publish to MCP Registry"
+  echo "  8. Verify"
   echo ""
   read -p "Continue? (y/N) " -n 1 -r
   echo
@@ -106,6 +107,13 @@ if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Already at v${VERSION} -- skipping"
 else
   npm version "$VERSION" --no-git-tag-version
+  # server.json is published to the MCP Registry in step 7; bump its version
+  # alongside package.json so the bump commit fully reflects the release and
+  # server.json is never left dirty in the working tree after a publish.
+  if [ -f server.json ]; then
+    jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+    mv server.tmp server.json
+  fi
   info "Version bumped"
 fi
 
@@ -113,8 +121,10 @@ step 4 "Commit, tag, and push"
 if [ "$IS_CI" = "true" ]; then
   info "CI mode -- skipping commit/tag/push (already tagged)"
 else
-  if [ -n "$(git status --porcelain package.json package-lock.json 2>/dev/null)" ]; then
-    git add package.json package-lock.json
+  BUMP_FILES="package.json package-lock.json"
+  [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+  if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
+    git add $BUMP_FILES
     git commit -m "v${VERSION}"
     info "Committed v${VERSION}"
   else
@@ -253,7 +263,95 @@ else
   info "GitHub release created"
 fi
 
-step 7 "Verify"
+# =============================================================================
+# Step 7: Publish to the Official MCP Registry
+# =============================================================================
+# Downstream catalogs (Glama, PulseMCP, mcpservers.org) auto-source from the
+# Official MCP Registry; publishing here is what makes the new version visible
+# to them. server.json was already bumped in step 3 so the version matches the
+# tag.
+step 7 "Publish to MCP Registry"
+
+if [ ! -f server.json ]; then
+  info "No server.json -- not an MCP server, skipping registry publish"
+else
+  # Post-publish smoke test (ported from the old release.yml): the release is
+  # live on npm, so we confirm that a fresh install via npx can execute the
+  # binary and respond to --version. Catches packaging regressions (missing
+  # bin shebang, bad "files" entry, broken tsup output) before they hit real
+  # users. Skipped in CI mode here -- CI runs its own smoke and this is the
+  # local-publish path.
+  if [ "$IS_CI" != "true" ]; then
+    # Run npx from a temp dir -- if run from the checkout root, npx sees our
+    # own package.json `bin` entry and tries to resolve the local (unbuilt)
+    # path instead of installing the published tarball.
+    SMOKE_DIR=$(mktemp -d)
+    # Registry propagation can lag well past a minute after publish succeeds,
+    # and `npm view` and `npx` may hit different CDN paths. Retry the npx
+    # invocation itself with a budget generous enough to outlast realistic
+    # propagation. 30 * 10s = ~5min upper bound; typical case completes in
+    # < 30s.
+    ATTEMPTS=30
+    SLEEP_SECONDS=10
+    SMOKE_OUTPUT=""
+    SMOKE_STARTED_AT=$(date +%s)
+    for i in $(seq 1 $ATTEMPTS); do
+      if SMOKE_OUTPUT=$(cd "$SMOKE_DIR" && npx -y "@yawlabs/fetch-mcp@${VERSION}" --version 2>/dev/null); then
+        info "npx smoke: $SMOKE_OUTPUT (after $(( $(date +%s) - SMOKE_STARTED_AT ))s)"
+        break
+      fi
+      warn "Waiting for @yawlabs/fetch-mcp@${VERSION} to be installable via npx (attempt $i/$ATTEMPTS, ${SLEEP_SECONDS}s)..."
+      sleep $SLEEP_SECONDS
+    done
+    rm -rf "$SMOKE_DIR"
+    if [ "$SMOKE_OUTPUT" != "$VERSION" ]; then
+      fail "Smoke test expected $VERSION, got '$SMOKE_OUTPUT' after $ATTEMPTS attempts ($(( $(date +%s) - SMOKE_STARTED_AT ))s)"
+    fi
+  fi
+
+  # mcp-publisher binary cached at ~/.local/bin. Pinned to "latest" upstream;
+  # if the registry's CLI introduces a breaking change, the next release will
+  # surface it. The OS/arch detection handles Linux, macOS, and Git Bash on
+  # Windows (MINGW/MSYS uname -s starts with "mingw" / "msys").
+  MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher}"
+  if ! [ -x "$MP" ]; then
+    info "mcp-publisher not found at $MP -- downloading"
+    mkdir -p "$(dirname "$MP")"
+    OS_RAW=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$OS_RAW" in mingw*|msys*|cygwin*) OS=windows ;; *) OS="$OS_RAW" ;; esac
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    TMP=$(mktemp -d)
+    curl -sL -o "$TMP/mp.tar.gz" \
+      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" \
+      || fail "Failed to download mcp-publisher (${OS}/${ARCH})"
+    tar xzf "$TMP/mp.tar.gz" -C "$TMP" || fail "Failed to extract mcp-publisher tarball"
+    if [ -f "$TMP/mcp-publisher.exe" ]; then
+      mv "$TMP/mcp-publisher.exe" "$MP"
+    else
+      mv "$TMP/mcp-publisher" "$MP"
+    fi
+    rm -rf "$TMP"
+    chmod +x "$MP" 2>/dev/null || true
+  fi
+
+  # OIDC auth (used by the old release.yml) only works inside Actions; locally
+  # we use a GitHub PAT via `login github -token <PAT>`. The PAT needs read:org
+  # for YawLabs so the registry can verify org membership for the
+  # io.github.YawLabs/* namespace.
+  if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+    fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+  fi
+  "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null 2>&1 \
+    || fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"
+  "$MP" publish \
+    || fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
+  info "Published to MCP Registry"
+fi
+
+# =============================================================================
+# Step 8: Verify
+# =============================================================================
+step 8 "Verify"
 sleep 3
 
 NPM_VERSION=$(npm view "@yawlabs/fetch-mcp@${VERSION}" version 2>/dev/null || echo "")
