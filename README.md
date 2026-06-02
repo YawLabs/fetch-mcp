@@ -2,7 +2,7 @@
 
 A comprehensive HTTP fetch MCP server for AI assistants. Bring-your-own client: runs as a stdio MCP server so any MCP-compatible client (Claude Code, Claude Desktop, Cursor, `mcph`, …) can fetch web content safely.
 
-[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](yaw://install?name=Fetch&command=npx&args=-y%2C%40yawlabs%2Ffetch-mcp&description=HTTP%20fetch%20for%20AI%20agents%20-%20HTML-to-markdown%2C%20reader%20mode%2C%20metadata%2C%20RSS%2C%20sitemaps&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Ffetch-mcp)
+[![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=Fetch&command=npx&args=-y%2C%40yawlabs%2Ffetch-mcp&description=HTTP%20fetch%20for%20AI%20agents%20-%20HTML-to-markdown%2C%20reader%20mode%2C%20metadata%2C%20RSS%2C%20sitemaps&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Ffetch-mcp)
 
 One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
 
