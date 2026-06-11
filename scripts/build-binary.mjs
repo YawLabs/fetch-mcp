@@ -73,7 +73,17 @@ await esbuild.build({
   platform: 'node',
   format: 'cjs',
   target: 'node20',
-  define: { __VERSION__: JSON.stringify(version) },
+  // esbuild leaves import.meta.url EMPTY in cjs output, so a server that reads
+  // it (e.g. createRequire(import.meta.url) to find package.json) crashes at
+  // load with createRequire(undefined). Polyfill it to the carrier's own path
+  // (__filename is the executable in a SEA). Version reads should still prefer
+  // the __VERSION__ define; this is the safety net for everything else.
+  banner: { js: "const __seaImportMetaUrl = require('node:url').pathToFileURL(__filename).href;" },
+  define: { __VERSION__: JSON.stringify(version), 'import.meta.url': '__seaImportMetaUrl' },
+  // Optional native addons some servers pull transitively (ssh2 -> cpu-features)
+  // are require()'d inside try/catch; mark them external so esbuild doesn't
+  // choke on the .node binary -- they degrade gracefully when absent.
+  external: ['cpu-features'],
   outfile: bundlePath,
 });
 console.log(`bundle: ${fmtSize(bundlePath)}`);

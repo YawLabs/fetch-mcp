@@ -53,10 +53,10 @@ jobs:
         with:
           node-version: 22
 
-      # esbuild (build-binary.mjs) needs devDeps; postject is fetched via npx.
+      # esbuild + postject (build-binary.mjs) are devDeps, installed here.
       - run: npm ci
 
-      # Native SEA build -> bin/<platform>-<arch>/yaw-mcp[.exe]
+      # Native SEA build -> bin/<platform>-<arch>/<cmd>[.exe]
       # (macOS: build-binary.mjs ad-hoc codesigns after postject).
       - run: node scripts/build-binary.mjs
 
@@ -65,11 +65,12 @@ jobs:
         run: node scripts/stage-release-asset.mjs
 
       # Smoke-test the freshly built binary so a broken artifact never ships.
+      # --version is the one subcommand every @yawlabs CLI implements; richer
+      # probes (doctor, etc.) are server-specific and don't belong in the
+      # shared template.
       - name: Smoke test
         shell: bash
-        run: |
-          ./dist-release/${{ steps.stage.outputs.asset }} --version
-          ./dist-release/${{ steps.stage.outputs.asset }} doctor --json > /dev/null
+        run: ./dist-release/${{ steps.stage.outputs.asset }} --version
 
       - name: Publish to the release
         uses: softprops/action-gh-release@v2

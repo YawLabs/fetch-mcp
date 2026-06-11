@@ -11,8 +11,13 @@ import { registerReaderTools } from "./tools/reader.js";
 import { registerRobotsTools } from "./tools/robots.js";
 import { registerSitemapTools } from "./tools/sitemap.js";
 
-const require = createRequire(import.meta.url);
-const { version } = require("../package.json");
+// Inlined by the single-binary build (build-binary.mjs --define); the bare
+// createRequire(import.meta.url) at module load would crash the binary
+// (import.meta.url is empty in the CJS bundle). Falls back to package.json for
+// the normal ESM/tsup build.
+declare const __VERSION__: string;
+const version =
+  typeof __VERSION__ !== "undefined" ? __VERSION__ : createRequire(import.meta.url)("../package.json").version;
 
 export function createFetchServer(): McpServer {
   setHttpContext({ version });
