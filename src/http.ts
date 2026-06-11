@@ -156,8 +156,16 @@ async function resolveAndPin(
 function pinnedAgent(ip: string, family: 4 | 6): Agent {
   return new Agent({
     connect: {
+      // Node 22 always calls lookup with { all: true } internally and passes the
+      // result through lookupAndConnectMultiple, which expects an array of address
+      // objects: cb(null, [{address, family}]).  The old single-address form
+      // cb(null, ipString, familyNumber) causes "Invalid IP address: undefined"
+      // because lookupAndConnectMultiple reads addresses[0]?.address where
+      // addresses[0] is the first character of the string.
       lookup: (_hostname, _options, cb) => {
-        (cb as (err: NodeJS.ErrnoException | null, address: string, family: number) => void)(null, ip, family);
+        (cb as (err: NodeJS.ErrnoException | null, addresses: { address: string; family: number }[]) => void)(null, [
+          { address: ip, family },
+        ]);
       },
     },
   });
