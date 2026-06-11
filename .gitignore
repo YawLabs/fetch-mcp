@@ -7,3 +7,6 @@ coverage/
 .idea/
 .env
 .env.local
+bin/
+build-tmp/
+dist-release/
