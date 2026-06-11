@@ -1,4 +1,5 @@
 import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { Agent } from "undici";
 import { checkIpAddress, defaultUserAgent, validateUrl } from "./security.js";
 
@@ -289,7 +290,11 @@ async function sendHop(params: {
   if (!opts.allowPrivateHosts) {
     // Literal IP URLs are covered by validateUrl. For hostnames we must
     // resolve and pin so fetch can't race us to a rebound address.
-    const literal = /^[0-9.]+$|^[0-9a-f:]+$/i.test(host);
+    // Use isIP() (node:net) -- the same check validateUrl uses -- rather than
+    // a hand-rolled regex. The old regex matched partial addresses like "127"
+    // or "192.168" as literals, skipping pinning; on Windows "127" connects
+    // to 127.0.0.1, making this a real SSRF bypass path.
+    const literal = isIP(host) !== 0;
     if (!literal) {
       const resolved = await resolveAndPin(host);
       if (!resolved.ok) return { kind: "error", response: failure(url, resolved.reason, redirects, start) };

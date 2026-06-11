@@ -100,6 +100,21 @@ describe("DNS-rebinding SSRF -- resolveAndPin refuses blocked resolved addresses
 });
 
 describe("DNS-rebinding SSRF -- resolveAndPin is bypassed where it should be", () => {
+  // Regression: the old literal-IP check used /^[0-9.]+$|^[0-9a-f:]+$/i.
+  // The IPv6 arm matched any all-hex hostname -- "dead", "cafe", "beef" -- as
+  // if it were an IPv6 literal, skipping DNS pinning entirely. A domain like
+  // "dead.example.com" wouldn't trigger this (contains '.'), but a bare label
+  // composed purely of hex chars (registerable as a gTLD or in internal DNS)
+  // would slip past the pin and be fetched without the rebind guard.
+  // Fix: use isIP() (node:net), same check validateUrl already uses.
+  it("resolve-and-pins a hex-only hostname ('dead') -- NOT treated as an IPv6 literal", async () => {
+    // "dead" is all hex chars and matches the old regex, but isIP("dead") === 0.
+    // With the fix it must go through resolveAndPin; lookup being called confirms it.
+    lookupMock.mockResolvedValue([{ address: "1.2.3.4", family: 4 }]);
+    await httpRequest({ method: "GET", url: "http://dead/", timeoutMs: 200 });
+    expect(lookupMock).toHaveBeenCalledWith("dead", expect.objectContaining({ all: true }));
+  });
+
   it("does NOT call DNS lookup for a literal private IP (validateUrl rejects it first)", async () => {
     const res = await httpRequest({ method: "GET", url: "http://127.0.0.1/" });
     expect(res.ok).toBe(false);
