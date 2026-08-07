@@ -15,9 +15,10 @@
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
   "bin": {
-    "fetch-mcp": "dist/index.js"
+    "fetch-mcp": "bin/fetch-mcp.mjs"
   },
   "files": [
+    "bin/fetch-mcp.mjs",
     "dist",
     "!dist/**/*.test.*",
     "README.md",
