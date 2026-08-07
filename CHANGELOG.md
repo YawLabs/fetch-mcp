@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-07
+
 ### Added
 - Runtime launcher at `bin/fetch-mcp.mjs`: the published `fetch-mcp` command now prefers the [oam](https://oamjs.org) runtime and falls back to Node. `FETCH_MCP_RUNTIME` selects (`auto` / `oam` / `node`) and `OAM_BIN` overrides discovery. Both paths verified against the MCP surface — handshake plus all 15 tools — and behave identically. The fallback does **not** re-exec Node: npm has already started Node to run the launcher, so it is an in-process `import()` with no extra spawn.
 
