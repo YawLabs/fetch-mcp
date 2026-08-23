@@ -8,6 +8,15 @@
 - **The `--version` spawn ceiling now matches vitest's `testTimeout`.** Both `execFileSync` calls in `src/tests/version.test.ts` bounded the spawn at 5s while `vitest.config.ts` sets `testTimeout` to 15s. These bound a spawn expected to SUCCEED, so the ceiling has to cover a real `node` start under load rather than a warm one — a bare `node -e "0"` was measured at ~11s on a contended Windows box, more than double the ceiling, which fails the test for machine load rather than for anything about the code. The hang contract the suite protects is unchanged (`--version` must not reach `startServer()`, which connects stdio and blocks forever); it is now enforced by the outer `testTimeout` instead of the inner one. Both sites share a named `SPAWN_TIMEOUT_MS` so they cannot drift from the config again.
 - **npm auth failures in `release.sh` now point at restoring the automation token** rather than at a login flow that would overwrite it.
 
+## [0.5.0] — 2026-08-08
+
+### Added
+- **Opt-in `oam --permission` sandbox via `FETCH_MCP_SANDBOX=1`.** Opt-in rather than default because a wrong grant does not fail loudly: oam denies a non-granted environment variable by making it ABSENT from `process.env` rather than throwing, so an under-granted secret reads as "unauthenticated" rather than "denied". The env allow-list is derived from what the shipped bundle actually reads, not hand-written. Net is granted in full — fetching a caller-supplied URL is this server's job, so restricting by host would break the tool rather than harden it. The value is in what stays denied: this server reads no file and spawns no process, so running without an fs or child grant turns both into a runtime refusal rather than a capability it merely happens not to use today.
+- **`server.json` / `package.json` version-parity test** (`src/release-metadata.test.ts`). `server.json` is what the Official MCP Registry reads at publish time; it carries the version twice (top-level plus `packages[].version`) and `release.sh` bumps it separately from `package.json`, so an edit updating one and not the other ships a desynced registry entry — visible to users, invisible to the release. Three assertions: top-level version parity, per-package version parity, and `mcpName` == `server.json` name (a distinct drift mode: the registry keys on `name` while npm consumers read `mcpName`, and disagreement puts discovery and install on different identifiers). The `mcpName` check asserts both fields are non-empty first so it cannot pass vacuously if a refactor drops both. Ported from tailscale-mcp, where it caught a real version skew and aborted the 0.15.0 publish.
+
+### Changed
+- **The launcher now requires oam >= 0.9.0.** It probes `oam --version`; below the floor, `auto` falls back to Node with a note on stderr and `FETCH_MCP_RUNTIME=oam` becomes a hard error. Older oam ran `child_process.execFile` arguments through a shell, accepted an exec timeout and ignored it, truncated `spawnSync` at `maxBuffer` while reporting success, and treated stdio `inherit`/`ignore` as `pipe`.
+
 ## [0.4.0] — 2026-08-07
 
 ### Added
