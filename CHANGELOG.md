@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-08-23
+
+### Fixed
+- **The `--version` spawn ceiling now matches vitest's `testTimeout`.** Both `execFileSync` calls in `src/tests/version.test.ts` bounded the spawn at 5s while `vitest.config.ts` sets `testTimeout` to 15s. These bound a spawn expected to SUCCEED, so the ceiling has to cover a real `node` start under load rather than a warm one — a bare `node -e "0"` was measured at ~11s on a contended Windows box, more than double the ceiling, which fails the test for machine load rather than for anything about the code. The hang contract the suite protects is unchanged (`--version` must not reach `startServer()`, which connects stdio and blocks forever); it is now enforced by the outer `testTimeout` instead of the inner one. Both sites share a named `SPAWN_TIMEOUT_MS` so they cannot drift from the config again.
+- **npm auth failures in `release.sh` now point at restoring the automation token** rather than at a login flow that would overwrite it.
+
 ## [0.4.0] — 2026-08-07
 
 ### Added
