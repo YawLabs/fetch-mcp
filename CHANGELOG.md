@@ -1,5 +1,7 @@
 # Changelog
 
+All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh`, run from the workstation: this repo has no GitHub Actions workflows (removed 2026-07-21), so `release.sh` is the sole pipeline and publishes to npm, GitHub Releases, and the MCP Registry itself.
+
 ## [Unreleased]
 
 ### Fixed
@@ -28,11 +30,10 @@
 
 ### Changed
 - `.gitignore` excludes `bin/*` rather than `bin/`, so the launcher can be re-included with a negation. A negation cannot undo a directory-level exclusion — that trap shipped a broken `bin` in postgres-mcp, where the launcher was untracked and absent from every fresh clone.
+- **GitHub Actions removed** (`ci.yml`, `release.yml`, dependabot). `release.sh` became the sole pipeline again, reversing the CI migration recorded in 0.3.2. Publishing now runs from the workstation.
 - `scripts/build-binary.mjs` pins the CLI source entry instead of deriving it from `bin`'s value, which would have resolved to `bin/fetch-mcp.ts` once `bin` moved to the launcher — the breakage postgres-mcp shipped in its 0.9.0.
 
-All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh` -- in CI on tag push (`.github/workflows/release.yml`, the canonical path) or locally as a fallback.
-
-## Unreleased
+## 0.3.2 — 2026-05-15
 
 ### Internal
 
