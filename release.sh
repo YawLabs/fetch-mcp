@@ -9,8 +9,11 @@
 #                                    skips commit/tag/push since the tag
 #                                    push triggered the run)
 #
-# Local mode requires an active npm session in ~/.npmrc (`npm login
-# --auth-type=web` -- WebAuthn requires a browser; Claude cannot run this).
+# Local mode requires an automation token in ~/.npmrc (npmjs.com -> Access
+# Tokens -> Generate -> Automation). Do NOT use `npm login --auth-type=web`:
+# it OVERWRITES that automation token with a 2FA-bound web session, and the
+# next publish then EOTPs on a WebAuthn challenge -- which requires a browser,
+# so Claude cannot complete it either.
 # CI mode reads NODE_AUTH_TOKEN from the workflow secret instead.
 #
 # If interrupted, re-run with the same version -- each step is idempotent.
@@ -80,7 +83,7 @@ command -v gh   >/dev/null || fail "gh CLI not installed"
 # Local mode requires an active npm session. CI mode uses NODE_AUTH_TOKEN
 # wired in via the workflow env -- npm whoami isn't load-bearing there.
 if [ "$IS_CI" != "true" ]; then
-  WHOAMI=$(npm whoami 2>&1) || fail "npm session missing or expired -- run: npm login --auth-type=web"
+  WHOAMI=$(npm whoami 2>&1) || fail "npm is not authenticated. The automation token in ~/.npmrc is missing or dead -- replace it with a new automation token from npmjs.com (Access Tokens -> Generate -> Automation). Do NOT run 'npm login --auth-type=web': it overwrites the automation token with a 2FA-bound web session."
   info "npm: logged in as $WHOAMI"
 fi
 
@@ -285,7 +288,24 @@ else
     fi
     if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
       rm -f "$PUBLISH_LOG"
-      fail "npm publish failed (non-OTP error -- see output above). If E401/E404, your ~/.npmrc session is stale: run 'npm login --auth-type=web' and retry."
+      fail "npm publish failed (non-OTP error -- see output above).
+
+  If the error was E401 or E404, the automation token in ~/.npmrc is dead.
+  npm answers an UNAUTHORIZED PUT with 404, not 401, so 'could not be found
+  or you do not have permission' here almost always means 'not authorized'
+  -- the package is fine. Confirm which it is:
+
+      npm whoami          # E401 => the token is dead
+
+  Fix: mint a NEW automation token (npmjs.com -> Access Tokens -> Generate
+  -> Automation), then write these two lines to ~/.npmrc:
+
+      @yawlabs:registry=https://registry.npmjs.org/
+      //registry.npmjs.org/:_authToken=npm_YOURTOKEN
+
+  Do NOT run 'npm login --auth-type=web'. It OVERWRITES the automation token
+  with a 2FA-bound web session; the next publish then EOTPs on a WebAuthn
+  challenge, and any CI sharing that token starts failing too."
     fi
     rm -f "$PUBLISH_LOG"
     if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
