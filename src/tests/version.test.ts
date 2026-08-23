@@ -19,10 +19,20 @@ describe("--version subcommand", () => {
   // rather than failing -- CI always runs the build step first.
   const buildAvailable = existsSync(DIST_BIN);
 
+  // Matches vitest.config.ts's testTimeout. These bound a spawn that is
+  // expected to SUCCEED, so the ceiling must cover a real `node` start under
+  // load, not just a warm one: on a contended Windows box a bare `node -e "0"`
+  // was measured at ~11s, which alone blows a 5s ceiling and fails the test for
+  // machine load rather than for anything about the code. The hang contract
+  // this suite exists to protect -- `--version` must not reach startServer(),
+  // which connects stdio and blocks forever -- is still enforced, by the outer
+  // testTimeout instead of this inner one.
+  const SPAWN_TIMEOUT_MS = 15_000;
+
   it.skipIf(!buildAvailable)("'--version' prints the package.json version and exits 0", () => {
     const stdout = execFileSync(process.execPath, [DIST_BIN, "--version"], {
       encoding: "utf-8",
-      timeout: 5_000,
+      timeout: SPAWN_TIMEOUT_MS,
     });
     expect(stdout.trim()).toBe(PACKAGE_VERSION);
   });
@@ -30,7 +40,7 @@ describe("--version subcommand", () => {
   it.skipIf(!buildAvailable)("'version' (without dashes) is also accepted", () => {
     const stdout = execFileSync(process.execPath, [DIST_BIN, "version"], {
       encoding: "utf-8",
-      timeout: 5_000,
+      timeout: SPAWN_TIMEOUT_MS,
     });
     expect(stdout.trim()).toBe(PACKAGE_VERSION);
   });
