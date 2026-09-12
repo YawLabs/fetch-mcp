@@ -2,7 +2,7 @@
 
 All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh`, run from the workstation: this repo has no GitHub Actions workflows (removed 2026-07-21), so `release.sh` is the sole pipeline and publishes to npm, GitHub Releases, and the MCP Registry itself.
 
-## [Unreleased]
+## [0.5.3] — 2026-09-11
 
 ### Fixed
 - **The launcher no longer dies with a raw stack trace when `spawn` fails.** Node throws synchronously rather than emitting `error` for some unexecutable targets — notably a `.cmd`/`.bat` on Windows — and the `error` listener is registered *after* the `spawn` call, so it could never observe that throw. Both failure modes now route through one handler.
