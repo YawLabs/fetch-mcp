@@ -2,7 +2,7 @@
   "name": "@yawlabs/fetch-mcp",
   "version": "0.5.2",
   "mcpName": "io.github.YawLabs/fetch-mcp",
-  "description": "Comprehensive HTTP fetch MCP server: SSRF protection, HTML-to-markdown, reader-mode, metadata / link / sitemap / RSS-Atom extraction, robots.txt verdicts",
+  "description": "Fetch MCP server for AI agents: HTTP requests, HTML-to-markdown, reader mode, metadata, links, sitemaps, RSS/Atom, robots.txt, SSRF-safe",
   "license": "MIT",
   "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
   "type": "module",
@@ -66,21 +66,25 @@
     "node": ">=20"
   },
   "keywords": [
-    "mcp",
-    "model-context-protocol",
     "fetch",
+    "fetch-mcp",
     "http",
-    "web",
-    "scraping",
+    "http-client",
+    "web-scraping",
+    "html-to-markdown",
     "markdown",
-    "ssrf",
-    "robots",
+    "reader-mode",
+    "opengraph",
+    "metadata",
     "sitemap",
     "rss",
     "atom",
-    "opengraph",
-    "reader-mode",
+    "robots-txt",
+    "ssrf",
+    "mcp",
     "mcp-server",
+    "model-context-protocol",
+    "claude-code",
     "ai"
   ],
   "repository": {
@@ -90,5 +94,5 @@
   "bugs": {
     "url": "https://github.com/YawLabs/fetch-mcp/issues"
   },
-  "homepage": "https://github.com/YawLabs/fetch-mcp"
+  "homepage": "https://yaw.sh/mcp-servers/fetch-mcp/"
 }
