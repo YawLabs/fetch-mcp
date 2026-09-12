@@ -560,7 +560,7 @@ describe("httpRequest -- HEAD", () => {
     });
     const res = await httpRequest({ method: "HEAD", url: baseUrl, allowPrivateHosts: true });
     expect(res.status).toBe(200);
-    expect(res.headers["etag"]).toBe("abc123");
+    expect(res.headers.etag).toBe("abc123");
     expect(res.bodyText).toBeUndefined();
   });
 });
