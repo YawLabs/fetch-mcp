@@ -4,7 +4,8 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 
 ## Layout
 
-- `src/index.ts` — CLI entrypoint; calls `startServer()`.
+- `bin/fetch-mcp.mjs` — the npm `bin`. Runtime launcher: prefers oam, falls back to the Node process already running it; imports `dist/index.js` in-process or spawns `oam run <entry> -- <argv>`.
+- `src/index.ts` — CLI entrypoint: handles `version` / `--version`, rejects any other argument, otherwise calls `startServer()`.
 - `src/server.ts` — MCP server factory, registers tool modules.
 - `src/security.ts` — SSRF block list + URL validator. Security-critical.
 - `src/http.ts` — core request client: redirects, retries, size cap, auth, timeouts.
@@ -29,32 +30,36 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 6. **Sitemap gzip detection is on the raw bytes, not Content-Encoding.** Many sitemaps are served as `.xml.gz` with `application/x-gzip` and no `Content-Encoding`, so node fetch does not decompress. `decodeSitemapPayload()` sniffs the gzip magic (`1f 8b`) on the raw buffer; don't switch sitemap to `decodeText: true` or gzip detection breaks.
 7. **JSON-LD parsing is best-effort.** `parseHtmlMeta()` swallows JSON.parse errors on malformed `<script type="application/ld+json">` blocks rather than failing the entire meta request — sites frequently ship invalid JSON-LD.
 8. **Atom link picking prefers `rel="alternate"` over `rel="self"`.** The self link points to the feed XML itself, not the article — see `extractAtomLink()` in `src/tools/feed.ts`.
+9. **Argument handling in `src/index.ts` runs before `startServer()`.** `version` / `--version` prints the version and exits 0 (the release smoke test depends on it); any other argument prints `Unknown subcommand` plus usage to **stderr** and exits 1; only a launch with no argument starts the server. `startServer()` binds stdio and blocks on stdin, so an argument that reaches it looks like a hang (#33). Never write diagnostics to stdout — it is the MCP channel. Every `bin/fetch-mcp.mjs` path (in-process under Node or a host oam, or the spawned `oam run <entry> -- …`) reaches `src/index.ts` with no argument when the launcher itself got none; `src/tests/version.test.ts` pins all three outcomes.
 
 ## Convention quick-list
 
 - Use npm, keep the lockfile committed.
-- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit -- there is no push/PR CI gate, the pre-commit local pass is the only check before the release workflow fires on tag push.
+- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit -- there is no push/PR CI gate, so the pre-commit local pass and `release.sh`'s own lint/test steps are the only checks.
+- Record user-facing changes under `## [Unreleased]` in `CHANGELOG.md` as you land them; `release.sh` promotes that heading to the release version.
 - zod schemas describe tool input; the exported TypeScript type is derived from the zod shape, not hand-written.
 - Tool callbacks always return a `formatX()` result — never throw. Upstream errors get caught and returned as `formatError(...)`.
 
 ## Release
 
-CI publish via `.github/workflows/release.yml`, fired on `v*` tag push. Uses the org-level `NPM_TOKEN` secret (no local `npm login` needed). The workflow runs the same `release.sh` with `CI=true` set; release.sh detects CI mode, skips the local-only steps (npm whoami check, dirty-tree check, interactive prompt, commit/tag/push), and goes straight to publish + GitHub release.
+**`./release.sh X.Y.Z` from a clean `main` on the workstation is the whole pipeline.** The repo has no GitHub Actions workflows and Actions is disabled on it (workflows removed 2026-07-21), so nothing fires on tag push and nothing re-checks the tree after you. Don't hand-roll `npm version` + tag + push: that tags a version nobody publishes.
 
-**To cut a release** (preferred path — matches every other CI-publish YawLabs MCP repo):
+The script runs eight steps. Each is idempotent, so after an interruption re-run with the same version to resume:
 
-```bash
-npm version X.Y.Z         # bumps package.json + package-lock.json
-git add package.json package-lock.json
-git commit -m "vX.Y.Z"
-git tag vX.Y.Z
-git push origin main --follow-tags
-gh run watch              # CI fires on the tag push, publishes within ~40s
-```
+1. Lint + typecheck -- the only lint gate this repo has.
+2. Build + test.
+3. Bump `package.json` / `package-lock.json`, sync `server.json`, and promote `## [Unreleased]` in `CHANGELOG.md` to the version. Aborts if the release would ship with unpromoted `[Unreleased]` content.
+4. Commit `vX.Y.Z`, create an annotated tag, `git push origin main --follow-tags`.
+5. `npm publish`, with EOTP retry.
+6. GitHub release. Its notes are the commit subjects since the previous tag, not the CHANGELOG, so write subjects that read as release notes.
+7. Smoke test (below), then MCP Registry publish via `mcp-publisher` (token: `MCP_REGISTRY_TOKEN`, else `gh auth token`).
+8. Verify: the npm version, `package.json` and the git tag. Mismatches only warn.
 
-**Local fallback** (when you need to bypass CI -- debugging the release script, intentionally publishing without going through the workflow, or just iterating on release.sh itself): `release.sh X.Y.Z` from a clean tree with an active `npm login --auth-type=web` session. Pre-flight aborts if `npm whoami` 401s. Same script, just runs every step locally instead of letting CI handle steps 4-6. Note that "GitHub outage" is NOT the canonical use case -- the local fallback's own `git push origin main --follow-tags` step also fails when GitHub is down, so it doesn't actually rescue you in that scenario; you'd need to wait for GitHub or manually invoke just the publish + verify steps. Tag-meaning shifts here from "shipped" to "intent to ship" -- the CI flow tags BEFORE publish (the tag triggers the publish), so don't rely on tag-existence as proof of registry presence; check `npm view "@yawlabs/fetch-mcp@X.Y.Z"` instead.
+**Auth:** an npm automation token in `~/.npmrc`; pre-flight aborts if `npm whoami` fails. Never `npm login --auth-type=web` -- it overwrites the automation token with a 2FA-bound session and the next publish EOTPs. The tag lands in step 4, before publish, so a tag is not proof of registry presence; check `npm view "@yawlabs/fetch-mcp@X.Y.Z" version`.
 
-**Smoke test:** `release.yml` runs a post-publish `npx -y @yawlabs/fetch-mcp@VERSION --version` from a temp dir and asserts the output matches the tag. Catches packaging regressions (missing bin shebang, bad `"files"` entry, broken tsup output). The `--version` handler lives at the top of `src/index.ts` and MUST be processed before `startServer()` -- the latter binds stdio and blocks forever, so a `--version` invocation that reaches it would hang the smoke test.
+`release.sh` still carries a `CI=true` mode and a hand-off-to-`release.yml` branch from the Actions era. Both stay dormant while no workflow exists.
+
+**Smoke test:** step 7 installs the just-published version with `npx` from a temp dir (retrying for up to ~5 min while the registry propagates), runs it with `--version`, and fails the release unless the output equals the version. It catches packaging regressions: a missing bin shebang, a bad `"files"` entry, broken tsup output. It depends on the argument handling in `src/index.ts` (Launch-critical #9).
 
 ## Sibling repos
 
