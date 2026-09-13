@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/fetch-mcp",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "mcpName": "io.github.YawLabs/fetch-mcp",
   "description": "Fetch MCP server for AI agents: HTTP requests, HTML-to-markdown, reader mode, metadata, links, sitemaps, RSS/Atom, robots.txt, SSRF-safe",
   "license": "MIT",
