@@ -232,8 +232,11 @@ Fetches `<origin>/robots.txt`, parses it, and returns:
   crawlDelay: number | null;   // from the matched group
   sitemaps: string[];          // top-level Sitemap: declarations
   rawRobotsText: string;       // first 512KB
+  note?: string;               // only when robots.txt 404s
 }
 ```
+
+A `/robots.txt` that returns 404 means there are no rules, so the verdict is `allowed: true`. The response keeps the same shape: `status: 404`, `matchedRule: null`, `crawlDelay: null`, `sitemaps: []`, `rawRobotsText: ""`, plus the `note`. Any other non-2xx status is returned as an error.
 
 The parser follows Google's rules: longest match wins, `*` is a wildcard segment, `$` anchors the end of the path, specific user-agent group beats the `*` wildcard group when the UA matches (comparison uses the length of the actually-matched agent token, not the group's first agent). Allow beats Disallow on equal-length ties.
 
