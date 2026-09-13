@@ -2,6 +2,14 @@
 
 All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh`, run from the workstation: this repo has no GitHub Actions workflows (removed 2026-07-21), so `release.sh` is the sole pipeline and publishes to npm, GitHub Releases, and the MCP Registry itself.
 
+## [Unreleased]
+
+### Fixed
+- **The launcher no longer boots a second, nested oam when it is already running on one.** A host that resolves this package's `bin` and launches `oam run bin/fetch-mcp.mjs` — Yaw MCP does, and so does oam's sidecar regression matrix — got the launcher discovering and spawning another oam without asking what it was already running on: one server, two runtime boots (measured on Windows as `oam.exe` with a nested `oam.exe` + `conhost.exe` underneath). When `process.versions.oam` clears the same 0.9.0 floor a discovered binary must, the server is now imported into the host process directly. A host oam below the floor keeps the discovery path, and so does `FETCH_MCP_SANDBOX=1`, because `--permission` only applies to a fresh oam. That is a request for a spawn, not a guarantee: if discovery then finds nothing runnable, `FETCH_MCP_RUNTIME=auto` falls back to in-process *without* `--permission`, as it always has; `FETCH_MCP_RUNTIME=oam` makes that fatal.
+
+### Internal
+- **`biome.json`'s `$schema` now matches the installed biome** (moved from 2.4.11 to 2.5.1), so editor validation checks against the schema of the binary that actually runs. No config keys needed migrating.
+
 ## [0.5.3] — 2026-09-11
 
 ### Fixed
