@@ -2,7 +2,7 @@
 
 All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh`, run from the workstation: this repo has no GitHub Actions workflows (removed 2026-07-21), so `release.sh` is the sole pipeline and publishes to npm, GitHub Releases, and the MCP Registry itself.
 
-## [Unreleased]
+## [0.5.6] — 2026-09-13
 
 ### Fixed
 - **`fetch_robots` returns the documented shape when a site has no `robots.txt`.** A 404 used to return only `robotsUrl`, `status`, `allowed` and `note`, so a caller reading `sitemaps`, `path`, `userAgent`, `matchedRule`, `crawlDelay` or `rawRobotsText` off the README shape got `undefined` — on the most common case, not an edge case. The 404 response now carries every documented key (`matchedRule: null`, `crawlDelay: null`, `sitemaps: []`, `rawRobotsText: ""`) alongside the unchanged verdict (`status: 404`, `allowed: true`) and the `note`, which the README now lists as optional. A new end-to-end test reads the key list from the README itself, so docs and handler cannot drift apart silently again. ([#34](https://github.com/YawLabs/fetch-mcp/issues/34))
