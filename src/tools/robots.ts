@@ -161,30 +161,41 @@ export function registerRobotsTools(server: McpServer) {
         allowPrivateHosts: allow_private_hosts,
         decodeText: true,
       });
-      // 404 means "no rules -- everything allowed" per the spec
       if (res.error) return formatError(res.error);
+      const ua = user_agent ?? "*";
+      const path = parsed.pathname + parsed.search;
+      // 404 means "no rules -- everything allowed" per the spec. It returns the
+      // same keys as the parsed path below (see README `fetch_robots`), because
+      // a site with no robots.txt is the common case, and a caller reading
+      // `sitemaps` or `path` off the documented shape must not get undefined.
       if (res.status === 404) {
         return formatJson({
           robotsUrl,
           status: 404,
+          userAgent: ua,
+          path,
           allowed: true,
+          matchedRule: null,
+          crawlDelay: null,
+          sitemaps: [],
+          rawRobotsText: "",
           note: "no robots.txt -- crawl permitted by default",
         });
       }
       if (!res.ok) return formatError(`HTTP ${res.status} ${res.statusText} fetching ${robotsUrl}`);
-      const robots = parseRobots(res.bodyText ?? "");
-      const ua = user_agent ?? "*";
-      const verdict = isAllowed(robots, ua, parsed.pathname + parsed.search);
+      const rawRobotsText = res.bodyText ?? "";
+      const robots = parseRobots(rawRobotsText);
+      const verdict = isAllowed(robots, ua, path);
       return formatJson({
         robotsUrl,
         status: res.status,
         userAgent: ua,
-        path: parsed.pathname + parsed.search,
+        path,
         allowed: verdict.allowed,
         matchedRule: verdict.rule ?? null,
         crawlDelay: pickGroup(robots, ua)?.crawlDelay ?? null,
         sitemaps: robots.sitemaps,
-        rawRobotsText: res.bodyText,
+        rawRobotsText,
       });
     },
   );
