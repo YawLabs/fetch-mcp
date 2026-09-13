@@ -4,7 +4,7 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 
 ## Layout
 
-- `bin/fetch-mcp.mjs` — the npm `bin`. Runtime launcher: prefers oam, falls back to the Node process already running it; imports `dist/index.js` in-process or spawns `oam run <entry> -- <argv>`.
+- `bin/fetch-mcp.mjs` — the npm `bin`. Runtime launcher: prefers the newest oam at or above `OAM_MIN` (0.15.2, the latest oam release), falls back to Node. Imports `dist/index.js` in-process, spawns `oam [--permission --allow-net] run <entry> -- <argv>`, or — from an oam host below the floor, or under `FETCH_MCP_RUNTIME=node` on any oam host — hands off to `node <entry> <argv>` with piped stdio. It never serves on an oam below the floor.
 - `src/index.ts` — CLI entrypoint: handles `version` / `--version`, rejects any other argument, otherwise calls `startServer()`.
 - `src/server.ts` — MCP server factory, registers tool modules.
 - `src/security.ts` — SSRF block list + URL validator. Security-critical.
@@ -30,7 +30,7 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 6. **Sitemap gzip detection is on the raw bytes, not Content-Encoding.** Many sitemaps are served as `.xml.gz` with `application/x-gzip` and no `Content-Encoding`, so node fetch does not decompress. `decodeSitemapPayload()` sniffs the gzip magic (`1f 8b`) on the raw buffer; don't switch sitemap to `decodeText: true` or gzip detection breaks.
 7. **JSON-LD parsing is best-effort.** `parseHtmlMeta()` swallows JSON.parse errors on malformed `<script type="application/ld+json">` blocks rather than failing the entire meta request — sites frequently ship invalid JSON-LD.
 8. **Atom link picking prefers `rel="alternate"` over `rel="self"`.** The self link points to the feed XML itself, not the article — see `extractAtomLink()` in `src/tools/feed.ts`.
-9. **Argument handling in `src/index.ts` runs before `startServer()`.** `version` / `--version` prints the version and exits 0 (the release smoke test depends on it); any other argument prints `Unknown subcommand` plus usage to **stderr** and exits 1; only a launch with no argument starts the server. `startServer()` binds stdio and blocks on stdin, so an argument that reaches it looks like a hang (#33). Never write diagnostics to stdout — it is the MCP channel. Every `bin/fetch-mcp.mjs` path (in-process under Node or a host oam, or the spawned `oam run <entry> -- …`) reaches `src/index.ts` with no argument when the launcher itself got none; `src/tests/version.test.ts` pins all three outcomes.
+9. **Argument handling in `src/index.ts` runs before `startServer()`.** `version` / `--version` prints the version and exits 0 (the release smoke test depends on it); any other argument prints `Unknown subcommand` plus usage to **stderr** and exits 1; only a launch with no argument starts the server. `startServer()` binds stdio and blocks on stdin, so an argument that reaches it looks like a hang (#33). Never write diagnostics to stdout — it is the MCP channel. Every `bin/fetch-mcp.mjs` path (in-process under Node or a host oam, the spawned `oam run <entry> -- …`, or the Node handoff `node <entry> …`) reaches `src/index.ts` with no argument when the launcher itself got none; `src/tests/version.test.ts` pins all three outcomes.
 
 ## Convention quick-list
 

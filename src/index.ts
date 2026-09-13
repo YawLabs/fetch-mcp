@@ -22,9 +22,10 @@ if (subcommand === "--version" || subcommand === "version") {
 // nothing and block on stdin forever, which reads as "the package is broken".
 // The server starts only when no argument is given -- the way MCP hosts launch
 // it, and the way every bin/fetch-mcp.mjs path arrives: its in-process import
-// keeps the launcher's own (empty) argv, and its `oam run <entry> -- ...` spawn
-// reaches here with none because oam consumes the `--` separator. stderr, never
-// stdout: stdout is the MCP channel.
+// keeps the launcher's own (empty) argv, its `oam run <entry> -- ...` spawn
+// reaches here with none because oam consumes the `--` separator, and its
+// `node <entry> ...` handoff passes the launcher's argv through unchanged.
+// stderr, never stdout: stdout is the MCP channel.
 if (subcommand !== undefined) {
   console.error(
     `Unknown subcommand: ${subcommand}\nUsage: fetch-mcp [version|--version]  (no argument starts the stdio MCP server)`,
