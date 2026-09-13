@@ -193,6 +193,127 @@ describe("launcher fallbackInProcess()", () => {
 type LauncherRun = { stdout: string; stderr: string; code: number | null };
 
 /**
+ * The `--import` preload every spawned launcher runs with: the argv[1] exit
+ * marker, the optional oam pose, and any test-specific source appended.
+ */
+function preloadFor(hostOam: string | undefined, extraPreload: string): string[] {
+  // Every run also reports, at exit, what the LAUNCHER process's argv[1] ended
+  // up as. runInProcess points it at dist/index.js; a handoff leaves it on the
+  // launcher. That is the only way to tell "served in-process" from "handed
+  // off to a child that printed the same version".
+  const exitMarker = `import { writeSync } from "node:fs"; process.on("exit", () => { try { writeSync(2, "LAUNCHER_ARGV1=" + process.argv[1] + "\\n"); } catch {} });`;
+  const posing =
+    hostOam === undefined
+      ? ""
+      : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
+  return ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}\n${extraPreload}`)}`];
+}
+
+/**
+ * Preload source that makes the launcher's FIRST spawn target a path that does
+ * not exist, and lets every later spawn through. That is the shape of a chosen
+ * oam that passed its `--version` probe and then could not be spawned (deleted
+ * or replaced in between). The version probe uses execFileSync, not spawn, so
+ * it is untouched.
+ */
+const FAIL_FIRST_SPAWN = [
+  'import childProcess from "node:child_process";',
+  'import { syncBuiltinESMExports } from "node:module";',
+  "const realSpawn = childProcess.spawn;",
+  "let failed = false;",
+  "childProcess.spawn = function (cmd, args, opts) {",
+  "  if (failed) return realSpawn.call(this, cmd, args, opts);",
+  "  failed = true;",
+  '  return realSpawn.call(this, cmd + ".does-not-exist", args, opts);',
+  "};",
+  "syncBuiltinESMExports();",
+].join("\n");
+
+type ServeSession = { answered: number[]; stderr: string; exitedOnItsOwn: boolean; code: number | null };
+
+/**
+ * Launch the REAL bin with no argument, so it serves MCP over stdio, and hold a
+ * short session: `initialize`, then -- only once that is answered -- a
+ * `tools/list`. Resolves with the ids answered and whether the launcher exited
+ * before the session was ended here.
+ *
+ * `--version` cannot see two failures this exists for, because it prints and
+ * exits before either shows up. A launcher killed a moment after it answered
+ * the first request still passes `--version`, and so does a server whose stdin
+ * stopped delivering after the first chunk. The second request, sent only after
+ * the first answer, catches both.
+ */
+function serveLauncher(
+  hostOam: string | undefined,
+  extraEnv: Record<string, string>,
+  extraPreload = "",
+): Promise<ServeSession> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(process.execPath, [...preloadFor(hostOam, extraPreload), LAUNCHER], {
+      env: { PATH: process.env.PATH ?? "", OAM_BIN: process.execPath, ...extraEnv },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const answered: number[] = [];
+    let buffered = "";
+    let stderr = "";
+    let stopped = false;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      clearTimeout(deadline);
+      child.kill();
+    };
+    // Well inside TIMEOUT_MS. A launcher that keeps running without answering
+    // is reported by what it answered, not by a vitest timeout.
+    const deadline = setTimeout(stop, 30_000);
+    const send = (message: object) => child.stdin.write(`${JSON.stringify(message)}\n`);
+    // The launcher may die with requests unsent; that EPIPE is the finding, not a crash.
+    child.stdin.on("error", () => {});
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      buffered += chunk;
+      for (let newline = buffered.indexOf("\n"); newline !== -1; newline = buffered.indexOf("\n")) {
+        const line = buffered.slice(0, newline);
+        buffered = buffered.slice(newline + 1);
+        let id: unknown;
+        try {
+          id = JSON.parse(line).id;
+        } catch {
+          continue;
+        }
+        if (typeof id !== "number") continue;
+        answered.push(id);
+        if (id === 1) {
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
+          send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+        } else if (id === 2) {
+          stop();
+        }
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(deadline);
+      resolvePromise({ answered, stderr, exitedOnItsOwn: !stopped, code });
+    });
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "launcher-test", version: "0.0.0" },
+      },
+    });
+  });
+}
+
+/**
  * Run the REAL bin under Node, optionally posing as oam by preloading a
  * `process.versions.oam` key, and return what it wrote.
  *
@@ -214,19 +335,13 @@ type LauncherRun = { stdout: string; stderr: string; code: number | null };
  * Env is a whitelist so a FETCH_MCP_* var exported by the developer's shell
  * cannot change what is being asserted.
  */
-function runLauncher(hostOam: string | undefined, extraEnv: Record<string, string> = {}): Promise<LauncherRun> {
-  // Every run also reports, at exit, what the LAUNCHER process's argv[1] ended
-  // up as. runInProcess points it at dist/index.js; a handoff leaves it on the
-  // launcher. That is the only way to tell "served in-process" from "handed
-  // off to a child that printed the same version".
-  const exitMarker = `import { writeSync } from "node:fs"; process.on("exit", () => { try { writeSync(2, "LAUNCHER_ARGV1=" + process.argv[1] + "\\n"); } catch {} });`;
-  const posing =
-    hostOam === undefined
-      ? ""
-      : `Object.defineProperty(process.versions, "oam", { value: ${JSON.stringify(hostOam)}, enumerable: true });`;
-  const preload = ["--import", `data:text/javascript,${encodeURIComponent(`${exitMarker}${posing}`)}`];
+function runLauncher(
+  hostOam: string | undefined,
+  extraEnv: Record<string, string> = {},
+  extraPreload = "",
+): Promise<LauncherRun> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, [...preload, LAUNCHER, "--version"], {
+    const child = spawn(process.execPath, [...preloadFor(hostOam, extraPreload), LAUNCHER, "--version"], {
       env: { PATH: process.env.PATH ?? "", OAM_BIN: process.execPath, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -400,6 +515,46 @@ describe("launcher with no usable oam", () => {
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim(), "nothing may be served").toBe("");
       expect(run.stderr).toMatch(/FETCH_MCP_RUNTIME=oam but no usable oam \(0\.15\.2 or newer\) was found/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it.skipIf(!buildAvailable)(
+    "still falls back when the chosen oam fails to spawn on an oam host",
+    async () => {
+      // The chosen binary passed its --version probe and then could not be
+      // spawned. A failed spawn emits 'error' and then 'close' with the negative
+      // errno, and on an oam host the launcher waits for 'close' -- so an
+      // unguarded close handler exited the launcher mid-fallback and nothing
+      // served. OAM_BIN is the Node running this test, which clears the floor,
+      // so it is the chosen "oam"; the preload sends that first spawn to a
+      // missing path, and the Node handoff spawns normally.
+      const run = await runLauncher("0.9.0", isolated({ OAM_BIN: process.execPath }), FAIL_FIRST_SPAWN);
+      expect(run.code, JSON.stringify(run)).toBe(0);
+      expect(run.stdout.trim(), "the Node fallback must still serve").toBe(PACKAGE_VERSION);
+      expect(run.stderr).toMatch(/failed to launch oam at .*; using Node instead\./);
+      expect(run.stderr).toMatch(IN_CHILD);
+    },
+    TIMEOUT_MS,
+  );
+
+  it.skipIf(!buildAvailable)(
+    "under FETCH_MCP_SANDBOX=1, a supported oam host keeps serving in-process when the chosen oam fails to spawn",
+    async () => {
+      // fetch-mcp's own fallback, which the case above cannot reach. The
+      // sandbox sends a 0.15.2 host to discovery. When the spawn fails, the
+      // documented fallback serves in THIS process, and it has to keep serving.
+      // Before the fix it answered `initialize` and then either exited on the
+      // dead child's 'close', or, with stdin already piped into that child,
+      // stopped reading stdin. Both lose the second request.
+      const session = await serveLauncher(
+        "0.15.2",
+        isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: process.execPath }),
+        FAIL_FIRST_SPAWN,
+      );
+      expect(session.answered, JSON.stringify(session)).toEqual([1, 2]);
+      expect(session.exitedOnItsOwn, JSON.stringify(session)).toBe(false);
+      expect(session.stderr).toMatch(/failed to launch oam at .*; using this oam 0\.15\.2 process instead\./);
     },
     TIMEOUT_MS,
   );
