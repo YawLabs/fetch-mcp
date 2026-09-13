@@ -2,7 +2,7 @@
 
 All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh`, run from the workstation: this repo has no GitHub Actions workflows (removed 2026-07-21), so `release.sh` is the sole pipeline and publishes to npm, GitHub Releases, and the MCP Registry itself.
 
-## [Unreleased]
+## [0.5.5] — 2026-09-12
 
 ### Fixed
 - **A mistyped or unsupported argument no longer hangs with no output.** Anything other than `version` / `--version` fell through to `startServer()`, which connects stdio and blocks on stdin forever, so `fetch-mcp versoin` or `fetch-mcp --help` looked like a broken package. It now prints `Unknown subcommand: <arg>` and a usage line to stderr (never stdout, the MCP channel) and exits 1. Launching with no argument — how MCP hosts start the server, and how every launcher path arrives: in-process under Node or a host oam, and the spawned `oam run <entry> -- …` hop, since oam consumes the `--` separator — is unchanged. ([#33](https://github.com/YawLabs/fetch-mcp/issues/33))
