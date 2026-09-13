@@ -33,11 +33,18 @@
  * no `oam --version` probe, no second oam. OAM_BIN is a discovery input, so it
  * is not consulted on that path: the host has already chosen which oam runs.
  *
- * Two cases still spawn, deliberately. FETCH_MCP_SANDBOX=1, because
- * `--permission` is a process-level flag that only a FRESH oam can apply --
- * serving in-process there would drop the sandbox without a word, a security
- * downgrade dressed up as an optimisation. And a host oam below the floor,
- * which takes the discovery path exactly as it always did.
+ * Two cases still take the discovery path, deliberately. FETCH_MCP_SANDBOX=1,
+ * because `--permission` is a process-level flag that only a FRESH oam can
+ * apply -- choosing in-process there would drop the sandbox without a word, a
+ * security downgrade dressed up as an optimisation. And a host oam below the
+ * floor, which takes the discovery path exactly as it always did.
+ *
+ * Discovery asks for a spawn; it does not guarantee one. If it finds no
+ * runnable oam at or above the floor, or the spawn itself fails, the default
+ * FETCH_MCP_RUNTIME=auto falls back to running the server in-process exactly
+ * as it always has -- so under FETCH_MCP_SANDBOX=1 that fallback serves WITHOUT
+ * `--permission`, and nothing on stderr mentions the sandbox. Set
+ * FETCH_MCP_RUNTIME=oam to make a sandbox that cannot be applied fatal instead.
  *
  * THE `--permission` SANDBOX (oam 0.9.0+, opt-in)
  * `FETCH_MCP_SANDBOX=1` runs the server under oam's permission model.
@@ -179,7 +186,8 @@ function atLeast(v, min) {
  * `hostOam` is `process.versions.oam`: oam's own key, absent on Node, so on
  * Node every mode but `node` is the discovery path it always was. `sandbox`
  * is whether a spawn would carry flags only a fresh oam can apply; see ALREADY
- * RUNNING ON OAM above for why that alone forces the spawn. The floor is
+ * RUNNING ON OAM above for why that alone forces the discovery path, and why
+ * discovery can still end in-process without those flags. The floor is
  * OAM_MIN itself, not a parameter, so a host oam and a discovered one can never
  * be held to different minimums.
  *
