@@ -7,7 +7,7 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
 - `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — keeps the Keep-a-Changelog link references current when the file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, a release with nothing under `[Unreleased]` got no entry at all (0.6.0 below is backfilled), and every GitHub release page showed raw commit subjects.
-- package.json keywords: the core discoverability terms (claude-code, cursor, ai-agents) now come before the topic-specific ones, so they survive GitHub's 20-topic cap when topics are synced from keywords.
+- package.json keywords: the core discoverability terms (mcp, mcp-server, model-context-protocol, claude-code, cursor, ai-agents, ai) now follow the product names, and `ssrf` moves ahead of the generic content keywords, so the terms that matter most survive GitHub's 20-topic cap when topics are synced from keywords. `atom` and `robots-txt` are the two that fall past it.
 
 ## [0.6.0] — 2026-09-13
 
