@@ -2,6 +2,11 @@
 
 All notable changes to `@yawlabs/fetch-mcp` are documented here. This project uses [semantic versioning](https://semver.org). Releases ship via `release.sh`, run from the workstation: this repo has no GitHub Actions workflows (removed 2026-07-21), so `release.sh` is the sole pipeline and publishes to npm, GitHub Releases, and the MCP Registry itself.
 
+## [Unreleased]
+
+### Changed
+- npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+
 ## [0.5.7] — 2026-09-13
 
 ### Fixed

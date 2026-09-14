@@ -2,6 +2,13 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.YawLabs/fetch-mcp",
   "description": "HTTP fetch MCP server: SSRF protection, HTML-to-markdown, reader mode, metadata extraction",
+  "title": "Fetch MCP Server",
+  "repository": {
+    "url": "https://github.com/YawLabs/fetch-mcp",
+    "source": "github",
+    "id": "1215431148"
+  },
+  "websiteUrl": "https://yaw.sh/mcp-servers/fetch-mcp/",
   "version": "0.6.0",
   "packages": [
     {
