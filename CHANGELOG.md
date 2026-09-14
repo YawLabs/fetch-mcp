@@ -6,6 +6,17 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ### Changed
 - npm and MCP Registry listing metadata: bugs URL, core keywords, and server.json title/repository/websiteUrl
+- `release.sh` writes a `## [x.y.z]` changelog entry for every release — promoting `[Unreleased]` when it has content, otherwise generating one from the commit subjects since the previous tag — keeps the Keep-a-Changelog link references current when the file has them, and takes the GitHub release notes from that entry instead of from `git log` subjects. Before this, a release with nothing under `[Unreleased]` got no entry at all (0.6.0 below is backfilled), and every GitHub release page showed raw commit subjects.
+
+## [0.6.0] — 2026-09-13
+
+Release tooling and documentation only; no change to the published package's behavior.
+
+### Changed
+- README: the X follow badge moved from the top of the page to the bottom, so the description leads on npm and GitHub (#42).
+
+### Internal
+- **`release.sh` waits for npm to serve the new version before the MCP Registry step.** `npm publish` returns as soon as the registry accepts the tarball, but the version is not yet readable from npm's CDN-backed read path, and the MCP Registry validates a publish by reading it — ssh-mcp v0.15.3's registry step failed with `version '0.15.3' was not found (status: 404)` and needed a re-run, and aws-mcp hit the same failure on three consecutive releases. The script now polls the exact per-version URL the registry's npm validator requests (`@yawlabs%2Ffetch-mcp/<version>`, the scope slash escaped the way Go's `url.PathEscape` does it) with `curl` rather than `npm view`, whose 5-minute metadata cache can outlast the condition it is waiting on. A timeout warns rather than fails, so `mcp-publisher` still reports its own precise error. `SKIP_NPM_WAIT=1` bypasses the wait, `NPM_WAIT_TIMEOUT_S` retunes the 300s default, and a host without curl skips it with a warning (#41).
 
 ## [0.5.7] — 2026-09-13
 
