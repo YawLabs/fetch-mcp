@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-16
+
 ### Security
 - **`FETCH_MCP_SANDBOX` now accepts `1`, `true`, `yes` and `on` (case-insensitive, trimmed); `FETCH_MCP_RUNTIME` is trimmed and lowercased.** Both used to be quiet about a value the launcher did not understand: `FETCH_MCP_SANDBOX=true` -- the natural spelling in a JSON env block -- and `FETCH_MCP_RUNTIME="oam "` (a trailing space) ran unsandboxed / on Node with nothing on stderr, a silent downgrade of two opt-ins. Anything unrecognised is now treated as the default (off / auto) and NAMED on stderr (`FETCH_MCP_SANDBOX=maybe is not recognised and is treated as off...` and `FETCH_MCP_RUNTIME=oam; is not recognised and is treated as auto...`). The fail-closed pairing (sandbox on + `RUNTIME=oam`) cannot fall open on a typo, and the unit tests pin every accepted spelling.
 - **A dropped sandbox is no longer silent.** Every path that serves without `--permission` after it was asked for -- a below-floor oam host with nothing to spawn, a Node host, the `RUNTIME=node` hand-off, or a chosen oam that would not start -- now prints `runs WITHOUT --permission`, names the consequence, says how to get the sandbox applied (install / update oam, or set `OAM_BIN`), and names the way to make its absence fatal (`RUNTIME=oam`). The note is printed ONLY once a serving path is committed to, so it never sits next to an exit that served nothing; the old code printed "using Node instead" before the launcher had looked for Node on PATH, and could sit directly above "no Node was found on PATH" on the failure case.
