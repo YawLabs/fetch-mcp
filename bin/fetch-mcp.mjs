@@ -25,12 +25,13 @@
  *
  * WHICH OAM
  * OAM_BIN, when set and usable, is used as given. Otherwise every oam binary
- * discovery can see -- the installed locations, then PATH -- is asked for its
- * version, and the NEWEST one at or above the floor wins; a tie keeps search
- * order. Taking the first binary found instead let a stale copy early in the
- * search order hide a current one later: with oam 0.9.0 installed in ~/.oam/bin
- * and 0.15.2 on PATH, the launcher bound to 0.9.0 because installed locations
- * are searched first.
+ * discovery can see -- the oam THIS process runs on, if any (see
+ * hostOamCandidate), then the installed locations, then PATH -- is asked for
+ * its version, and the NEWEST one at or above the floor wins; a tie keeps
+ * search order. Taking the first binary found instead let a stale copy early
+ * in the search order hide a current one later: with oam 0.9.0 installed in
+ * ~/.oam/bin and 0.15.2 on PATH, the launcher bound to 0.9.0 because installed
+ * locations are searched first.
  *
  * An OAM_BIN that does not exist, is below the floor, or will not run is named
  * on stderr and discovery carries on. It used to stop everything: a typo in
@@ -74,10 +75,10 @@
  * oam, or the spawn itself fails, the default FETCH_MCP_RUNTIME=auto falls
  * back. A Node host runs the server in-process, and so does an oam host at the
  * floor -- which only reaches discovery for the sandbox -- so under
- * FETCH_MCP_SANDBOX=1 that fallback serves WITHOUT `--permission`, and nothing
- * on stderr mentions the sandbox. A host below the floor hands off to Node
- * instead. Set FETCH_MCP_RUNTIME=oam to make a sandbox that cannot be applied
- * fatal.
+ * FETCH_MCP_SANDBOX=1 that fallback serves WITHOUT `--permission`. The
+ * launcher says so on stderr rather than downgrading silently, and
+ * FETCH_MCP_RUNTIME=oam makes a sandbox that cannot be applied fatal instead.
+ * A host below the floor hands off to Node.
  *
  * THE `--permission` SANDBOX (opt-in)
  * `FETCH_MCP_SANDBOX=1` runs the server under oam's permission model.
@@ -92,6 +93,23 @@
  * It is opt-in because `--permission` is a behaviour change, and a server that
  * gains a legitimate need for either capability should fail in review, not in a
  * user's session.
+ *
+ * Request the sandbox through the environment variable, not by putting
+ * `--permission` on the HOST command (`oam --permission run <this file>`):
+ * under that host every process.env read is empty, so FETCH_MCP_SANDBOX,
+ * FETCH_MCP_RUNTIME and OAM_BIN are all inert. The outcome is still safe --
+ * the host's own sandbox covers the in-process server -- but nothing this
+ * launcher is told applies.
+ *
+ * When the sandbox IS applied the launcher prints no line about it (it may
+ * still mention an unusable OAM_BIN it passed over). Every path that serves
+ * WITHOUT it after it was asked for prints a line that contains
+ * `runs WITHOUT --permission`, plus how to get it applied. To make silence
+ * mean success, pair it with FETCH_MCP_RUNTIME=oam, which turns an unapplied
+ * sandbox into a startup failure. To confirm from a shell:
+ *   FETCH_MCP_SANDBOX=1 FETCH_MCP_RUNTIME=oam fetch-mcp --version
+ * The version on stdout, exit 0 and no `WITHOUT --permission` line means the
+ * sandboxed oam served it.
  *
  * MINIMUM OAM VERSION
  * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
@@ -112,10 +130,16 @@
  *                            it, unless FETCH_MCP_SANDBOX=1 needs a fresh one)
  *   FETCH_MCP_RUNTIME=node   Node: in THIS process on Node, handed off to Node
  *                            on PATH when THIS process is oam; never sandboxed
- *   FETCH_MCP_SANDBOX=1      spawn oam under --permission (see above)
+ *   FETCH_MCP_SANDBOX=1      spawn oam under --permission (see above); not
+ *                            applied under FETCH_MCP_RUNTIME=node, and the
+ *                            launcher says so
  *   OAM_BIN=/path/to/oam     use this oam when it is usable, before discovery
- * The FETCH_MCP_RUNTIME value is case-insensitive; anything else behaves like
- * `auto`.
+ * Both values are case-insensitive and trimmed. A runtime value other than
+ * auto / oam / node is treated as auto and named on stderr. A sandbox value of
+ * 1 / true / yes / on enables it, 0 / false / no / off (or unset) disables it,
+ * and anything else is treated as off and named on stderr. Neither is ever a
+ * silent no-op: the fail-closed pairing (sandbox on + RUNTIME=oam) must not
+ * fall open on a typo.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -286,6 +310,43 @@ function fallbackInProcess(hostOam) {
 }
 
 /**
+ * How FETCH_MCP_SANDBOX reads: "on", "off", or "unrecognised" (set to
+ * something that is neither). Case-insensitive, whitespace-trimmed, because a
+ * security opt-in that fails OPEN on `true`, `Yes` or a trailing space -- with
+ * nothing on stderr -- is the silent downgrade this launcher promises never to
+ * make. An unrecognised value is treated as off AND named on stderr (see the
+ * top-level `sandboxSetting` check below), never quietly honoured or quietly
+ * ignored.
+ *
+ * Pure on purpose, like runtimePlan: the accepted spellings are testable
+ * without booting anything.
+ */
+function parseSandboxSetting(value) {
+  if (value === undefined) return "off";
+  const v = value.trim().toLowerCase();
+  if (v === "" || v === "0" || v === "false" || v === "no" || v === "off") return "off";
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return "on";
+  return "unrecognised";
+}
+
+/**
+ * How FETCH_MCP_RUNTIME reads: `{ mode, recognised }`. Trimmed and
+ * case-insensitive; anything but auto / oam / node is `auto` with
+ * `recognised: false`, which the caller names on stderr. Silence here would
+ * let the fail-closed pairing (sandbox on + RUNTIME=oam) fall open on
+ * `"oam "` -- the same class of downgrade parseSandboxSetting exists to stop.
+ *
+ * Pure on purpose, like parseSandboxSetting.
+ */
+function parseRuntimeSetting(value) {
+  const v = (value ?? "").trim().toLowerCase();
+  // Unset and empty both mean the default, as they do for the sandbox value.
+  const mode = v === "" ? "auto" : v;
+  if (mode === "auto" || mode === "oam" || mode === "node") return { mode, recognised: true };
+  return { mode: "auto", recognised: false };
+}
+
+/**
  * The `--permission` grant list, or [] when the sandbox is not requested.
  *
  * These are oam's PROCESS-level flags: they belong before the `run` subcommand,
@@ -297,8 +358,8 @@ function fallbackInProcess(hostOam) {
  * so the env list below is derived from what the bundle actually reads; trimming
  * it produces silent misbehaviour, not a clear denial.
  */
-function sandboxFlags() {
-  if (process.env.FETCH_MCP_SANDBOX !== "1") return [];
+function sandboxFlags(setting) {
+  if (setting !== "on") return [];
 
   // Bare --allow-net grants every host. See the header for why that is correct
   // here rather than a cop-out.
@@ -308,8 +369,7 @@ function sandboxFlags() {
   // make. The flag is omitted rather than emitted empty: under `--permission`
   // an absent --allow-env already denies everything, and `--allow-env=` would
   // state the same thing in a form that reads like an oversight.
-  const flags = ["--permission", netFlag];
-  return flags;
+  return ["--permission", netFlag];
 }
 
 /**
@@ -379,10 +439,34 @@ function unusableReason(path, version, label = path) {
 }
 
 /**
- * Choose the oam to spawn: a usable OAM_BIN, else the newest usable discovered
- * binary. Returns the choice (or null) plus stderr notes: `overrideNote` about
- * an unusable OAM_BIN, and `skipped` describing what was found and rejected
- * when nothing was usable.
+ * The oam THIS process runs on, as a spawn candidate -- or null on Node.
+ *
+ * A host that launches `oam run <this file>` from an oam that is not on PATH
+ * and not in an installed location (Yaw MCP ships its own, inside the app)
+ * is the most common way to reach discovery from an oam host at all: the
+ * sandbox needs a fresh oam, and the one binary guaranteed to exist is the
+ * host's own. Without this, such a host reported "no usable oam was found"
+ * while being one.
+ *
+ * The binary must report the version the host says it is. A wrapper or shim
+ * on execPath, or a Node posing as oam (this launcher's own tests preload
+ * `process.versions.oam` onto Node), is not an oam that can spawn a child, and
+ * the one `--version` probe tells them apart.
+ */
+function hostOamCandidate() {
+  if (process.versions.oam === undefined) return null;
+  const version = oamVersion(process.execPath);
+  const claimed = parseVersion(process.versions.oam);
+  if (!version || !claimed || version.join(".") !== claimed.join(".")) return null;
+  return { path: process.execPath, version };
+}
+
+/**
+ * Choose the oam to spawn: a usable OAM_BIN, else the newest usable binary
+ * among the host's own oam (first, so it wins ties) and discovery. Returns the
+ * choice (or null) plus stderr notes: `overrideNote` about an unusable
+ * OAM_BIN, and `skipped` describing what was found and rejected when nothing
+ * was usable.
  */
 function chooseOam() {
   const override = process.env.OAM_BIN;
@@ -396,10 +480,14 @@ function chooseOam() {
       overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
     }
   }
-  const overrideKey = override ? pathKey(override) : null;
-  const candidates = discoverOamPaths()
-    .filter((path) => pathKey(path) !== overrideKey)
-    .map((path) => ({ path, version: oamVersion(path) }));
+  const host = hostOamCandidate();
+  const seen = new Set([override, host?.path].filter(Boolean).map(pathKey));
+  const candidates = [
+    ...(host ? [host] : []),
+    ...discoverOamPaths()
+      .filter((path) => !seen.has(pathKey(path)))
+      .map((path) => ({ path, version: oamVersion(path) })),
+  ];
   const chosen = pickNewest(candidates);
   const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
   return { chosen, overrideNote, skipped };
@@ -421,12 +509,14 @@ async function runInProcess() {
   await import(SERVER_URL.href);
 }
 
-// ONE reporter for every failed in-process fallback. runInProcess() is a bare
-// import() that rejects when dist/index.js is missing, and at ESM top level an
-// unhandled rejection is an uncaught exception -- replacing this launcher's
-// diagnostic with a raw stack trace.
-const fallbackFailed = (e) => {
-  process.stderr.write(`fetch-mcp: fallback to Node failed (${e?.message ?? e})\n`);
+// ONE reporter for every failed in-process start, primary path or fallback.
+// runInProcess() is a bare import() that rejects when dist/index.js is missing,
+// and at ESM top level an unhandled rejection is an uncaught exception --
+// replacing this launcher's diagnostic with a raw stack trace. Names the
+// process it was starting in rather than "Node": under the sandbox an at-floor
+// oam host falls back on itself.
+const startFailed = (e) => {
+  process.stderr.write(`fetch-mcp: could not start the server in ${fallbackTarget(hostOam)} (${e?.message ?? e})\n`);
   process.exitCode = 1;
 };
 
@@ -458,7 +548,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
     // 'error' listener is registered AFTER this call, so it can never observe
     // one -- an uncaught throw here kills the launcher with a raw stack trace
     // instead of falling back.
-    await onLaunchFailed(err).catch(fallbackFailed);
+    await onLaunchFailed(err).catch(startFailed);
     return;
   }
 
@@ -484,7 +574,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
   });
   child.on("error", (err) => {
     if (spawned) return;
-    onLaunchFailed(err).catch(fallbackFailed);
+    onLaunchFailed(err).catch(startFailed);
   });
   // A child that exits before reading everything closes its stdin; the
   // resulting EPIPE is not worth crashing over.
@@ -555,21 +645,30 @@ async function launchChild(cmd, args, onLaunchFailed) {
  * Hand the server to Node on PATH. Only reachable when THIS process is oam --
  * one below the floor, or any oam under FETCH_MCP_RUNTIME=node -- so there is
  * no in-process option left. `reason` is printed before the handoff; empty
- * means Node was asked for, which is not news.
+ * means Node was asked for, which is not news. `sandboxWhy`, when the sandbox
+ * was requested, is printed only once Node has been found: a line saying the
+ * server runs without `--permission` must not precede an exit that served
+ * nothing.
  */
-async function handOffToNode(reason) {
+async function handOffToNode(reason, sandboxWhy) {
   const node = findNodeOnPath();
   if (!node) {
+    // On an oam at the floor under FETCH_MCP_RUNTIME=node, the only obstacle
+    // to serving is that setting: THIS process could serve. Say so.
+    const onUsableOam = atLeast(parseVersion(process.versions.oam), OAM_MIN);
+    const serveHere = onUsableOam
+      ? `, or remove FETCH_MCP_RUNTIME=node to serve on this oam ${process.versions.oam}`
+      : "";
     const remedy =
       mode === "node"
-        ? "Put Node on PATH, or launch this command with node.\n"
+        ? `Put Node on PATH, launch this command with node${serveHere}.\n`
         : `Run \`oam self-update\` to get oam ${OAM_MIN.join(".")} or newer, or launch this command with node.\n`;
-    await errSync(
-      `fetch-mcp: ${reason || `FETCH_MCP_RUNTIME=node on oam ${process.versions.oam}`}, and no Node was found on PATH to run the server.\n${remedy}`,
-    );
+    const what = reason || `FETCH_MCP_RUNTIME=node on oam ${process.versions.oam ?? "this process"}`;
+    await errSync(`fetch-mcp: ${what}, and no Node was found on PATH to run the server.\n${remedy}`);
     process.exit(1);
   }
   if (reason) await errSync(`fetch-mcp: ${reason}; running on ${node} instead.\n`);
+  await noteSandboxNotApplied(sandboxWhy);
   await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
     await errSync(`fetch-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
     process.exit(1);
@@ -581,29 +680,101 @@ function fallbackTarget(hostOam) {
   return hostOam !== undefined && fallbackInProcess(hostOam) ? `this oam ${hostOam} process` : "Node";
 }
 
-/** No usable oam, or it would not start, under a mode that allows a fallback. */
+/**
+ * The "; using X instead" suffix for a fallback announcement -- only when the
+ * fallback serves in THIS process, which cannot fail to be found. A handoff to
+ * Node has not looked for Node yet; handOffToNode names it once it has, so an
+ * announcement here cannot sit above "no Node was found on PATH".
+ */
+function fallbackSuffix(hostOam) {
+  return fallbackInProcess(hostOam) ? `; using ${fallbackTarget(hostOam)} instead` : "";
+}
+
+/**
+ * The one line that keeps a dropped sandbox from being silent. Printed on every
+ * path that serves without `--permission` after it was asked for -- a fallback
+ * (nothing usable to spawn, or the spawn failed), and FETCH_MCP_RUNTIME=node,
+ * where there is no oam to apply it -- and printed only once that path is
+ * committed to serving, so it never sits next to an exit that served nothing.
+ * `why` is a clause; the line names the consequence, how to get the sandbox
+ * applied, and how to make its absence fatal instead.
+ */
+async function noteSandboxNotApplied(why) {
+  if (sandbox.length === 0) return;
+  const remedy =
+    mode === "node"
+      ? "Remove FETCH_MCP_RUNTIME=node to let the launcher use oam.\n"
+      : `To apply it, install or update oam (${OAM_MIN.join(".")} or newer) from https://oamjs.org or set ` +
+        "OAM_BIN=/path/to/oam; set FETCH_MCP_RUNTIME=oam to make this fatal instead.\n";
+  await errSync(
+    `fetch-mcp: ${sandboxAsSet} was not applied -- ${why}, so the server runs WITHOUT --permission.\n${remedy}`,
+  );
+}
+
+/**
+ * No usable oam, or it would not start, under a mode that allows a fallback.
+ * `why` finishes the below-floor handoff note, so it can say which of the two
+ * happened.
+ */
 async function fallBack(hostOam, why) {
+  // "fresh" is the word that makes this line make sense on a host that IS an
+  // oam at the floor: it just said "using this oam 0.15.2 process", and only a
+  // freshly spawned oam can apply a process-level flag.
+  const sandboxWhy = `a fresh oam (${OAM_MIN.join(".")} or newer) is needed to apply it and none could be spawned`;
   if (fallbackInProcess(hostOam)) {
+    await noteSandboxNotApplied(sandboxWhy);
     await runInProcess();
     return;
   }
-  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`);
+  await handOffToNode(`this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}, and ${why}`, sandboxWhy);
 }
 
-const mode = (process.env.FETCH_MCP_RUNTIME ?? "auto").toLowerCase();
+const runtimeSetting = parseRuntimeSetting(process.env.FETCH_MCP_RUNTIME);
+const mode = runtimeSetting.mode;
 const hostOam = process.versions.oam;
 
 // The sandbox is read off the grant list rather than FETCH_MCP_SANDBOX, so
 // "would the spawn carry --permission" cannot drift from what the spawn below
 // actually passes.
-const sandbox = sandboxFlags();
+const sandboxSetting = parseSandboxSetting(process.env.FETCH_MCP_SANDBOX);
+const sandbox = sandboxFlags(sandboxSetting);
+// The value as the user wrote it (trimmed: an accepted "1 " should not print
+// as a double space), so every line about it matches their config.
+const sandboxAsSet = `FETCH_MCP_SANDBOX=${(process.env.FETCH_MCP_SANDBOX ?? "").trim()}`;
+
+// Both settings: set to something, but nothing this launcher understands.
+// The safe reading of an unknown value is the default (auto; sandbox off) --
+// honouring a guess could sandbox a server whose operator meant to switch the
+// sandbox off -- but the default must never be silent. These lines describe
+// the READING only; whether the server then serves is not known yet, so they
+// make no claim about it.
+if (!runtimeSetting.recognised) {
+  await errSync(
+    `fetch-mcp: FETCH_MCP_RUNTIME=${(process.env.FETCH_MCP_RUNTIME ?? "").trim()} is not recognised ` +
+      "and is treated as auto; use auto, oam or node.\n",
+  );
+}
+if (sandboxSetting === "unrecognised") {
+  await errSync(
+    `fetch-mcp: ${sandboxAsSet} is not recognised and is treated as off; ` +
+      "set it to 1 to enable the sandbox or 0 to disable it.\n",
+  );
+}
 const plan = runtimePlan({ mode, hostOam, sandbox: sandbox.length > 0 });
 
+// Only FETCH_MCP_RUNTIME=node reaches either non-discovery plan with the
+// sandbox requested; a sandboxed `auto` or `oam` always discovers.
+const SANDBOX_MOOT_ON_NODE = "FETCH_MCP_RUNTIME=node runs the server on Node, which has no oam sandbox";
+
 if (plan === "in-process") {
-  await runInProcess();
+  await noteSandboxNotApplied(SANDBOX_MOOT_ON_NODE);
+  await runInProcess().catch(startFailed);
 } else if (plan === "handoff-node") {
   const belowFloor = !atLeast(parseVersion(hostOam), OAM_MIN);
-  await handOffToNode(belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "");
+  await handOffToNode(
+    belowFloor ? `this process is oam ${hostOam}, older than ${OAM_MIN.join(".")}` : "",
+    SANDBOX_MOOT_ON_NODE,
+  );
 } else {
   const { chosen, overrideNote, skipped } = chooseOam();
 
@@ -620,7 +791,7 @@ if (plan === "in-process") {
         process.exit(1);
       }
       await errSync(
-        `fetch-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err}); using ${fallbackTarget(hostOam)} instead.\n`,
+        `fetch-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})${fallbackSuffix(hostOam)}.\n`,
       );
       await fallBack(hostOam, "the newer oam would not start");
     });
@@ -636,16 +807,27 @@ if (plan === "in-process") {
         : []),
     ];
     if (mode === "oam") {
+      // With the sandbox requested, "use FETCH_MCP_RUNTIME=node" is not a
+      // remedy but a trade: Node cannot apply it. Say so, or the advice loops
+      // -- the fallback note sends people to RUNTIME=oam, and this error would
+      // send them straight back.
+      const nodeOption =
+        sandbox.length > 0
+          ? `or drop ${sandboxAsSet} and use FETCH_MCP_RUNTIME=node (Node cannot apply the sandbox)`
+          : "or use FETCH_MCP_RUNTIME=node";
       await errSync(
-        `fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found.\n` +
+        `fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found` +
+          `${sandbox.length > 0 ? `, and ${sandboxAsSet} needs one` : ""}.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
-          "Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, or use FETCH_MCP_RUNTIME=node.\n",
+          `Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, ${nodeOption}.\n`,
       );
       process.exit(1);
     }
     // auto: falling back is correct, but silence is how someone never learns
     // their OAM_BIN is wrong or their oam is too old to use.
-    if (notes.length > 0) await errSync(`fetch-mcp: ${notes.join("; ")}; using ${fallbackTarget(hostOam)} instead.\n`);
-    await fallBack(hostOam, "no newer oam was found").catch(fallbackFailed);
+    if (notes.length > 0) {
+      await errSync(`fetch-mcp: ${notes.join("; ")}${fallbackSuffix(hostOam)}.\n`);
+    }
+    await fallBack(hostOam, "no newer oam was found").catch(startFailed);
   }
 }
