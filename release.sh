@@ -73,11 +73,17 @@ changelog_dash() {
   if [ -n "$d" ]; then printf '%s' "$d"; else printf '%s' '--'; fi
 }
 
-# The tag this release is compared against: the newest v* tag reachable from
-# HEAD other than this release's own (a re-run after tagging must not compare
-# the version with itself). Empty on a first release.
+# The tag this release is compared against: the immediate predecessor of
+# v${VERSION} in semver order, matching the query step 6 uses. `git describe
+# --exclude` returns the most recent tag REACHABLE FROM HEAD instead, which
+# after a few releases points at an unrelated ancestor and pulls the wrong
+# commits into the generated changelog. Empty when v${VERSION} is the only
+# v* tag (a true first release).
 changelog_prev_tag() {
-  git describe --tags --abbrev=0 --match 'v*' --exclude "v${VERSION}" 2>/dev/null || true
+  git tag --sort=-v:refname 2>/dev/null \
+    | grep -A1 "^v${VERSION}$" \
+    | tail -1 \
+    | grep -v "^v${VERSION}$" || true
 }
 
 # The body of a generated entry: one bullet per commit subject since the
@@ -279,12 +285,11 @@ if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then
     read -p "Continue? (y/N) " -n 1 -r
     echo
     [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-  fi
-  
-  step 1 "Lint + typecheck"
   else
     info "Non-interactive shell -- proceeding without confirmation"
   fi
+  step 1 "Lint + typecheck"
+fi
 npm run lint || fail "Lint failed"
 npm run typecheck || fail "Type check failed"
 info "Lint + typecheck passed"
