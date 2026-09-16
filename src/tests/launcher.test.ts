@@ -1014,7 +1014,9 @@ describe("launcher with no usable oam", () => {
       expect(fatalLine, `fatal line must be the plain RUNTIME=oam opening: ${fatalLine}`).toMatch(
         /^fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam \(0\.15\.2 or newer\) was found\.$/,
       );
-      expect(fatalLine, `loop-aware text must not appear in the fatal: ${fatalLine}`).not.toMatch(/drop FETCH_MCP_SANDBOX/);
+      expect(fatalLine, `loop-aware text must not appear in the fatal: ${fatalLine}`).not.toMatch(
+        /drop FETCH_MCP_SANDBOX/,
+      );
       expect(fatalLine, `loop-aware text must not appear in the fatal: ${fatalLine}`).not.toMatch(/Node cannot apply/);
       // The remedy below the fatal: plain RUNTIME=node, no sandbox clause.
       expect(run.stderr).toMatch(/, or use FETCH_MCP_RUNTIME=node\.$/m);
