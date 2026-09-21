@@ -9,12 +9,12 @@
     "id": "1215431148"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/fetch-mcp/",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/fetch-mcp",
-      "version": "0.7.1",
+      "version": "0.8.0",
       "transport": {
         "type": "stdio"
       }

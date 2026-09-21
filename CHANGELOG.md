@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-21
+
 ### Security
 - **More IPv6 forms that reach IPv4 are blocked.** `checkIpAddress()` now rechecks the IPv4 embedded in IPv4-compatible (`::a.b.c.d`; URL normalisation turns `http://[::127.0.0.1]/` into `[::7f00:1]`), IPv4-translated (SIIT, `::ffff:0:a.b.c.d`) and 6to4 (`2002::/16`) addresses, and refuses Teredo (`2001::/32`), local-use NAT64 (`64:ff9b:1::/48`), site-local (`fec0::/10`) and discard-only (`100::/64`) outright. Each passed both the literal check and the DNS-answer check before. None of them connected on the hosts tested, so this is hardening rather than a demonstrated bypass. Public addresses in the rechecked forms, and the rest of `2001::/16` (Google Public DNS is `2001:4860::`), are still allowed. Past those named rules, IPv6 is now an allow-list: only global unicast (`2000::/3`) is accepted, minus the non-global blocks inside it (`3fff::/20` documentation, `2001:2::/48` benchmarking, `2001:10::/28` ORCHID), so `5f00::/16` SRv6, `100:0:0:1::/64` and unassigned space are refused, and the next special-purpose block IANA adds is closed by default.
 - **The Azure WireServer address `168.63.129.16` is blocked.** It looks public but is present on every Azure VM and serves goal state and extension settings to the guest.
