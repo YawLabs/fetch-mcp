@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Deadlines and cancellation (0.7.2).
+// Deadlines and cancellation (0.8.0).
 //
 // Through 0.7.1 `timeout_ms` bounded each HOP separately, the DNS lookup ran
 // before the hop's timer started, retries slept through their Retry-After

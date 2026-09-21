@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // We mock node:dns/promises so a public-looking hostname resolves to attacker-
 // controlled internal IPs, then assert httpRequest refuses with the resolveAndPin
 // "DNS: <host> resolves to ... reserved address" reason -- which must NOT name the
-// resolved IP (since 0.7.2), or every refusal maps an internal host to its
+// resolved IP (since 0.8.0), or every refusal maps an internal host to its
 // address. fetch must never be reached in the refusal cases.
 
 const REFUSED = /resolves to a private, loopback, link-local or otherwise reserved address -- refused$/;
