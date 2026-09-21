@@ -44,21 +44,38 @@ This is the `@yawlabs/fetch-mcp` server. Stdio MCP server. HTTP fetch with SSRF 
 ## Convention quick-list
 
 - Use npm, keep the lockfile committed.
-- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit -- there is no push/PR CI gate, so the pre-commit local pass and `release.sh`'s own lint/test steps are the only checks.
+- Run `npm run lint:fix` + `npm run typecheck` + `npm test` before every commit. Nothing runs checks for you -- no GitHub Actions, no git hooks -- so this local pass and `release.sh` steps 1-2 are the only checks. (A PR is still required to land on `main`; see below. It gates the merge, not the code.)
 - Record user-facing changes under `## [Unreleased]` in `CHANGELOG.md` as you land them; `release.sh` promotes that heading to the release version.
 - zod schemas describe tool input; the exported TypeScript type is derived from the zod shape, not hand-written.
 - Tool callbacks always return a `formatX()` result — never throw. Upstream errors get caught and returned as `formatError(...)`.
 
+## Landing changes: `main` requires a pull request
+
+`main` and the release tags are guarded by three repository **rulesets**. They are not classic branch protection, so `gh api repos/YawLabs/fetch-mcp/branches/main/protection` answers 404 "Branch not protected" -- that answer is WRONG for this repo. Read `gh api repos/YawLabs/fetch-mcp/rules/branches/main` instead.
+
+| Ruleset | Target | Rules | Who can bypass |
+|---|---|---|---|
+| Protect default branch | `main` | pull request required; 0 approvals; merge, squash or rebase | org admins |
+| Protect release tags | `refs/tags/v*` | creation, deletion, non-fast-forward | org admins |
+| Block force-push and deletion | `main` | deletion, non-fast-forward | nobody |
+
+Jeff is an org admin, so a direct `git push origin main` from his account **succeeds**. The only sign is a line in the push output: `remote: Bypassed rule violations for refs/heads/main: - Changes must be made through a pull request.` That is a bypass of his protection, which his global rules forbid without asking first. On 2026-09-21 two non-release commits (`12363b4`, `ac4cccf`) went in that way before anyone noticed.
+
+- **Every non-release change:** branch -> commit -> push the branch (with `GIT_SSH_COMMAND`) -> `gh pr create` -> `gh pr merge <N> --squash`. Zero approvals are required, so the merge needs no `--admin`.
+- **The one sanctioned direct push is `release.sh` step 4:** the `vX.Y.Z` commit and its annotated tag, both through the org-admin bypass (creating a `v*` tag is admin-only). So land the changes by PR first, `git pull` on `main`, then run `./release.sh` from the clean, up-to-date `main`.
+- **After any push, read the remote output.** "Bypassed rule violations" on anything other than a `release.sh` push means stop and tell Jeff.
+- Force-push and deletion on `main` are blocked for everyone, admins included. There is no bypass to reach for.
+
 ## Release
 
-**`./release.sh X.Y.Z` from a clean `main` on the workstation is the whole pipeline.** The repo has no GitHub Actions workflows and Actions is disabled on it (workflows removed 2026-07-21), so nothing fires on tag push and nothing re-checks the tree after you. Don't hand-roll `npm version` + tag + push: that tags a version nobody publishes.
+**`./release.sh X.Y.Z` from a clean `main` on the workstation is the whole pipeline**, once the changes have landed by PR (above). The repo has no GitHub Actions workflows and Actions is disabled on it (workflows removed 2026-07-21), so nothing fires on tag push and nothing re-checks the tree after you. Don't hand-roll `npm version` + tag + push: that tags a version nobody publishes.
 
 The script runs eight steps. Each is idempotent, so after an interruption re-run with the same version to resume:
 
 1. Lint + typecheck -- the only lint gate this repo has.
 2. Build + test.
 3. Bump `package.json` / `package-lock.json`, sync `server.json`, and promote `## [Unreleased]` in `CHANGELOG.md` to the version. Aborts if the release would ship with unpromoted `[Unreleased]` content.
-4. Commit `vX.Y.Z`, create an annotated tag, `git push origin main --follow-tags`.
+4. Commit `vX.Y.Z`, create an annotated tag, `git push origin main --follow-tags`. This direct push, and the `v*` tag creation, go through the org-admin ruleset bypass; the output shows "Bypassed rule violations" for both refs. It is the only sanctioned bypass.
 5. `npm publish`, with EOTP retry.
 6. GitHub release. Its notes are the CHANGELOG section for the version (passed by file), so the `[Unreleased]` block is what people read on the release page.
 7. Smoke test (below), then MCP Registry publish via `mcp-publisher` (token: `MCP_REGISTRY_TOKEN`, else `gh auth token`).
