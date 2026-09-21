@@ -569,10 +569,16 @@ describe("launcher on an oam host", () => {
   it.skipIf(!buildAvailable)(
     "still discovers when the host oam is below the floor",
     async () => {
+      // The invariant is the process shape: a below-floor host never serves in
+      // THIS process. What discovery then finds depends on the box -- OAM_BIN is
+      // Node here, whose --version passes the probe and whose spawn as an oam
+      // fails; but a probe that times out under load moves on to whatever real
+      // oam PATH holds and serves through it -- so assert the shape, not the
+      // outcome. (The stdout==version heuristic read the served-by-child case as
+      // a shortcut and flaked a release run.)
       const run = await runLauncher("0.15.1");
-      expect(servedInProcess(run), `a below-floor host must not shortcut, got ${JSON.stringify(run)}`).toBe(false);
-      expect(run.code).not.toBe(0);
-      expect(run.stderr).not.toMatch(/^fetch-mcp: /m);
+      expect(run.stderr, `a below-floor host must not shortcut, got ${JSON.stringify(run)}`).toMatch(IN_CHILD);
+      expect(run.stderr).not.toMatch(IN_LAUNCHER_PROCESS);
     },
     TIMEOUT_MS,
   );
