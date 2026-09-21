@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { ABSOLUTE_MAX_BYTES, httpRequest } from "../http.js";
+import { ABSOLUTE_MAX_BYTES, ABSOLUTE_MAX_TOTAL_MS, type HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export interface SitemapUrl {
@@ -19,6 +19,8 @@ export interface ParsedSitemap {
 }
 
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_SITEMAPS = 50;
+const MAX_SITEMAPS_CEILING = 1000;
 
 /**
  * The per-sitemap byte budget: the caller's `max_bytes` (default 20 MiB),
@@ -130,7 +132,20 @@ interface SitemapWarning {
   error: string;
 }
 
-export function registerSitemapTools(server: McpServer) {
+export interface SitemapLimits {
+  /**
+   * Budget for one whole fetch_sitemap call, across every document it fetches.
+   * Defaults to the ceiling a single httpRequest() call has. Injected rather
+   * than module state so a test can shorten it without touching other servers.
+   */
+  totalMs: number;
+}
+
+export function registerSitemapTools(
+  server: McpServer,
+  request: HttpRequester,
+  limits: SitemapLimits = { totalMs: ABSOLUTE_MAX_TOTAL_MS },
+) {
   server.tool(
     "fetch_sitemap",
     "Fetch a sitemap.xml (or sitemap-index) and return the contained URLs with their lastmod / changefreq / priority. Follows sitemap-index chaining up to max_depth levels. Gzipped .xml.gz payloads are auto-decompressed. Partial failures (one child sitemap 500s while others work) are returned under 'warnings' without aborting the whole request. SSRF-protected by default.",
@@ -146,6 +161,15 @@ export function registerSitemapTools(server: McpServer) {
           "How many sitemap-index levels to follow (default 1). 0 keeps the top-level index flat and only returns its childSitemaps list.",
         ),
       max_urls: z.number().int().min(1).max(50_000).optional().describe("Cap on total URLs returned (default 5000)"),
+      max_sitemaps: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_SITEMAPS_CEILING)
+        .optional()
+        .describe(
+          `Cap on sitemap documents fetched -- the index plus every child (default ${DEFAULT_MAX_SITEMAPS}, max ${MAX_SITEMAPS_CEILING}). Children past the cap are listed under childSitemaps, unfetched.`,
+        ),
       max_bytes: z
         .number()
         .int()
@@ -158,20 +182,42 @@ export function registerSitemapTools(server: McpServer) {
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, max_depth, max_urls, max_bytes, timeout_ms, max_redirects, allow_private_hosts, user_agent }) => {
+    async (
+      { url, max_depth, max_urls, max_sitemaps, max_bytes, timeout_ms, max_redirects, allow_private_hosts, user_agent },
+      extra,
+    ) => {
       const depth = max_depth ?? 1;
       const cap = max_urls ?? 5000;
+      const sitemapCap = max_sitemaps ?? DEFAULT_MAX_SITEMAPS;
       const byteCap = sitemapByteCap(max_bytes);
+      let fetched = 0;
       const seen = new Set<string>();
       const allUrls: SitemapUrl[] = [];
       const visitedIndexes: string[] = [];
       const unvisitedChildren: string[] = [];
       const warnings: SitemapWarning[] = [];
 
+      // One budget for the whole tool call. Each fetch is its own httpRequest
+      // with its own ceiling, so up to max_sitemaps x timeout_ms could pass
+      // before this call returned. `budget` aborts on the MCP request's
+      // cancellation or when limits.totalMs runs out, and every fetch -- the
+      // one in flight included -- carries its signal.
+      const budget = new AbortController();
+      let budgetSpent = false;
+      const budgetMessage = `fetch_sitemap exceeded its ${limits.totalMs}ms total limit`;
+      const onCancel = () => budget.abort();
+      if (extra.signal.aborted) budget.abort();
+      else extra.signal.addEventListener("abort", onCancel, { once: true });
+      const budgetTimer = setTimeout(() => {
+        budgetSpent = true;
+        budget.abort();
+      }, limits.totalMs);
+
       const fetchOne = async (
         u: string,
       ): Promise<{ ok: true; parsed: ParsedSitemap } | { ok: false; error: string }> => {
-        const res = await httpRequest({
+        const res = await request({
+          signal: budget.signal,
           method: "GET",
           url: u,
           timeoutMs: timeout_ms,
@@ -183,6 +229,15 @@ export function registerSitemapTools(server: McpServer) {
         });
         if (res.error) return { ok: false, error: res.error };
         if (!res.ok) return { ok: false, error: `HTTP ${res.status} ${res.statusText}` };
+        // A body cut off at max_bytes is partial XML. The parser accepts it and
+        // returns however many <url> entries arrived, which read as the whole
+        // sitemap. Refuse it, the same way an over-cap gzip payload is refused.
+        if (res.truncated) {
+          return {
+            ok: false,
+            error: `sitemap is larger than max_bytes (${byteCap} bytes); raise max_bytes to read it`,
+          };
+        }
         if (!res.bodyBase64) return { ok: false, error: "empty body" };
         const buf = Buffer.from(res.bodyBase64, "base64");
         try {
@@ -194,33 +249,62 @@ export function registerSitemapTools(server: McpServer) {
       };
 
       const queue: Array<{ url: string; depth: number }> = [{ url, depth: 0 }];
-      while (queue.length > 0 && allUrls.length < cap) {
-        const next = queue.shift();
-        if (!next) break;
-        if (seen.has(next.url)) continue;
-        seen.add(next.url);
-        const result = await fetchOne(next.url);
-        if (!result.ok) {
-          // If the very first fetch fails, the whole tool is meaningless -- surface as error.
-          if (visitedIndexes.length === 0 && allUrls.length === 0) {
-            return formatError(`${next.url}: ${result.error}`);
+      /** Move everything still queued (and unseen) to childSitemaps, once, with a warning. */
+      const listUnfetched = (pending: Array<{ url: string }>, why: string) => {
+        const distinct = [...new Set(pending.map((q) => q.url).filter((u) => !seen.has(u)))];
+        unvisitedChildren.push(...distinct);
+        warnings.push({
+          url,
+          error: `${why}: ${distinct.length} child sitemap(s) not fetched, listed under childSitemaps`,
+        });
+      };
+      try {
+        while (queue.length > 0 && allUrls.length < cap) {
+          const next = queue.shift();
+          if (!next) break;
+          if (seen.has(next.url)) continue;
+          if (budget.signal.aborted) {
+            // Out of budget: say so and list what is left. A plain cancellation
+            // just stops -- nobody is waiting for the answer.
+            if (budgetSpent) listUnfetched([next, ...queue], budgetMessage);
+            break;
           }
-          warnings.push({ url: next.url, error: result.error });
-          continue;
-        }
-        visitedIndexes.push(next.url);
-        for (const child of result.parsed.urls) {
-          if (allUrls.length >= cap) break;
-          allUrls.push(child);
-        }
-        for (const c of result.parsed.childSitemaps) {
-          if (seen.has(c)) continue;
-          if (next.depth < depth) {
-            queue.push({ url: c, depth: next.depth + 1 });
-          } else {
-            unvisitedChildren.push(c);
+          // Bound the fan-out: an index can list hundreds of thousands of child
+          // sitemaps on as many hosts, and each one is a request this server makes.
+          if (fetched >= sitemapCap) {
+            listUnfetched([next, ...queue], `max_sitemaps (${sitemapCap}) reached`);
+            break;
+          }
+          seen.add(next.url);
+          fetched++;
+          const result = await fetchOne(next.url);
+          if (!result.ok) {
+            // A fetch cut short by the budget reports why, not "cancelled".
+            const error = budgetSpent ? budgetMessage : result.error;
+            // If the very first fetch fails, the whole tool is meaningless -- surface as error.
+            if (visitedIndexes.length === 0 && allUrls.length === 0) {
+              return formatError(`${next.url}: ${error}`);
+            }
+            warnings.push({ url: next.url, error });
+            continue;
+          }
+          visitedIndexes.push(next.url);
+          for (const child of result.parsed.urls) {
+            if (allUrls.length >= cap) break;
+            allUrls.push(child);
+          }
+          for (const c of result.parsed.childSitemaps) {
+            if (seen.has(c)) continue;
+            if (next.depth < depth) {
+              queue.push({ url: c, depth: next.depth + 1 });
+            } else {
+              unvisitedChildren.push(c);
+            }
           }
         }
+      } finally {
+        clearTimeout(budgetTimer);
+        extra.signal.removeEventListener("abort", onCancel);
       }
       return formatJson({
         sitemaps: visitedIndexes,

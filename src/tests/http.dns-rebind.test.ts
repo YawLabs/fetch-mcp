@@ -9,7 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 //
 // We mock node:dns/promises so a public-looking hostname resolves to attacker-
 // controlled internal IPs, then assert httpRequest refuses with the resolveAndPin
-// "DNS: <host> -> <ip>" reason. fetch must never be reached in the refusal cases.
+// "DNS: <host> resolves to ... reserved address" reason -- which must NOT name the
+// resolved IP (since 0.7.2), or every refusal maps an internal host to its
+// address. fetch must never be reached in the refusal cases.
+
+const REFUSED = /resolves to a private, loopback, link-local or otherwise reserved address -- refused$/;
 
 const lookupMock = vi.fn();
 
@@ -48,8 +52,9 @@ describe("DNS-rebinding SSRF -- resolveAndPin refuses blocked resolved addresses
     lookupMock.mockResolvedValue([{ address: "10.1.2.3", family: 4 }]);
     const res = await httpRequest({ method: "GET", url: "http://rebind.example.com/" });
     expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/^DNS: rebind\.example\.com -> 10\.1\.2\.3/);
-    expect(res.error).toMatch(/reserved\/private range/);
+    expect(res.error).toMatch(/^DNS: rebind\.example\.com /);
+    expect(res.error).toMatch(REFUSED);
+    expect(res.error).not.toContain("10.1.2.3");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -57,7 +62,9 @@ describe("DNS-rebinding SSRF -- resolveAndPin refuses blocked resolved addresses
     lookupMock.mockResolvedValue([{ address: "127.0.0.1", family: 4 }]);
     const res = await httpRequest({ method: "GET", url: "http://loopback.example.com/" });
     expect(res.ok).toBe(false);
-    expect(res.error).toContain("DNS: loopback.example.com -> 127.0.0.1");
+    expect(res.error).toMatch(/^DNS: loopback\.example\.com /);
+    expect(res.error).toMatch(REFUSED);
+    expect(res.error).not.toContain("127.0.0.1");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -65,7 +72,9 @@ describe("DNS-rebinding SSRF -- resolveAndPin refuses blocked resolved addresses
     lookupMock.mockResolvedValue([{ address: "169.254.169.254", family: 4 }]);
     const res = await httpRequest({ method: "GET", url: "http://metadata.example.com/latest/" });
     expect(res.ok).toBe(false);
-    expect(res.error).toContain("DNS: metadata.example.com -> 169.254.169.254");
+    expect(res.error).toMatch(/^DNS: metadata\.example\.com /);
+    expect(res.error).toMatch(REFUSED);
+    expect(res.error).not.toContain("169.254");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -73,8 +82,9 @@ describe("DNS-rebinding SSRF -- resolveAndPin refuses blocked resolved addresses
     lookupMock.mockResolvedValue([{ address: "fc00::1", family: 6 }]);
     const res = await httpRequest({ method: "GET", url: "http://v6.example.com/" });
     expect(res.ok).toBe(false);
-    expect(res.error).toContain("DNS: v6.example.com -> fc00::1");
-    expect(res.error).toMatch(/unique-local/);
+    expect(res.error).toMatch(/^DNS: v6\.example\.com /);
+    expect(res.error).toMatch(REFUSED);
+    expect(res.error).not.toContain("fc00");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -86,7 +96,9 @@ describe("DNS-rebinding SSRF -- resolveAndPin refuses blocked resolved addresses
     ]);
     const res = await httpRequest({ method: "GET", url: "http://mixed.example.com/" });
     expect(res.ok).toBe(false);
-    expect(res.error).toContain("DNS: mixed.example.com -> 192.168.0.5");
+    expect(res.error).toMatch(REFUSED);
+    expect(res.error).not.toContain("192.168.0.5");
+    expect(res.error).not.toContain("93.184.216.34");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -136,24 +148,17 @@ describe("DNS-rebinding SSRF -- resolveAndPin is bypassed where it should be", (
     // With allowPrivateHosts set, the resolveAndPin guard is skipped. We don't need a
     // live server: prove the DNS-pin path is bypassed by asserting lookup was not called.
     // fetch is reached (and fails with the test's network-disabled error), but
-    // resolveAndPin must NOT have run. The operator has to allow the opt-in first,
-    // or the gate refuses the request before this path is reached at all.
-    setHttpContext({ version: "test", allowPrivateHosts: true });
-    try {
-      const res = await httpRequest({
-        method: "GET",
-        url: "http://skip-pin.invalid/",
-        allowPrivateHosts: true,
-        timeoutMs: 200,
-      });
-      expect(lookupMock).not.toHaveBeenCalled();
-      expect(fetchSpy).toHaveBeenCalledOnce();
-      // The request fails at the transport layer, not via resolveAndPin or the gate.
-      expect(res.ok).toBe(false);
-      expect(res.error).toMatch(/network disabled/);
-    } finally {
-      setHttpContext({ version: "test" });
-    }
+    // resolveAndPin must NOT have run. The operator has to allow the opt-in first
+    // (the policy argument), or the gate refuses before this path is reached.
+    const res = await httpRequest(
+      { method: "GET", url: "http://skip-pin.invalid/", allowPrivateHosts: true, timeoutMs: 200 },
+      { allowPrivateHosts: true },
+    );
+    expect(lookupMock).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    // The request fails at the transport layer, not via resolveAndPin or the gate.
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/network disabled/);
   });
 });
 

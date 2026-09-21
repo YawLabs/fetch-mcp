@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 import { makeTurndown, stripHtmlToText } from "./content.js";
 import { decodeHtmlEntities, findBalancedTagContents, findTags, parseAttrs } from "./html.js";
@@ -98,7 +98,7 @@ export function extractByline(html: string): string | undefined {
   return undefined;
 }
 
-export function registerReaderTools(server: McpServer) {
+export function registerReaderTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_reader",
     "GET a URL, locate the main article body (prefers <article>, <main>, itemprop=articleBody, or known CMS class names; falls back to <body>), strip navigation/footer/aside chrome, and convert to clean markdown. Returns { title, byline, markdown, wordCount }. Optimized for feeding long-form articles into an LLM without header/footer/sidebar noise.",
@@ -111,8 +111,9 @@ export function registerReaderTools(server: McpServer) {
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
-      const res = await httpRequest({
+    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,

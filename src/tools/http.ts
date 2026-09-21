@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatHttpResponse } from "../format.js";
-import { type HttpMethod, type HttpRequestOptions, httpRequest } from "../http.js";
+import type { HttpMethod, HttpRequester, HttpRequestOptions } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 const commonSchema = {
@@ -13,7 +13,9 @@ const commonSchema = {
     .positive()
     .max(120_000)
     .optional()
-    .describe("Request timeout in ms (default 10000, max 120000)"),
+    .describe(
+      "Timeout in ms for each attempt, covering DNS, every redirect hop and the body (default 10000, max 120000). Retries get a fresh budget; a whole call is capped at 5 minutes.",
+    ),
   max_bytes: z
     .number()
     .int()
@@ -84,13 +86,14 @@ function toRequestOptions(method: HttpMethod, input: Record<string, any>): HttpR
   return opts;
 }
 
-export function registerHttpTools(server: McpServer) {
+export function registerHttpTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "http_get",
     "Perform an HTTP GET. Returns status, headers, and body. Automatically parses JSON when the server responds with application/json. Follows redirects (each hop re-validated against SSRF rules). Refuses URLs that resolve to private/loopback/link-local addresses unless the operator enabled FETCH_MCP_ALLOW_PRIVATE_HOSTS and the call sets allow_private_hosts.",
     commonSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("GET", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("GET", input), signal: extra.signal })),
   );
 
   server.tool(
@@ -98,7 +101,8 @@ export function registerHttpTools(server: McpServer) {
     "Perform an HTTP POST. Body can be given as a raw string (body) or as a JSON value (body_json — auto-sets content-type to application/json). NOT idempotent: calling twice submits twice.",
     { ...commonSchema, ...bodySchema },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("POST", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("POST", input), signal: extra.signal })),
   );
 
   server.tool(
@@ -106,7 +110,8 @@ export function registerHttpTools(server: McpServer) {
     "Perform an HTTP PUT. Use for full-resource replacement. Idempotent: the same PUT applied twice leaves the resource in the same state.",
     { ...commonSchema, ...bodySchema },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("PUT", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("PUT", input), signal: extra.signal })),
   );
 
   server.tool(
@@ -114,7 +119,8 @@ export function registerHttpTools(server: McpServer) {
     "Perform an HTTP PATCH. Use for partial updates. Spec-wise NOT guaranteed idempotent — depends on the server's patch semantics.",
     { ...commonSchema, ...bodySchema },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("PATCH", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("PATCH", input), signal: extra.signal })),
   );
 
   server.tool(
@@ -122,7 +128,8 @@ export function registerHttpTools(server: McpServer) {
     "Perform an HTTP DELETE. Idempotent (per spec): a repeated DELETE on an already-deleted resource typically returns 404/410.",
     { ...commonSchema, ...bodySchema },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("DELETE", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("DELETE", input), signal: extra.signal })),
   );
 
   server.tool(
@@ -130,7 +137,8 @@ export function registerHttpTools(server: McpServer) {
     "Perform an HTTP HEAD. Returns status + headers with no body. Useful for checking a resource exists, getting its size (Content-Length), or polling for changes cheaply.",
     commonSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("HEAD", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("HEAD", input), signal: extra.signal })),
   );
 
   server.tool(
@@ -138,6 +146,7 @@ export function registerHttpTools(server: McpServer) {
     "Perform an HTTP OPTIONS. Returns the server's supported methods and CORS policy for a resource. Helpful for API discovery.",
     commonSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async (input) => formatHttpResponse(await httpRequest(toRequestOptions("OPTIONS", input))),
+    async (input, extra) =>
+      formatHttpResponse(await request({ ...toRequestOptions("OPTIONS", input), signal: extra.signal })),
   );
 }

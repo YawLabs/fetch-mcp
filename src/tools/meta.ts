@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 import { decodeHtmlEntities, findTags, parseAttrs } from "./html.js";
 
@@ -137,7 +137,7 @@ function resolveUrl(base: string, href: string): string {
   }
 }
 
-export function registerMetaTools(server: McpServer) {
+export function registerMetaTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_meta",
     "GET a URL and extract its head metadata: title, description, canonical, language, robots directive, Open Graph / Twitter Card / article: properties, icon links, RSS/Atom feed links, and any JSON-LD (schema.org) blocks. Keys that appear more than once (e.g. multiple og:image tags) are additionally returned via ogAll/twitterAll/articleAll arrays. Ideal for previewing a page before fully reading it.",
@@ -150,8 +150,9 @@ export function registerMetaTools(server: McpServer) {
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
-      const res = await httpRequest({
+    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,

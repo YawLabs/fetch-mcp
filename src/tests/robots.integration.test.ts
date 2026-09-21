@@ -35,10 +35,18 @@ async function callRobots(
   // Loopback fixtures need the operator opt-in for allow_private_hosts.
   const s = createFetchServer({ allowPrivateHosts: true });
   const tools = (
-    s as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<unknown> }> }
+    s as unknown as {
+      _registeredTools: Record<
+        string,
+        { handler: (input: unknown, extra: { signal: AbortSignal }) => Promise<unknown> }
+      >;
+    }
   )._registeredTools;
   const tool = tools.fetch_robots;
-  const out = (await tool.handler(input)) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+  const out = (await tool.handler(input, { signal: new AbortController().signal })) as {
+    content: Array<{ type: string; text: string }>;
+    isError?: boolean;
+  };
   const raw = out.content[0]!.text;
   let parsed: Record<string, unknown> | null = null;
   try {
