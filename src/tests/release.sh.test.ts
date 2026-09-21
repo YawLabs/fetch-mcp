@@ -51,7 +51,14 @@ function runBash(
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
 }
 
-describe("changelog_prev_tag", () => {
+// These tests build a real git repo, one spawn per step: the longest makes
+// ~20 `git` calls plus a bash. On a contended Windows box a single `git`
+// spawn was measured at ~1.4s, so vitest's 15s default failed the test for
+// machine load rather than for anything release.sh does. Same reasoning as
+// TIMEOUT_MS in launcher.test.ts.
+const GIT_SPAWN_TIMEOUT_MS = 60_000;
+
+describe("changelog_prev_tag", { timeout: GIT_SPAWN_TIMEOUT_MS }, () => {
   let repo: string;
   beforeEach(() => {
     repo = mkdtempSync(join(tmpdir(), "clprev-"));
@@ -61,7 +68,7 @@ describe("changelog_prev_tag", () => {
     writeFileSync(join(repo, "a"), "a");
     execFileSync("git", ["add", "a"], { cwd: repo });
     execFileSync("git", ["commit", "-qm", "a"], { cwd: repo });
-  });
+  }, GIT_SPAWN_TIMEOUT_MS);
 
   it("returns empty when the version is the only v* tag (true first release)", () => {
     execFileSync("git", ["tag", "-a", "v0.1.0", "-m", "v0.1.0"], { cwd: repo });
