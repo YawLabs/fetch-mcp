@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import TurndownService from "turndown";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export function makeTurndown(): TurndownService {
@@ -49,21 +49,28 @@ export function stripHtmlToText(html: string): string {
 
 const commonPageSchema = {
   url: z.string().url().describe("URL to fetch"),
-  timeout_ms: z.number().int().positive().max(120_000).optional().describe("Request timeout in ms (default 10000)"),
+  timeout_ms: z
+    .number()
+    .int()
+    .positive()
+    .max(120_000)
+    .optional()
+    .describe("Timeout in ms for the request, covering DNS, every redirect hop and the body (default 10000)"),
   max_bytes: z.number().int().positive().optional().describe("Max response size in bytes (default 5MiB)"),
   max_redirects: z.number().int().min(0).max(20).optional().describe("Max redirect hops (default 5)"),
   allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
   user_agent: z.string().optional().describe("User-Agent override"),
 };
 
-export function registerContentTools(server: McpServer) {
+export function registerContentTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_html_to_markdown",
     "GET a URL, decode the HTML, and convert to clean markdown (headings, lists, links, code fences). Scripts, styles, iframes, nav, footer, and aside elements are stripped. Intended for feeding web pages into an LLM cheaply -- markdown is usually 3-8x smaller than raw HTML. Follows redirects, respects size/timeout limits, and blocks private-host requests by default.",
     commonPageSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
-      const res = await httpRequest({
+    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,
@@ -90,8 +97,9 @@ export function registerContentTools(server: McpServer) {
     "GET a URL, decode the HTML, and return plain text with block-level structure preserved as newlines. Scripts, styles, and comments stripped; HTML entities decoded. Lighter than markdown when you only need the reading content.",
     commonPageSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
-      const res = await httpRequest({
+    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,

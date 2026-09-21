@@ -70,13 +70,10 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.clearAllMocks();
-  setHttpContext({ version: "test" });
 });
 
-/** The operator's FETCH_MCP_ALLOW_PRIVATE_HOSTS=1, for tests of the per-call opt-in. */
-function operatorAllowsPrivateHosts() {
-  setHttpContext({ version: "test", allowPrivateHosts: true });
-}
+/** The operator's FETCH_MCP_ALLOW_PRIVATE_HOSTS=1, passed as httpRequest's policy for tests of the per-call opt-in. */
+const OPERATOR_OPT_IN = { allowPrivateHosts: true };
 
 describe("redirect SSRF -- a redirect to a literal blocked IP is refused before it is dialed", () => {
   // [target, what the reason must mention]
@@ -208,9 +205,8 @@ describe("redirect SSRF -- a redirect to a non-http(s) scheme or localhost is re
   it("the scheme allow-list holds on a redirect even with allowPrivateHosts: true", async () => {
     // allowPrivateHosts bypasses the IP checks (SECURITY.md defenses 2-5), never the
     // scheme allow-list (defense 1).
-    operatorAllowsPrivateHosts();
     const seen = mockRedirectChain({ "http://1.2.3.4/": "file:///etc/passwd" });
-    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/", allowPrivateHosts: true });
+    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/", allowPrivateHosts: true }, OPERATOR_OPT_IN);
 
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/scheme "file:" is not allowed/);
@@ -270,9 +266,8 @@ describe("redirect SSRF -- legitimate redirects still follow (the fix does not o
   });
 
   it("with allowPrivateHosts: true a redirect to a private literal IS followed (documented opt-out)", async () => {
-    operatorAllowsPrivateHosts();
     const seen = mockRedirectChain({ "http://1.2.3.4/": "http://127.0.0.1:8080/" });
-    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/", allowPrivateHosts: true });
+    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/", allowPrivateHosts: true }, OPERATOR_OPT_IN);
 
     expect(res.ok).toBe(true);
     expect(res.bodyText).toBe(SECRET);
@@ -309,9 +304,8 @@ describe("operator gate -- allowPrivateHosts is refused unless the operator enab
 
   it("with the operator opt-in, a call that does NOT set allowPrivateHosts is still guarded", async () => {
     // The operator switch permits the per-call opt-in; it does not turn the guard off.
-    operatorAllowsPrivateHosts();
     const seen = mockRedirectChain({ "http://1.2.3.4/": "http://169.254.169.254/latest/meta-data/" });
-    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/" });
+    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/" }, OPERATOR_OPT_IN);
 
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/169.254.169.254.*reserved/);

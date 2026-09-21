@@ -4,6 +4,20 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Security
+- **More IPv6 forms that reach IPv4 are blocked.** `checkIpAddress()` now rechecks the IPv4 embedded in IPv4-compatible (`::a.b.c.d`; URL normalisation turns `http://[::127.0.0.1]/` into `[::7f00:1]`), IPv4-translated (SIIT, `::ffff:0:a.b.c.d`) and 6to4 (`2002::/16`) addresses, and refuses Teredo (`2001::/32`), local-use NAT64 (`64:ff9b:1::/48`), site-local (`fec0::/10`) and discard-only (`100::/64`) outright. Each passed both the literal check and the DNS-answer check before. None of them connected on the hosts tested, so this is hardening rather than a demonstrated bypass. Public addresses in the rechecked forms, and the rest of `2001::/16` (Google Public DNS is `2001:4860::`), are still allowed.
+- **The Azure WireServer address `168.63.129.16` is blocked.** It looks public but is present on every Azure VM and serves goal state and extension settings to the guest.
+- **DNS refusals no longer name the resolved address.** `DNS: jenkins.corp -> 10.20.30.40 -- ...` went back to the model, so every refusal mapped an internal hostname to its IP. The message is now `DNS: <host> resolves to a private, loopback, link-local or otherwise reserved address -- refused`.
+- **The private-hosts policy is per server.** 0.7.1 kept the operator opt-in in module state, so in a process with several servers the most recent `createFetchServer()` decided for all of them: an embedder's untrusted server opened up the moment a trusted one was created, and a later plain one closed the trusted one. Each server now binds its own policy into the requester its tools use, and `httpRequest()` refuses the opt-in unless it is handed a policy that grants it. The stdio server, which creates exactly one, is unaffected.
+- **`fetch_sitemap` fetches at most `max_sitemaps` documents per call (default 50, max 1000).** An index listing N children produced N+1 requests, to as many hosts as it named, from one tool call. Children past the cap are listed under `childSitemaps`, unfetched, with a warning.
+
+### Changed
+- **`timeout_ms` bounds a whole attempt -- DNS, every redirect hop and the body -- instead of each hop separately.** The DNS lookup now runs inside it: it used to run before the hop timer started, so a resolver that never answered added its full OS timeout to every hop. Retries get a fresh budget, and a whole call is capped at 5 minutes; at the schema maxima (6 attempts x 21 hops x 120 s, plus Retry-After waits) one call could run for hours. A slow redirect chain that fit when each hop had its own `timeout_ms` may now need a larger value.
+- **Cancelling a tool call stops its requests.** Every tool passes the MCP request's cancellation signal through: the hop in flight (DNS included), a Retry-After wait and every later attempt stop at once with `request cancelled by the client`, and `fetch_sitemap` stops fetching children.
+
+### Fixed
+- **`fetch_sitemap` no longer returns a partial URL list as if it were complete.** A plain or `Content-Encoding` sitemap larger than `max_bytes` was cut off at the cap, the XML parser accepted the fragment, and the result listed however many URLs had arrived with `truncated: false`. It is now an error, or a warning for a child sitemap: `sitemap is larger than max_bytes (N bytes); raise max_bytes to read it` -- the same treatment an over-cap gzipped sitemap already got.
+
 ## [0.7.1] — 2026-09-21
 
 ### Security

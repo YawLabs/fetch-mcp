@@ -73,9 +73,14 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 /** Call a registered tool's handler directly, the way the integration suites do. */
 async function callTool(server: ReturnType<typeof createFetchServer>, name: string, input: unknown) {
   const tools = (
-    server as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<unknown> }> }
+    server as unknown as {
+      _registeredTools: Record<
+        string,
+        { handler: (input: unknown, extra: { signal: AbortSignal }) => Promise<unknown> }
+      >;
+    }
   )._registeredTools;
-  return (await tools[name]!.handler(input)) as ToolResult;
+  return (await tools[name]!.handler(input, { signal: new AbortController().signal })) as ToolResult;
 }
 
 describe("createFetchServer -- the gate at the tool boundary", () => {
@@ -104,6 +109,22 @@ describe("createFetchServer -- the gate at the tool boundary", () => {
     const out = await callTool(createFetchServer({ allowPrivateHosts: true }), "http_get", { url: fixtureUrl });
     expect(out.isError).toBe(true);
     expect(out.content[0]!.text).toMatch(/127\.0\.0\.1.*reserved/);
+  });
+
+  it("keeps each server's policy its own: servers created later neither open nor close it", async () => {
+    // Through 0.7.1 the policy was module state, so the most recent
+    // createFetchServer() decided for every server in the process: an embedder's
+    // untrusted server opened up the moment a trusted one was created.
+    const untrusted = createFetchServer();
+    const trusted = createFetchServer({ allowPrivateHosts: true });
+    const later = createFetchServer();
+    const ask = { url: fixtureUrl, allow_private_hosts: true };
+
+    expect((await callTool(untrusted, "http_get", ask)).content[0]!.text).toContain(PRIVATE_HOSTS_DISABLED);
+    expect((await callTool(trusted, "http_get", ask)).content[0]!.text).toContain("INTERNAL-ONLY");
+    expect((await callTool(later, "http_get", ask)).content[0]!.text).toContain(PRIVATE_HOSTS_DISABLED);
+    // The plain server created after it did not close the trusted one either.
+    expect((await callTool(trusted, "http_get", ask)).content[0]!.text).toContain("INTERNAL-ONLY");
   });
 
   it("tells the model about the gate in every tool's allow_private_hosts description", () => {

@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 import { decodeHtmlEntities, findTags, parseAttrs } from "./html.js";
 
@@ -97,7 +97,7 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
   return links;
 }
 
-export function registerLinksTools(server: McpServer) {
+export function registerLinksTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_links",
     "Extract every outbound link from an HTML page, resolved to absolute URLs. Each entry includes href, anchor text, optional rel/title, and an internal/external classification (bare-domain and www. treated as the same host). Anchors (#), javascript:, mailto:, tel:, data:, and file: URIs are skipped. Respects <base href>.",
@@ -113,8 +113,12 @@ export function registerLinksTools(server: McpServer) {
       limit: z.number().int().min(1).max(10_000).optional().describe("Cap on returned links (default 1000)"),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent, dedupe, filter, limit }) => {
-      const res = await httpRequest({
+    async (
+      { url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent, dedupe, filter, limit },
+      extra,
+    ) => {
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,

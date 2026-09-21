@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 interface Group {
@@ -133,7 +133,7 @@ export function isAllowed(parsed: RobotsParsed, userAgent: string, path: string)
   return { allowed: best.allow, rule: `${best.allow ? "Allow" : "Disallow"}: ${best.path}` };
 }
 
-export function registerRobotsTools(server: McpServer) {
+export function registerRobotsTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_robots",
     "Fetch and parse the robots.txt for a given origin, then tell the caller whether a target URL is crawlable by a given user-agent. Follows the Google-style longest-match rule with Allow-wins-on-tie. Returns the raw robots.txt, parsed groups, sitemap references, and the allow/deny verdict with the matching rule.",
@@ -145,7 +145,7 @@ export function registerRobotsTools(server: McpServer) {
       allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, user_agent, timeout_ms, max_redirects, allow_private_hosts }) => {
+    async ({ url, user_agent, timeout_ms, max_redirects, allow_private_hosts }, extra) => {
       let parsed: URL;
       try {
         parsed = new URL(url);
@@ -153,7 +153,8 @@ export function registerRobotsTools(server: McpServer) {
         return formatError("URL failed to parse");
       }
       const robotsUrl = `${parsed.origin}/robots.txt`;
-      const res = await httpRequest({
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url: robotsUrl,
         timeoutMs: timeout_ms,

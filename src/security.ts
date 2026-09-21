@@ -8,6 +8,8 @@ const BLOCKED_IPV4_CIDRS: Array<[number, number]> = [
   cidr("10.0.0.0", 8), //     RFC 1918 private
   cidr("100.64.0.0", 10), //  CGNAT
   cidr("127.0.0.0", 8), //    loopback
+  cidr("168.63.129.16", 32), // Azure WireServer / host agent: a public-looking virtual IP on every Azure VM
+  //                            that serves goal state and extension settings to the guest
   cidr("169.254.0.0", 16), // link-local + AWS/GCP/Azure metadata (169.254.169.254)
   cidr("172.16.0.0", 12), //  RFC 1918 private
   cidr("192.0.0.0", 24), //   IETF protocol assignments
@@ -115,6 +117,12 @@ export function checkIpAddress(ip: string): string | null {
       return reason ? `IPv6 address ${ip} maps to ${v4}: ${reason}` : null;
     }
 
+    // IPv4-translated (SIIT, ::ffff:0:0:0/96) -- the same embedding one hextet
+    // further in. Recheck the IPv4 it carries.
+    if (allBytesZero(bytes, 0, 8) && bytes[8] === 0xff && bytes[9] === 0xff && bytes[10] === 0 && bytes[11] === 0) {
+      return recheckEmbedded(ip, bytes, 12, "IPv4-translated");
+    }
+
     // ::1 loopback
     if (allBytesZero(bytes, 0, 15) && bytes[15] === 1) {
       return `IPv6 address ${ip} is loopback (::1)`;
@@ -123,6 +131,17 @@ export function checkIpAddress(ip: string): string | null {
     if (allBytesZero(bytes, 0, 16)) {
       return `IPv6 address ${ip} is unspecified (::)`;
     }
+    // IPv4-compatible (::a.b.c.d, ::/96; deprecated by RFC 4291). URL
+    // normalisation turns http://[::127.0.0.1]/ into [::7f00:1], which no rule
+    // above matches, so recheck the embedded IPv4 like the mapped form.
+    if (allBytesZero(bytes, 0, 12)) {
+      return recheckEmbedded(ip, bytes, 12, "IPv4-compatible");
+    }
+    // 6to4 (2002::/16) embeds the IPv4 tunnel endpoint in bytes 2-5; a relay
+    // delivers to it. Recheck it: 2002:a00:1::1 is a route to 10.0.0.1.
+    if (bytes[0] === 0x20 && bytes[1] === 0x02) {
+      return recheckEmbedded(ip, bytes, 2, "6to4");
+    }
     // fc00::/7 unique-local (covers fc00::-fdff::)
     if ((bytes[0]! & 0xfe) === 0xfc) {
       return `IPv6 address ${ip} is unique-local (fc00::/7)`;
@@ -130,6 +149,18 @@ export function checkIpAddress(ip: string): string | null {
     // fe80::/10 link-local (covers fe80::-febf::, the full /10 not just fe80::/16)
     if (bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0x80) {
       return `IPv6 address ${ip} is link-local (fe80::/10)`;
+    }
+    // fec0::/10 site-local (deprecated by RFC 3879, still routed inside some networks)
+    if (bytes[0] === 0xfe && (bytes[1]! & 0xc0) === 0xc0) {
+      return `IPv6 address ${ip} is site-local (fec0::/10)`;
+    }
+    // 2001::/32 Teredo -- tunnels to an IPv4 client address obfuscated in the low bytes
+    if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00) {
+      return `IPv6 address ${ip} is Teredo (2001::/32)`;
+    }
+    // 100::/64 discard-only (RFC 6666)
+    if (bytes[0] === 0x01 && bytes[1] === 0x00 && allBytesZero(bytes, 2, 8)) {
+      return `IPv6 address ${ip} is discard-only (100::/64)`;
     }
     // ff00::/8 multicast
     if (bytes[0] === 0xff) {
@@ -149,9 +180,31 @@ export function checkIpAddress(ip: string): string | null {
     ) {
       return `IPv6 address ${ip} is NAT64 (64:ff9b::/96)`;
     }
+    // 64:ff9b:1::/48 local-use NAT64 (RFC 8215): on a network with a local
+    // translator, 64:ff9b:1::a00:1 reaches 10.0.0.1.
+    if (
+      bytes[0] === 0x00 &&
+      bytes[1] === 0x64 &&
+      bytes[2] === 0xff &&
+      bytes[3] === 0x9b &&
+      bytes[4] === 0x00 &&
+      bytes[5] === 0x01
+    ) {
+      return `IPv6 address ${ip} is local-use NAT64 (64:ff9b:1::/48)`;
+    }
     return null;
   }
   return `"${ip}" is not a valid IP literal`;
+}
+
+/**
+ * Check the IPv4 address embedded at `bytes[offset..offset+4]` of an IPv6
+ * address against the IPv4 rules. `kind` names the embedding for the reason.
+ */
+function recheckEmbedded(ip: string, bytes: Uint8Array, offset: number, kind: string): string | null {
+  const v4 = `${bytes[offset]}.${bytes[offset + 1]}.${bytes[offset + 2]}.${bytes[offset + 3]}`;
+  const reason = checkIpAddress(v4);
+  return reason ? `IPv6 address ${ip} (${kind}) embeds ${v4}: ${reason}` : null;
 }
 
 export interface SsrfCheckResult {

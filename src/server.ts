@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { setHttpContext } from "./http.js";
+import { createRequester, setHttpContext } from "./http.js";
 import { ALLOW_PRIVATE_HOSTS_ENV, allowPrivateHostsWarning, parseAllowPrivateHostsSetting } from "./policy.js";
 import { registerContentTools } from "./tools/content.js";
 import { registerFeedTools } from "./tools/feed.js";
@@ -26,25 +26,25 @@ export interface FetchServerOptions {
    * loopback / private / link-local hosts? Default false -- such calls are
    * refused. `startServer()` sets it from FETCH_MCP_ALLOW_PRIVATE_HOSTS.
    *
-   * Process-wide: the policy lives in the http module's context, so the most
-   * recent createFetchServer() call decides for every server in the process.
-   * The stdio server creates exactly one; an embedder creating several must
-   * give them all the same setting.
+   * Per server: each createFetchServer() call binds its own policy into the
+   * requester its tools use, so servers in one process never share or
+   * overwrite each other's setting.
    */
   allowPrivateHosts?: boolean;
 }
 
 export function createFetchServer(options: FetchServerOptions = {}): McpServer {
-  setHttpContext({ version, allowPrivateHosts: options.allowPrivateHosts === true });
+  setHttpContext({ version });
+  const request = createRequester({ allowPrivateHosts: options.allowPrivateHosts === true });
   const server = new McpServer({ name: "fetch-mcp", version });
-  registerHttpTools(server);
-  registerContentTools(server);
-  registerRobotsTools(server);
-  registerSitemapTools(server);
-  registerMetaTools(server);
-  registerLinksTools(server);
-  registerFeedTools(server);
-  registerReaderTools(server);
+  registerHttpTools(server, request);
+  registerContentTools(server, request);
+  registerRobotsTools(server, request);
+  registerSitemapTools(server, request);
+  registerMetaTools(server, request);
+  registerLinksTools(server, request);
+  registerFeedTools(server, request);
+  registerReaderTools(server, request);
   return server;
 }
 

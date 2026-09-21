@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export interface FeedEntry {
@@ -175,7 +175,7 @@ export function parseFeedXml(xml: string): ParsedFeed {
   return { kind: "unknown", entries: [] };
 }
 
-export function registerFeedTools(server: McpServer) {
+export function registerFeedTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_feed",
     "Fetch and parse an RSS 2.0 or Atom 1.0 feed. Returns feed-level metadata (title, description, link, updated) plus a list of entries (title, link, id, published, updated, author, summary, content, contentType, categories). Auto-detects RSS vs Atom.",
@@ -189,8 +189,9 @@ export function registerFeedTools(server: McpServer) {
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ url, limit, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }) => {
-      const res = await httpRequest({
+    async ({ url, limit, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
+      const res = await request({
+        signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,

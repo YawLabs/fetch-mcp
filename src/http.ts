@@ -15,6 +15,14 @@ export const DEFAULT_TIMEOUT_MS = 10_000;
 export const DEFAULT_MAX_BYTES = 5 * 1024 * 1024; // 5 MiB
 export const DEFAULT_MAX_REDIRECTS = 5;
 export const ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024; // 100 MiB — hard ceiling
+/**
+ * Ceiling on one whole httpRequest() call: every attempt, redirect hop and
+ * retry wait. Without it the schema maxima (6 attempts x 21 hops x 120s, plus
+ * Retry-After sleeps) let one call run for hours.
+ */
+export const ABSOLUTE_MAX_TOTAL_MS = 5 * 60 * 1000;
+
+const CANCELLED = "request cancelled by the client";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
 
@@ -24,6 +32,11 @@ export interface HttpRequestOptions {
   headers?: Record<string, string>;
   body?: string | Uint8Array;
   contentType?: string;
+  /**
+   * Budget for each ATTEMPT, end to end: DNS, every redirect hop, headers and
+   * body. Retries get a fresh budget; the whole call is also capped at
+   * ABSOLUTE_MAX_TOTAL_MS. Default 10s.
+   */
   timeoutMs?: number;
   maxBytes?: number;
   maxRedirects?: number;
@@ -39,6 +52,11 @@ export interface HttpRequestOptions {
   userAgent?: string;
   /** Retry on 408/425/429/5xx with exponential backoff (honors Retry-After). Default 0. */
   retries?: number;
+  /**
+   * Caller cancellation -- the MCP request's signal. Aborting stops the hop in
+   * flight (DNS included), any retry wait, and every later attempt.
+   */
+  signal?: AbortSignal;
 }
 
 export interface HttpResponse {
@@ -58,18 +76,36 @@ export interface HttpResponse {
 
 interface InternalContext {
   version: string;
-  /**
-   * Operator policy (FETCH_MCP_ALLOW_PRIVATE_HOSTS): whether a request may opt
-   * into private hosts at all. Unset means no -- a request that sets
-   * `allowPrivateHosts` is refused before any network work.
-   */
-  allowPrivateHosts?: boolean;
 }
 
 let context: InternalContext = { version: "0.0.0" };
 
 export function setHttpContext(ctx: InternalContext) {
   context = ctx;
+}
+
+/**
+ * One server's operator policy. `allowPrivateHosts` is the operator's opt-in
+ * (FETCH_MCP_ALLOW_PRIVATE_HOSTS): whether a request may set `allowPrivateHosts`
+ * at all. It travels with each call rather than living in module state, so two
+ * servers in one process cannot change each other's policy.
+ */
+export interface HttpPolicy {
+  allowPrivateHosts: boolean;
+}
+
+const REFUSE_PRIVATE_HOSTS: HttpPolicy = Object.freeze({ allowPrivateHosts: false });
+
+export type HttpRequester = (opts: HttpRequestOptions) => Promise<HttpResponse>;
+
+/**
+ * A request function bound to one server's policy -- what createFetchServer
+ * hands its tools. The policy is copied and frozen, so the caller cannot widen
+ * it afterwards.
+ */
+export function createRequester(policy: HttpPolicy): HttpRequester {
+  const bound: HttpPolicy = Object.freeze({ allowPrivateHosts: policy.allowPrivateHosts === true });
+  return (opts) => httpRequest(opts, bound);
 }
 
 /**
@@ -161,8 +197,15 @@ async function resolveAndPin(
     const results = await lookup(hostname, { all: true, verbatim: true });
     if (results.length === 0) return { ok: false, reason: `DNS: ${hostname} returned no addresses` };
     for (const r of results) {
-      const reason = checkIpAddress(r.address);
-      if (reason) return { ok: false, reason: `DNS: ${hostname} -> ${r.address} -- ${reason}` };
+      // The resolved address is deliberately NOT in the message: it goes back
+      // to the model, and naming it (`jenkins.corp -> 10.20.30.40`) turned every
+      // refusal into a way to map internal hosts and addresses.
+      if (checkIpAddress(r.address)) {
+        return {
+          ok: false,
+          reason: `DNS: ${hostname} resolves to a private, loopback, link-local or otherwise reserved address -- refused`,
+        };
+      }
     }
     const first = results[0]!;
     return { ok: true, ip: first.address, family: first.family === 6 ? 6 : 4 };
@@ -266,8 +309,43 @@ function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 504);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+/** Wait `ms`; resolves false early if `signal` aborts (true when the wait completed). */
+function sleepUnlessAborted(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Settle with `promise`, or reject with the signal's reason as soon as it
+ * aborts. dns.lookup cannot be cancelled; losing the race only stops waiting
+ * for it, which is what keeps DNS inside the attempt budget.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 /** Discard a response body without buffering it. Prevents socket leak / OOM. */
@@ -303,13 +381,17 @@ async function sendHop(params: {
   body: string | Uint8Array | undefined;
   contentType: string | undefined;
   opts: HttpRequestOptions;
-  timeoutMs: number;
+  /** Epoch ms by which this hop -- DNS, headers, body -- must finish (the attempt's budget). */
+  deadline: number;
+  /** The abort reason when `deadline` passes. */
+  timeoutMessage: string;
   maxBytes: number;
   stripAuth: boolean;
   redirects: string[];
   start: number;
 }): Promise<HopResult | HopRedirect | HopError> {
-  const { url, method, body, contentType, opts, timeoutMs, maxBytes, stripAuth, redirects, start } = params;
+  const { url, method, body, contentType, opts, deadline, timeoutMessage, maxBytes, stripAuth, redirects, start } =
+    params;
 
   // Every URL this function dials goes through the pre-flight validator:
   // scheme allow-list, literal-IP block list, `localhost*`. httpRequest runs
@@ -326,25 +408,33 @@ async function sendHop(params: {
   const parsed = new URL(url);
   const host = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
 
-  let dispatcher: Agent | undefined;
-  if (!opts.allowPrivateHosts) {
-    // A literal IP was just vetted by validateUrl -> checkIpAddress above. For
-    // hostnames we must resolve and pin so fetch can't race us to a rebound
-    // address. Use isIP() (node:net) -- the same check validateUrl uses --
-    // rather than a hand-rolled regex. The old regex matched partial addresses
-    // like "127" or "192.168" as literals, skipping pinning; on Windows "127"
-    // connects to 127.0.0.1, making this a real SSRF bypass path.
-    const literal = isIP(host) !== 0;
-    if (!literal) {
-      const resolved = await resolveAndPin(host);
-      if (!resolved.ok) return { kind: "error", response: failure(url, resolved.reason, redirects, start) };
-      dispatcher = pinnedAgent(resolved.ip, resolved.family);
-    }
-  }
-
+  // One controller for the whole hop, armed BEFORE the DNS lookup: the
+  // attempt's deadline and the caller's cancellation both cover resolution as
+  // well as the request. (The lookup used to run before the timer started, so
+  // a resolver that never answered added its full OS timeout to every hop.)
   const abortController = new AbortController();
-  const timer = setTimeout(() => abortController.abort(new Error(`request exceeded ${timeoutMs}ms`)), timeoutMs);
+  const timer = setTimeout(() => abortController.abort(new Error(timeoutMessage)), Math.max(0, deadline - Date.now()));
+  const onCallerAbort = () => abortController.abort(new Error(CANCELLED));
+  if (opts.signal?.aborted) onCallerAbort();
+  else opts.signal?.addEventListener("abort", onCallerAbort, { once: true });
+
+  let dispatcher: Agent | undefined;
   try {
+    if (!opts.allowPrivateHosts) {
+      // A literal IP was just vetted by validateUrl -> checkIpAddress above. For
+      // hostnames we must resolve and pin so fetch can't race us to a rebound
+      // address. Use isIP() (node:net) -- the same check validateUrl uses --
+      // rather than a hand-rolled regex. The old regex matched partial addresses
+      // like "127" or "192.168" as literals, skipping pinning; on Windows "127"
+      // connects to 127.0.0.1, making this a real SSRF bypass path.
+      const literal = isIP(host) !== 0;
+      if (!literal) {
+        const resolved = await raceAbort(resolveAndPin(host), abortController.signal);
+        if (!resolved.ok) return { kind: "error", response: failure(url, resolved.reason, redirects, start) };
+        dispatcher = pinnedAgent(resolved.ip, resolved.family);
+      }
+    }
+
     const hasBody = body !== undefined && method !== "GET" && method !== "HEAD";
     const headers = buildHeaders(opts, { stripAuth, method, hasBody, contentType });
     const res = await undiciFetch(url, {
@@ -411,6 +501,7 @@ async function sendHop(params: {
     return { kind: "error", response: failure(url, (err as Error).message, redirects, start) };
   } finally {
     clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", onCallerAbort);
     if (dispatcher) await dispatcher.close().catch(() => {});
   }
 }
@@ -421,17 +512,24 @@ async function sendHop(params: {
  * accumulate across attempts). On cross-origin redirect we strip the
  * credential headers (CROSS_ORIGIN_STRIPPED_HEADERS). On 303 we downgrade to GET; on 301/302 from
  * non-GET/HEAD we also downgrade (WHATWG fetch standard).
+ *
+ * `policy` is the server's operator policy; the default refuses the private-
+ * hosts opt-in, so only a requester built by createRequester() can grant it.
  */
-export async function httpRequest(opts: HttpRequestOptions): Promise<HttpResponse> {
+export async function httpRequest(
+  opts: HttpRequestOptions,
+  policy: HttpPolicy = REFUSE_PRIVATE_HOSTS,
+): Promise<HttpResponse> {
   const start = Date.now();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = Math.min(opts.maxBytes ?? DEFAULT_MAX_BYTES, ABSOLUTE_MAX_BYTES);
   const maxRedirects = opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const retries = Math.max(0, opts.retries ?? 0);
+  const callDeadline = start + ABSOLUTE_MAX_TOTAL_MS;
 
   // The one choke point for the operator gate: every tool reaches the network
   // through here, so no tool can forget it.
-  if (opts.allowPrivateHosts && !context.allowPrivateHosts) return failure(opts.url, PRIVATE_HOSTS_DISABLED, [], start);
+  if (opts.allowPrivateHosts && !policy.allowPrivateHosts) return failure(opts.url, PRIVATE_HOSTS_DISABLED, [], start);
 
   const urlCheck = validateUrl(opts.url, { allowPrivateHosts: opts.allowPrivateHosts });
   if (!urlCheck.ok) return failure(opts.url, urlCheck.reason ?? "URL rejected", [], start);
@@ -440,6 +538,15 @@ export async function httpRequest(opts: HttpRequestOptions): Promise<HttpRespons
   let lastResponse: HttpResponse | undefined;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (opts.signal?.aborted) return failure(opts.url, CANCELLED, [], start);
+    // timeout_ms bounds the whole attempt -- every hop of its redirect chain --
+    // not each hop separately, and never past the call-wide ceiling.
+    const attemptEnd = Date.now() + timeoutMs;
+    const deadline = Math.min(attemptEnd, callDeadline);
+    const timeoutMessage =
+      deadline < attemptEnd
+        ? `request exceeded the ${ABSOLUTE_MAX_TOTAL_MS}ms total limit (all attempts, redirects and retry waits)`
+        : `request exceeded ${timeoutMs}ms`;
     let currentUrl = opts.url;
     let currentMethod: HttpMethod = opts.method;
     let currentBody: string | Uint8Array | undefined = opts.body;
@@ -457,7 +564,8 @@ export async function httpRequest(opts: HttpRequestOptions): Promise<HttpRespons
         body: currentBody,
         contentType: currentContentType,
         opts,
-        timeoutMs,
+        deadline,
+        timeoutMessage,
         maxBytes,
         stripAuth,
         redirects,
@@ -486,7 +594,10 @@ export async function httpRequest(opts: HttpRequestOptions): Promise<HttpRespons
       if (res.ok) return res;
       if (attempt < retries && isRetryableStatus(res.status)) {
         const delay = parseRetryAfter(res.headers["retry-after"]) ?? Math.min(2 ** attempt * 500, 8000);
-        await sleep(delay);
+        // No room for the wait plus another attempt under the ceiling: return
+        // what we have rather than sleep into a timeout.
+        if (Date.now() + delay >= callDeadline) return res;
+        if (!(await sleepUnlessAborted(delay, opts.signal))) return failure(opts.url, CANCELLED, [], start);
         lastResponse = res;
         break; // next retry attempt
       }
