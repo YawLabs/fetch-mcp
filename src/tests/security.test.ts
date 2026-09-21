@@ -63,7 +63,7 @@ describe("checkIpAddress", () => {
     expect(checkIpAddress("fea0::1")).toMatch(/link-local/);
     expect(checkIpAddress("febf::1")).toMatch(/link-local/);
     // fec0:: is just outside the /10 -- not link-local, but deprecated site-local,
-    // blocked by its own rule since 0.7.2.
+    // blocked by its own rule since 0.8.0.
     expect(checkIpAddress("fec0::1")).toMatch(/site-local/);
     expect(checkIpAddress("fec0::1")).not.toMatch(/link-local/);
     // ...and site-local is the whole /10 (fec0::-feff::), not just fec0::/16.
@@ -71,9 +71,9 @@ describe("checkIpAddress", () => {
     expect(checkIpAddress("feff:ffff::1")).toMatch(/site-local/);
   });
 
-  describe("IPv6 forms that embed or tunnel to IPv4 (0.7.2)", () => {
+  describe("IPv6 forms that embed or tunnel to IPv4 (0.8.0)", () => {
     // Each of these passed checkIpAddress (and so validateUrl and the DNS
-    // answer check) before 0.7.2.
+    // answer check) before 0.8.0.
     it("rechecks the IPv4 inside IPv4-compatible addresses (::a.b.c.d, ::/96)", () => {
       // new URL("http://[::127.0.0.1]/") normalises the host to [::7f00:1].
       expect(checkIpAddress("::7f00:1")).toMatch(/IPv4-compatible\) embeds 127\.0\.0\.1/);
@@ -118,7 +118,7 @@ describe("checkIpAddress", () => {
     });
   });
 
-  describe("IPv6 global-unicast allow-list (0.7.2)", () => {
+  describe("IPv6 global-unicast allow-list (0.8.0)", () => {
     it("refuses everything outside 2000::/3 that no named rule caught", () => {
       // IANA: 5f00::/16 SRv6 SIDs, 100:0:0:1::/64 dummy prefix, and unassigned space.
       for (const ip of ["5f00::1", "100:0:0:1::1", "4000::1", "1000::1", "8000::1", "fe00::1", "c000::1"]) {
