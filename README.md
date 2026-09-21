@@ -33,6 +33,7 @@ SSRF protection is on by default. The server refuses requests to:
 - Multicast / broadcast
 - IPv4-mapped IPv6 (`::ffff:0:0/96`) re-checked against the IPv4 rules, and likewise the IPv4 embedded in IPv4-compatible (`::/96`), IPv4-translated (`::ffff:0:0:0/96`) and 6to4 (`2002::/16`) addresses
 - Teredo (`2001::/32`), NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), site-local (`fec0::/10`) and discard-only (`100::/64`) IPv6
+- Any other IPv6 outside global unicast (`2000::/3`), and the non-global blocks inside it (`3fff::/20`, `2001:2::/48`, `2001:10::/28`)
 - The Azure WireServer address `168.63.129.16`
 - Non-`http`/`https` schemes (`file://`, `gopher://`, `javascript:`, …)
 - Hostname `localhost` and any `*.localhost`
@@ -208,7 +209,7 @@ Fetch a `sitemap.xml` or sitemap-index and return the URL list:
 }
 ```
 
-Gzipped `.xml.gz` sitemaps are auto-decompressed. `max_depth` controls how many levels of sitemap-index to follow (default 1). Setting `max_depth: 0` on a sitemap-index returns the index's `childSitemaps` list without fetching any child (useful to discover structure cheaply). Partial failures — one child sitemap 500s while others succeed — are returned under `warnings` rather than aborting the whole call. `max_sitemaps` (default 50, max 1000) caps how many sitemap documents one call fetches, index included; children past it are listed under `childSitemaps` with a warning. `max_bytes` (default 20 MiB) applies to each sitemap, and to the decompressed size of a gzipped one; a sitemap larger than that is an error (a warning for a child) rather than a silently partial URL list.
+Gzipped `.xml.gz` sitemaps are auto-decompressed. `max_depth` controls how many levels of sitemap-index to follow (default 1). Setting `max_depth: 0` on a sitemap-index returns the index's `childSitemaps` list without fetching any child (useful to discover structure cheaply). Partial failures — one child sitemap 500s while others succeed — are returned under `warnings` rather than aborting the whole call. `max_sitemaps` (default 50, max 1000) caps how many sitemap documents one call fetches, index included; children past it are listed under `childSitemaps` with a warning. The whole call is capped at 5 minutes. `max_bytes` (default 20 MiB) applies to each sitemap, and to the decompressed size of a gzipped one; a sitemap larger than that is an error (a warning for a child) rather than a silently partial URL list.
 
 ### `fetch_feed`
 

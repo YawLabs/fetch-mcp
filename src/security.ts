@@ -192,6 +192,31 @@ export function checkIpAddress(ip: string): string | null {
     ) {
       return `IPv6 address ${ip} is local-use NAT64 (64:ff9b:1::/48)`;
     }
+    // Everything above named a specific range. What is left must be global
+    // unicast: IANA assigns public addresses only from 2000::/3, and reserves or
+    // marks non-global the rest (5f00::/16 SRv6 SIDs, 100:0:0:1::/64 dummy,
+    // 4000::/2 and fe00::/9 unassigned, ...). An allow-list here stops the next
+    // special-purpose block from being open by default.
+    if ((bytes[0]! & 0xe0) !== 0x20) {
+      return `IPv6 address ${ip} is outside global unicast (2000::/3)`;
+    }
+    // Non-global blocks inside 2000::/3.
+    if (bytes[0] === 0x3f && bytes[1] === 0xff && (bytes[2]! & 0xf0) === 0x00) {
+      return `IPv6 address ${ip} is documentation (3fff::/20)`;
+    }
+    if (
+      bytes[0] === 0x20 &&
+      bytes[1] === 0x01 &&
+      bytes[2] === 0x00 &&
+      bytes[3] === 0x02 &&
+      bytes[4] === 0x00 &&
+      bytes[5] === 0x00
+    ) {
+      return `IPv6 address ${ip} is benchmarking (2001:2::/48)`;
+    }
+    if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && (bytes[3]! & 0xf0) === 0x10) {
+      return `IPv6 address ${ip} is ORCHID (2001:10::/28, deprecated)`;
+    }
     return null;
   }
   return `"${ip}" is not a valid IP literal`;

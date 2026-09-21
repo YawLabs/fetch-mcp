@@ -66,6 +66,9 @@ describe("checkIpAddress", () => {
     // blocked by its own rule since 0.7.2.
     expect(checkIpAddress("fec0::1")).toMatch(/site-local/);
     expect(checkIpAddress("fec0::1")).not.toMatch(/link-local/);
+    // ...and site-local is the whole /10 (fec0::-feff::), not just fec0::/16.
+    expect(checkIpAddress("fed0::1")).toMatch(/site-local/);
+    expect(checkIpAddress("feff:ffff::1")).toMatch(/site-local/);
   });
 
   describe("IPv6 forms that embed or tunnel to IPv4 (0.7.2)", () => {
@@ -95,19 +98,62 @@ describe("checkIpAddress", () => {
     it("blocks Teredo (2001::/32) outright, without catching the rest of 2001::/16", () => {
       expect(checkIpAddress("2001::1")).toMatch(/Teredo/);
       expect(checkIpAddress("2001:0:4136:e378:8000:63bf:3fff:fdd2")).toMatch(/Teredo/);
-      // Google Public DNS lives in 2001:4860::/32 -- same first hextet, not Teredo.
+      expect(checkIpAddress("2001:0:ffff:ffff::1")).toMatch(/Teredo/);
+      // The /32 boundary: 2001:1:: is the next /32 over (PCP anycast, globally
+      // reachable), and Google Public DNS lives in 2001:4860::/32.
+      expect(checkIpAddress("2001:1::1")).toBeNull();
       expect(checkIpAddress("2001:4860:4860::8888")).toBeNull();
     });
 
     it("blocks local-use NAT64 (64:ff9b:1::/48) alongside the well-known prefix", () => {
       expect(checkIpAddress("64:ff9b:1::a00:1")).toMatch(/local-use NAT64/);
       expect(checkIpAddress("64:ff9b:1:ffff::1")).toMatch(/local-use NAT64/);
-      expect(checkIpAddress("64:ff9b:2::1")).toBeNull();
+      // Just outside the /48 -- still refused, by the global-unicast allow-list.
+      expect(checkIpAddress("64:ff9b:2::1")).toMatch(/outside global unicast/);
     });
 
-    it("blocks discard-only (100::/64) but not the rest of 100::/8", () => {
+    it("blocks discard-only (100::/64) by name; the rest of 100::/8 falls to the global-unicast allow-list", () => {
       expect(checkIpAddress("100::1")).toMatch(/discard-only/);
-      expect(checkIpAddress("100:0:0:1::1")).toBeNull();
+      expect(checkIpAddress("100:0:0:1::1")).toMatch(/outside global unicast/);
+    });
+  });
+
+  describe("IPv6 global-unicast allow-list (0.7.2)", () => {
+    it("refuses everything outside 2000::/3 that no named rule caught", () => {
+      // IANA: 5f00::/16 SRv6 SIDs, 100:0:0:1::/64 dummy prefix, and unassigned space.
+      for (const ip of ["5f00::1", "100:0:0:1::1", "4000::1", "1000::1", "8000::1", "fe00::1", "c000::1"]) {
+        expect(checkIpAddress(ip), ip).toMatch(/outside global unicast \(2000::\/3\)/);
+      }
+    });
+
+    it("refuses the non-global blocks inside 2000::/3", () => {
+      expect(checkIpAddress("3fff::1")).toMatch(/documentation \(3fff::\/20\)/);
+      expect(checkIpAddress("3fff:fff::1")).toMatch(/documentation/);
+      expect(checkIpAddress("2001:2::1")).toMatch(/benchmarking/);
+      expect(checkIpAddress("2001:2:0:ffff::1")).toMatch(/benchmarking/);
+      expect(checkIpAddress("2001:10::1")).toMatch(/ORCHID/);
+      expect(checkIpAddress("2001:1f::1")).toMatch(/ORCHID/);
+    });
+
+    it("keeps global unicast open, right up to the edges of those blocks", () => {
+      for (const ip of [
+        "2000::1",
+        "2606:4700:4700::1111",
+        "2a00:1450:4001::1",
+        "3ffe::1",
+        "3fff:1000::1", // just past 3fff::/20
+        "2001:3::1", // just past 2001:2::/48 (AMT, globally reachable)
+        "2001:20::1", // just past 2001:10::/28 (ORCHIDv2, globally reachable)
+      ]) {
+        expect(checkIpAddress(ip), ip).toBeNull();
+      }
+    });
+
+    it("leaves the embedding forms to their own rules (public embedded IPv4 stays allowed)", () => {
+      // ::/96, SIIT and mapped sit outside 2000::/3 but are decided earlier.
+      expect(checkIpAddress("::8.8.8.8")).toBeNull();
+      expect(checkIpAddress("::ffff:8.8.8.8")).toBeNull();
+      expect(checkIpAddress("::ffff:0:808:808")).toBeNull();
     });
 
     it("reaches validateUrl: a literal URL in any of these forms is refused", () => {

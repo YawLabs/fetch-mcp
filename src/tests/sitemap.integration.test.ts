@@ -2,9 +2,11 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer as createHttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { gzipSync } from "node:zlib";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { setHttpContext } from "../http.js";
+import { ABSOLUTE_MAX_TOTAL_MS, createRequester, setHttpContext } from "../http.js";
 import { createFetchServer } from "../server.js";
+import { registerSitemapTools } from "../tools/sitemap.js";
 
 setHttpContext({ version: "test" });
 
@@ -255,6 +257,123 @@ describe("fetch_sitemap fan-out cap (max_sitemaps)", () => {
     expect(parsed!.urlCount).toBe(5);
     expect(parsed!.warnings).toEqual([]);
     expect(parsed!.childSitemaps).toEqual([]);
+  });
+
+  it("counts failed fetches against the cap -- a failing child is still a request", async () => {
+    // An index of children that all 500: counting only successes would fetch
+    // every one of them, which is the fan-out the cap exists to bound.
+    let count = 0;
+    handler = (_req, res, url) => {
+      count++;
+      if (url.pathname === "/index.xml") {
+        res.setHeader("content-type", "application/xml");
+        const children = Array.from(
+          { length: 10 },
+          (_, i) => `<sitemap><loc>${baseUrl}/broken-${i}.xml</loc></sitemap>`,
+        );
+        res.end(
+          `<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${children.join("")}</sitemapindex>`,
+        );
+      } else {
+        res.statusCode = 500;
+        res.end("boom");
+      }
+    };
+    const { parsed } = await callSitemap({ url: `${baseUrl}/index.xml`, allow_private_hosts: true, max_sitemaps: 3 });
+
+    expect(count).toBe(3);
+    const warnings = parsed!.warnings as Array<{ url: string; error: string }>;
+    expect(warnings.filter((w) => w.error.startsWith("HTTP 500"))).toHaveLength(2);
+    expect(warnings.at(-1)!.error).toBe(
+      "max_sitemaps (3) reached: 8 child sitemap(s) not fetched, listed under childSitemaps",
+    );
+  });
+});
+
+describe("fetch_sitemap's whole-call budget", () => {
+  // Each fetch is its own httpRequest with its own ceiling, so without a budget
+  // for the tool call max_sitemaps x timeout_ms could pass before it returned.
+  // The budget is injected (registerSitemapTools' third argument), so these run
+  // in milliseconds rather than the production five minutes.
+  async function callWithBudget(totalMs: number, input: Record<string, unknown>) {
+    const mcp = new McpServer({ name: "budget-test", version: "0.0.0" });
+    registerSitemapTools(mcp, createRequester({ allowPrivateHosts: true }), { totalMs });
+    const tool = (
+      mcp as unknown as {
+        _registeredTools: Record<
+          string,
+          {
+            handler: (
+              input: unknown,
+              extra: { signal: AbortSignal },
+            ) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+          }
+        >;
+      }
+    )._registeredTools.fetch_sitemap!;
+    const out = await tool.handler(input, { signal: new AbortController().signal });
+    const raw = out.content[0]!.text;
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      /* error text */
+    }
+    return { raw, parsed, isError: Boolean(out.isError) };
+  }
+
+  it("stops fetching children once the budget is spent, and lists the rest", async () => {
+    let count = 0;
+    handler = (_req, res, url) => {
+      count++;
+      res.setHeader("content-type", "application/xml");
+      if (url.pathname === "/index.xml") {
+        const children = Array.from({ length: 10 }, (_, i) => `<sitemap><loc>${baseUrl}/slow-${i}.xml</loc></sitemap>`);
+        res.end(
+          `<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${children.join("")}</sitemapindex>`,
+        );
+      } else {
+        setTimeout(
+          () =>
+            res.end(
+              `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${baseUrl}${url.pathname}#p</loc></url></urlset>`,
+            ),
+          200,
+        );
+      }
+    };
+    const t0 = Date.now();
+    const { parsed, isError } = await callWithBudget(700, { url: `${baseUrl}/index.xml`, allow_private_hosts: true });
+
+    expect(isError).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(2500);
+    expect(count).toBeLessThan(11);
+    const warnings = parsed!.warnings as Array<{ url: string; error: string }>;
+    expect(warnings.at(-1)!.error).toMatch(
+      /^fetch_sitemap exceeded its 700ms total limit: \d+ child sitemap\(s\) not fetched, listed under childSitemaps$/,
+    );
+    expect((parsed!.childSitemaps as string[]).length).toBeGreaterThan(0);
+  });
+
+  it("cuts off the fetch in flight when the budget runs out, and says why", async () => {
+    handler = (_req, res) => {
+      setTimeout(() => res.end("too late"), 5000);
+    };
+    const t0 = Date.now();
+    const { raw, isError } = await callWithBudget(300, {
+      url: `${baseUrl}/stuck.xml`,
+      allow_private_hosts: true,
+      timeout_ms: 60_000,
+    });
+
+    expect(isError).toBe(true);
+    expect(raw).toContain("fetch_sitemap exceeded its 300ms total limit");
+    expect(Date.now() - t0).toBeLessThan(2500);
+  });
+
+  it("defaults to the five-minute ceiling in createFetchServer", () => {
+    // Pinned so the production default cannot silently drift from httpRequest's ceiling.
+    expect(ABSOLUTE_MAX_TOTAL_MS).toBe(300_000);
   });
 });
 

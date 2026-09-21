@@ -219,10 +219,15 @@ async function resolveAndPin(
  * This ensures the kernel dials the IP we verified, not one a racing
  * DNS server returns a millisecond later. The original hostname still
  * flows through SNI and the Host header for correct TLS + vhosting.
+ *
+ * `connectTimeoutMs` is what is left of the attempt's budget. undici's own
+ * default is 10s, which let a SYN that is never answered (or a TLS handshake a
+ * server never finishes) outlive both timeout_ms and a cancellation.
  */
-function pinnedAgent(ip: string, family: 4 | 6): Agent {
+function pinnedAgent(ip: string, family: 4 | 6, connectTimeoutMs: number): Agent {
   return new Agent({
     connect: {
+      timeout: Math.max(1, connectTimeoutMs),
       // Node 22 always calls lookup with { all: true } internally and passes the
       // result through lookupAndConnectMultiple, which expects an array of address
       // objects: cb(null, [{address, family}]).  The old single-address form
@@ -431,7 +436,7 @@ async function sendHop(params: {
       if (!literal) {
         const resolved = await raceAbort(resolveAndPin(host), abortController.signal);
         if (!resolved.ok) return { kind: "error", response: failure(url, resolved.reason, redirects, start) };
-        dispatcher = pinnedAgent(resolved.ip, resolved.family);
+        dispatcher = pinnedAgent(resolved.ip, resolved.family, deadline - Date.now());
       }
     }
 
@@ -502,7 +507,12 @@ async function sendHop(params: {
   } finally {
     clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onCallerAbort);
-    if (dispatcher) await dispatcher.close().catch(() => {});
+    // destroy(), not close(): each pinned Agent serves exactly one hop, and by
+    // now its body has been read, drained or abandoned. close() waits for a
+    // connect still in progress -- after a timeout or cancellation mid-connect
+    // that held the call for undici's 10s connect timeout, whatever timeout_ms
+    // said. destroy() drops it at once.
+    if (dispatcher) await dispatcher.destroy().catch(() => {});
   }
 }
 
@@ -594,9 +604,10 @@ export async function httpRequest(
       if (res.ok) return res;
       if (attempt < retries && isRetryableStatus(res.status)) {
         const delay = parseRetryAfter(res.headers["retry-after"]) ?? Math.min(2 ** attempt * 500, 8000);
-        // No room for the wait plus another attempt under the ceiling: return
-        // what we have rather than sleep into a timeout.
-        if (Date.now() + delay >= callDeadline) return res;
+        // Retry only if the wait AND a full attempt fit under the ceiling.
+        // Otherwise return the response we have: a retry that starts with a
+        // sliver of budget can only time out, and would throw this answer away.
+        if (Date.now() + delay + timeoutMs > callDeadline) return res;
         if (!(await sleepUnlessAborted(delay, opts.signal))) return failure(opts.url, CANCELLED, [], start);
         lastResponse = res;
         break; // next retry attempt

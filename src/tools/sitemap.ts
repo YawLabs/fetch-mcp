@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { ABSOLUTE_MAX_BYTES, type HttpRequester } from "../http.js";
+import { ABSOLUTE_MAX_BYTES, ABSOLUTE_MAX_TOTAL_MS, type HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export interface SitemapUrl {
@@ -132,7 +132,20 @@ interface SitemapWarning {
   error: string;
 }
 
-export function registerSitemapTools(server: McpServer, request: HttpRequester) {
+export interface SitemapLimits {
+  /**
+   * Budget for one whole fetch_sitemap call, across every document it fetches.
+   * Defaults to the ceiling a single httpRequest() call has. Injected rather
+   * than module state so a test can shorten it without touching other servers.
+   */
+  totalMs: number;
+}
+
+export function registerSitemapTools(
+  server: McpServer,
+  request: HttpRequester,
+  limits: SitemapLimits = { totalMs: ABSOLUTE_MAX_TOTAL_MS },
+) {
   server.tool(
     "fetch_sitemap",
     "Fetch a sitemap.xml (or sitemap-index) and return the contained URLs with their lastmod / changefreq / priority. Follows sitemap-index chaining up to max_depth levels. Gzipped .xml.gz payloads are auto-decompressed. Partial failures (one child sitemap 500s while others work) are returned under 'warnings' without aborting the whole request. SSRF-protected by default.",
@@ -184,11 +197,27 @@ export function registerSitemapTools(server: McpServer, request: HttpRequester) 
       const unvisitedChildren: string[] = [];
       const warnings: SitemapWarning[] = [];
 
+      // One budget for the whole tool call. Each fetch is its own httpRequest
+      // with its own ceiling, so up to max_sitemaps x timeout_ms could pass
+      // before this call returned. `budget` aborts on the MCP request's
+      // cancellation or when limits.totalMs runs out, and every fetch -- the
+      // one in flight included -- carries its signal.
+      const budget = new AbortController();
+      let budgetSpent = false;
+      const budgetMessage = `fetch_sitemap exceeded its ${limits.totalMs}ms total limit`;
+      const onCancel = () => budget.abort();
+      if (extra.signal.aborted) budget.abort();
+      else extra.signal.addEventListener("abort", onCancel, { once: true });
+      const budgetTimer = setTimeout(() => {
+        budgetSpent = true;
+        budget.abort();
+      }, limits.totalMs);
+
       const fetchOne = async (
         u: string,
       ): Promise<{ ok: true; parsed: ParsedSitemap } | { ok: false; error: string }> => {
         const res = await request({
-          signal: extra.signal,
+          signal: budget.signal,
           method: "GET",
           url: u,
           timeoutMs: timeout_ms,
@@ -220,49 +249,62 @@ export function registerSitemapTools(server: McpServer, request: HttpRequester) 
       };
 
       const queue: Array<{ url: string; depth: number }> = [{ url, depth: 0 }];
-      while (queue.length > 0 && allUrls.length < cap) {
-        // A cancelled tools/call: stop fetching (each request would come straight
-        // back "cancelled" and fill warnings with noise).
-        if (extra.signal.aborted) break;
-        const next = queue.shift();
-        if (!next) break;
-        if (seen.has(next.url)) continue;
-        // Bound the fan-out: an index can list hundreds of thousands of child
-        // sitemaps on as many hosts, and each one is a request this server makes.
-        if (fetched >= sitemapCap) {
-          const unfetched = [next, ...queue].map((q) => q.url).filter((u) => !seen.has(u));
-          const distinct = [...new Set(unfetched)];
-          unvisitedChildren.push(...distinct);
-          warnings.push({
-            url,
-            error: `max_sitemaps (${sitemapCap}) reached: ${distinct.length} child sitemap(s) not fetched, listed under childSitemaps`,
-          });
-          break;
-        }
-        seen.add(next.url);
-        fetched++;
-        const result = await fetchOne(next.url);
-        if (!result.ok) {
-          // If the very first fetch fails, the whole tool is meaningless -- surface as error.
-          if (visitedIndexes.length === 0 && allUrls.length === 0) {
-            return formatError(`${next.url}: ${result.error}`);
+      /** Move everything still queued (and unseen) to childSitemaps, once, with a warning. */
+      const listUnfetched = (pending: Array<{ url: string }>, why: string) => {
+        const distinct = [...new Set(pending.map((q) => q.url).filter((u) => !seen.has(u)))];
+        unvisitedChildren.push(...distinct);
+        warnings.push({
+          url,
+          error: `${why}: ${distinct.length} child sitemap(s) not fetched, listed under childSitemaps`,
+        });
+      };
+      try {
+        while (queue.length > 0 && allUrls.length < cap) {
+          const next = queue.shift();
+          if (!next) break;
+          if (seen.has(next.url)) continue;
+          if (budget.signal.aborted) {
+            // Out of budget: say so and list what is left. A plain cancellation
+            // just stops -- nobody is waiting for the answer.
+            if (budgetSpent) listUnfetched([next, ...queue], budgetMessage);
+            break;
           }
-          warnings.push({ url: next.url, error: result.error });
-          continue;
-        }
-        visitedIndexes.push(next.url);
-        for (const child of result.parsed.urls) {
-          if (allUrls.length >= cap) break;
-          allUrls.push(child);
-        }
-        for (const c of result.parsed.childSitemaps) {
-          if (seen.has(c)) continue;
-          if (next.depth < depth) {
-            queue.push({ url: c, depth: next.depth + 1 });
-          } else {
-            unvisitedChildren.push(c);
+          // Bound the fan-out: an index can list hundreds of thousands of child
+          // sitemaps on as many hosts, and each one is a request this server makes.
+          if (fetched >= sitemapCap) {
+            listUnfetched([next, ...queue], `max_sitemaps (${sitemapCap}) reached`);
+            break;
+          }
+          seen.add(next.url);
+          fetched++;
+          const result = await fetchOne(next.url);
+          if (!result.ok) {
+            // A fetch cut short by the budget reports why, not "cancelled".
+            const error = budgetSpent ? budgetMessage : result.error;
+            // If the very first fetch fails, the whole tool is meaningless -- surface as error.
+            if (visitedIndexes.length === 0 && allUrls.length === 0) {
+              return formatError(`${next.url}: ${error}`);
+            }
+            warnings.push({ url: next.url, error });
+            continue;
+          }
+          visitedIndexes.push(next.url);
+          for (const child of result.parsed.urls) {
+            if (allUrls.length >= cap) break;
+            allUrls.push(child);
+          }
+          for (const c of result.parsed.childSitemaps) {
+            if (seen.has(c)) continue;
+            if (next.depth < depth) {
+              queue.push({ url: c, depth: next.depth + 1 });
+            } else {
+              unvisitedChildren.push(c);
+            }
           }
         }
+      } finally {
+        clearTimeout(budgetTimer);
+        extra.signal.removeEventListener("abort", onCancel);
       }
       return formatJson({
         sitemaps: visitedIndexes,

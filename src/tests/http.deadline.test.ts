@@ -56,18 +56,21 @@ const later = (ms: number, fn: () => void) => setTimeout(fn, ms);
 
 describe("timeout_ms bounds a whole attempt", () => {
   it("covers every hop of a redirect chain, not each hop separately", async () => {
-    // Two hops of ~150ms each: under 0.7.1 each fit a 250ms per-hop timeout and
-    // the chain took ~300ms. Now the chain must fit the 250ms together.
+    // Two hops of ~1000ms each: under 0.7.1 each fit a 1500ms per-hop timeout
+    // and the chain took ~2000ms. Now the chain must fit the 1500ms together.
+    // The margin that matters is the FIRST hop's (500ms of headroom): the
+    // second hop must be reached for the test to prove anything, and a loaded
+    // box only ever makes the chain longer, never shorter.
     handler = (req, res) => {
-      if (req.url === "/a") later(150, () => res.writeHead(302, { location: "/b" }).end());
-      else later(150, () => res.end("done"));
+      if (req.url === "/a") later(1000, () => res.writeHead(302, { location: "/b" }).end());
+      else later(1000, () => res.end("done"));
     };
     const t0 = Date.now();
-    const res = await request({ method: "GET", url: `${base}/a`, allowPrivateHosts: true, timeoutMs: 250 });
+    const res = await request({ method: "GET", url: `${base}/a`, allowPrivateHosts: true, timeoutMs: 1500 });
 
     expect(res.ok).toBe(false);
-    expect(res.error).toBe("request exceeded 250ms");
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(res.error).toBe("request exceeded 1500ms");
+    expect(Date.now() - t0).toBeLessThan(5000);
     expect(hits).toEqual(["/a", "/b"]);
   });
 
@@ -174,6 +177,53 @@ describe("caller cancellation (the MCP request's signal)", () => {
 
     expect(res.ok).toBe(true);
     expect(res.bodyText).toBe("fine");
+  });
+});
+
+describe("every tool passes the MCP request's signal through", () => {
+  // A tool that dropped `signal: extra.signal` would dial the fixture despite
+  // the cancelled request. All 15 tools, so no single one can regress quietly.
+  const TOOLS = [
+    "http_get",
+    "http_post",
+    "http_put",
+    "http_patch",
+    "http_delete",
+    "http_head",
+    "http_options",
+    "fetch_html_to_markdown",
+    "fetch_html_to_text",
+    "fetch_reader",
+    "fetch_meta",
+    "fetch_links",
+    "fetch_feed",
+    "fetch_robots",
+    "fetch_sitemap",
+  ];
+
+  it.each(TOOLS)("%s makes no request once its tools/call is cancelled", async (name) => {
+    const { createFetchServer } = await import("../server.js");
+    handler = (_req, res) => res.end("<html></html>");
+    const tools = (
+      createFetchServer({ allowPrivateHosts: true }) as unknown as {
+        _registeredTools: Record<
+          string,
+          { handler: (input: unknown, extra: { signal: AbortSignal }) => Promise<{ content: Array<{ text: string }> }> }
+        >;
+      }
+    )._registeredTools;
+    expect(Object.keys(tools).sort()).toEqual([...TOOLS].sort());
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const out = await tools[name]!.handler(
+      { url: `${base}/page`, allow_private_hosts: true },
+      { signal: cancelled.signal },
+    );
+
+    expect(hits).toEqual([]);
+    // fetch_sitemap just stops (nobody is waiting on a cancelled call); the
+    // rest report the cancellation their one request came back with.
+    if (name !== "fetch_sitemap") expect(out.content[0]!.text).toContain("request cancelled by the client");
   });
 });
 

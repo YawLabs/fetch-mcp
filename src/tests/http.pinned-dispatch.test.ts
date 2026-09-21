@@ -1,6 +1,6 @@
 import type { IncomingMessage, Server } from "node:http";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, createServer as createTcpServer, type Socket, type Server as TcpServer } from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Real-socket coverage for the guarded HOSTNAME path: resolveAndPin -> pinnedAgent
@@ -82,5 +82,53 @@ describe("guarded hostname requests dial through the pinned dispatcher", () => {
     expect(res.error).toMatch(/127\.0\.0\.1.*reserved/);
     // Only the redirecting hop reached the server; /secret was never requested.
     expect(seen.map((s) => s.path)).toEqual(["/to-literal"]);
+  });
+});
+
+describe("a hop aborted mid-connect lets go at once", () => {
+  // A server that accepts TCP and never answers the TLS ClientHello: the pinned
+  // Agent is still "connecting" when the deadline or the cancellation fires.
+  // sendHop used to `await dispatcher.close()`, which waits out undici's 10s
+  // connect timeout -- the call returned "request exceeded 300ms" after ~10.6s.
+  let stall: TcpServer;
+  let stallPort: number;
+  const sockets = new Set<Socket>();
+
+  beforeAll(async () => {
+    stall = createTcpServer((socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+    });
+    await new Promise<void>((done) => stall.listen(0, "127.0.0.1", () => done()));
+    stallPort = (stall.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((done) => stall.close(() => done()));
+  });
+
+  it("returns on timeout_ms, not after undici's 10s connect timeout", async () => {
+    const t0 = Date.now();
+    const res = await httpRequest({ method: "GET", url: `https://pinned.test:${stallPort}/`, timeoutMs: 300 });
+
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe("request exceeded 300ms");
+    expect(Date.now() - t0).toBeLessThan(3000);
+  });
+
+  it("returns on cancellation, not after undici's 10s connect timeout", async () => {
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 200);
+    const t0 = Date.now();
+    const res = await httpRequest({
+      method: "GET",
+      url: `https://pinned.test:${stallPort}/`,
+      timeoutMs: 30_000,
+      signal: cancel.signal,
+    });
+
+    expect(res.error).toBe("request cancelled by the client");
+    expect(Date.now() - t0).toBeLessThan(3000);
   });
 });
