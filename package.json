@@ -4,7 +4,7 @@
   "mcpName": "io.github.YawLabs/fetch-mcp",
   "description": "Fetch MCP server for AI agents: HTTP requests, HTML-to-markdown, reader mode, metadata, links, sitemaps, RSS/Atom, robots.txt, SSRF-safe",
   "license": "MIT",
-  "author": "Yaw Labs <support@mcp.hosting> (https://mcp.hosting)",
+  "author": "Yaw Labs <contact@yaw.sh> (https://yaw.sh)",
   "type": "module",
   "exports": {
     ".": {
@@ -59,7 +59,7 @@
     }
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "keywords": [
     "fetch",

@@ -578,7 +578,7 @@ describe("launcher on an oam host", () => {
   );
 
   it.skipIf(!buildAvailable)(
-    "passes --permission to oam BEFORE `run`, with --allow-net but no other grant",
+    "passes --permission to oam BEFORE `run`, with --allow-net and only the one env grant the server reads",
     async () => {
       // oam rejects `run --permission`, so where the flag sits is
       // load-bearing, and the only grant (--allow-net) is the documented
@@ -588,10 +588,15 @@ describe("launcher on an oam host", () => {
       const args = recordedSpawnArgs(run);
       expect(args, `no spawn was recorded: ${JSON.stringify(run)}`).not.toBeNull();
       expect(args![0]).toBe("--permission");
-      // The single grant sits between `--permission` and `run`. No `--allow-env`
-      // (this server reads no env), no `--allow-net=...` (bare grants every
-      // host, which is the right call for a fetch server -- see the header).
-      expect(args!.slice(1, args!.indexOf("run"))).toEqual(["--allow-net"]);
+      // The grants sit between `--permission` and `run`. `--allow-env` names the
+      // one variable the server reads (FETCH_MCP_ALLOW_PRIVATE_HOSTS) -- a bare
+      // grant would expose the whole environment, and no grant would silently
+      // read the operator's opt-in as off. No `--allow-net=...` (bare grants
+      // every host, which is the right call for a fetch server -- see the header).
+      expect(args!.slice(1, args!.indexOf("run"))).toEqual([
+        "--allow-net",
+        "--allow-env=FETCH_MCP_ALLOW_PRIVATE_HOSTS",
+      ]);
       expect(args![args!.indexOf("run")]).toBe("run");
       expect(args![args!.indexOf("run") + 1]).toMatch(/dist[\\/]index\.js$/);
       expect(args!.slice(args!.indexOf("run") + 2)).toEqual(["--", "--version"]);
@@ -1069,6 +1074,108 @@ describe("launcher with no usable oam", () => {
       expect(session.answered, JSON.stringify(session)).toEqual([1, 2]);
       expect(session.exitedOnItsOwn, JSON.stringify(session)).toBe(false);
       expect(session.stderr).toMatch(/failed to launch oam at .*; using this oam 0\.15\.2 process instead\./);
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("launcher nodeFloorProblem()", () => {
+  const problem = new Function(
+    `${extract([
+      /const NODE_MIN = \[[^\]]*\];/,
+      ATLEAST_DECL,
+      /function nodeFloorProblem\(version, what\) \{[\s\S]*?\n\}/,
+    ])}\nreturn nodeFloorProblem;`,
+  )() as (version: number[] | null, what: string) => string | null;
+
+  it("keeps the floor in step with package.json engines", () => {
+    // Both must move together: engines is what npm warns on, NODE_MIN is what
+    // the launcher refuses on. undici 8's own floor is 22.19.0.
+    const engines = JSON.parse(readFileSync(resolve(REPO_ROOT, "package.json"), "utf-8")).engines.node as string;
+    expect(engines).toBe(">=22.19.0");
+    expect(extract([/const NODE_MIN = \[[^\]]*\];/])).toBe("const NODE_MIN = [22, 19, 0];");
+  });
+
+  it("accepts the floor and anything newer", () => {
+    for (const v of [
+      [22, 19, 0],
+      [22, 22, 2],
+      [24, 0, 0],
+      [25, 1, 0],
+    ]) {
+      expect(problem(v, "this process"), v.join(".")).toBeNull();
+    }
+  });
+
+  it("refuses older Nodes and names the version, the floor and both remedies", () => {
+    for (const v of [
+      [22, 18, 0],
+      [22, 14, 0],
+      [20, 20, 2],
+      [18, 0, 0],
+    ]) {
+      const line = problem(v, "this process");
+      expect(line, v.join(".")).toMatch(
+        new RegExp(`^fetch-mcp: this process is Node ${v.join(".")}, older than 22.19.0; `),
+      );
+      expect(line).toContain("Install a newer Node, or install oam from https://oamjs.org");
+    }
+    expect(problem([20, 0, 0], "C:\tools\node.exe")).toMatch(/^fetch-mcp: C:\tools\node\.exe is Node 20\.0\.0/);
+  });
+
+  it("does not refuse when the version could not be read", () => {
+    // Nothing to compare: let the server's own failure name the problem
+    // rather than refusing a Node that may well be fine.
+    expect(problem(null, "this process")).toBeNull();
+  });
+});
+
+describe("launcher on a Node host below the floor", () => {
+  const posingAsNode = (version: string) =>
+    `Object.defineProperty(process.versions, "node", { value: ${JSON.stringify(version)}, configurable: true, enumerable: true });`;
+  const REFUSED =
+    /^fetch-mcp: this process is Node 22\.14\.0, older than 22\.19\.0; @yawlabs\/fetch-mcp needs Node 22\.19\.0 or newer/m;
+
+  it.skipIf(!buildAvailable)(
+    "refuses to serve in-process under FETCH_MCP_RUNTIME=node instead of importing a server that cannot run there",
+    async () => {
+      const run = await runLauncher(undefined, isolated({ FETCH_MCP_RUNTIME: "node" }), posingAsNode("22.14.0"));
+      expect(run.code, JSON.stringify(run)).toBe(1);
+      expect(run.stdout).toBe("");
+      expect(run.stderr).toMatch(REFUSED);
+      // Never got as far as pointing argv[1] at dist/index.js.
+      expect(run.stderr).not.toMatch(IN_LAUNCHER_PROCESS);
+    },
+    TIMEOUT_MS,
+  );
+
+  it.skipIf(!buildAvailable)(
+    "refuses the auto-mode fallback too, and prints no 'runs WITHOUT --permission' note above the refusal",
+    async () => {
+      // No oam anywhere and the sandbox requested: the fallback would serve
+      // in this process without --permission. The refusal has to come first,
+      // so the sandbox note never sits above an exit that served nothing.
+      const run = await runLauncher(
+        undefined,
+        isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }),
+        posingAsNode("22.14.0"),
+      );
+      expect(run.code, JSON.stringify(run)).toBe(1);
+      expect(run.stdout).toBe("");
+      expect(run.stderr).toMatch(REFUSED);
+      expect(run.stderr).not.toMatch(SANDBOX_DROPPED);
+      expect(run.stderr).not.toMatch(/using Node instead/);
+    },
+    TIMEOUT_MS,
+  );
+
+  it.skipIf(!buildAvailable)(
+    "serves as before on a Node at the floor (positive control on the real runtime)",
+    async () => {
+      const run = await runLauncher(undefined, isolated({ FETCH_MCP_RUNTIME: "node" }));
+      expect(run.code, JSON.stringify(run)).toBe(0);
+      expect(run.stdout.trim()).toBe(PACKAGE_VERSION);
+      expect(run.stderr).not.toMatch(/older than 22\.19\.0/);
     },
     TIMEOUT_MS,
   );

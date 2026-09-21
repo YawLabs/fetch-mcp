@@ -11,7 +11,10 @@ import {
   shouldDecodeAsText,
 } from "../http.js";
 
-setHttpContext({ version: "test" });
+// These suites reach a loopback server with allowPrivateHosts, so they run with
+// the operator opt-in (FETCH_MCP_ALLOW_PRIVATE_HOSTS=1) on. The gate itself is
+// covered in http.redirect-ssrf.test.ts and policy.test.ts.
+setHttpContext({ version: "test", allowPrivateHosts: true });
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => void;
 

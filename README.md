@@ -35,7 +35,25 @@ SSRF protection is on by default. The server refuses requests to:
 - Non-`http`/`https` schemes (`file://`, `gopher://`, `javascript:`, …)
 - Hostname `localhost` and any `*.localhost`
 
-DNS is resolved once per redirect hop, every returned address is checked, and the verified IP is pinned into the HTTP dispatcher so the subsequent TCP connection dials that exact address — closing the DNS-rebinding TOCTOU window. `Authorization` headers are stripped on cross-origin redirects. A 302 to `http://127.0.0.1` through a public host gets caught. Set `allow_private_hosts: true` per-request when you really do need internal access (e.g. development).
+Every redirect hop is re-validated against all of the above -- scheme, literal IP and `localhost*` -- before it is dialed, so a 302 from a public host to `http://127.0.0.1`, `http://169.254.169.254` or `ftp://…` is caught. For hostnames, DNS is resolved once per hop, every returned address is checked, and the verified IP is pinned into the HTTP dispatcher so the subsequent TCP connection dials that exact address — closing the DNS-rebinding TOCTOU window. `Authorization`, `Cookie` and `Proxy-Authorization` headers are stripped on cross-origin redirects.
+
+### Reaching private hosts (development)
+
+The model chooses tool arguments, and the model is not trusted: a prompt injected through a fetched page can ask for anything. So the per-call `allow_private_hosts: true` opt-in is **refused unless the operator enables it** by launching the server with `FETCH_MCP_ALLOW_PRIVATE_HOSTS=1` (`true`/`yes`/`on` also work; any unrecognised value is treated as off and named on stderr). With the variable set, a call still has to ask: requests without `allow_private_hosts` stay guarded.
+
+```json
+{
+  "mcpServers": {
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "@yawlabs/fetch-mcp@latest"],
+      "env": { "FETCH_MCP_ALLOW_PRIVATE_HOSTS": "1" }
+    }
+  }
+}
+```
+
+Only set it where the model may legitimately reach your internal network -- a local dev box, not a cloud VM with a metadata endpoint.
 
 ## Install & run
 
@@ -48,7 +66,7 @@ npm i -g @yawlabs/fetch-mcp
 fetch-mcp
 ```
 
-Requires Node ≥20.
+Requires Node 22.19 or newer when running on Node (the floor of its HTTP client, undici 8; the launcher refuses older Nodes with a clear message instead of crashing). Under [oam](https://oamjs.org), which the launcher prefers when installed, the Node version does not matter.
 
 ## Configure in Claude Code / Claude Desktop
 
@@ -88,7 +106,7 @@ Common parameters:
 | `user_agent` | string | `@yawlabs/fetch-mcp/<v>` | `User-Agent` override |
 | `basic_auth` | `{username,password}` | — | Injects `Authorization: Basic …` |
 | `bearer_token` | string | — | Injects `Authorization: Bearer …` |
-| `allow_private_hosts` | bool | `false` | Bypass SSRF block |
+| `allow_private_hosts` | bool | `false` | Opt this call into loopback / private / link-local targets. Refused unless the operator set `FETCH_MCP_ALLOW_PRIVATE_HOSTS=1` ([details](#reaching-private-hosts-development)) |
 | `decode_text` | bool | *auto* | When unset, auto-detects by response Content-Type (text for text/*, JSON, XML, JS, form-urlencoded; binary otherwise). Set explicitly `true` to force text decoding, `false` to force base64 in `body_base64`. |
 
 Body-capable tools (POST/PUT/PATCH/DELETE) also take:
@@ -248,7 +266,7 @@ npm run lint     # biome
 npm run typecheck
 ```
 
-Tests spin up a local loopback HTTP server on `127.0.0.1:0` to exercise the real request/response path — no mocking of HTTP. SSRF tests verify that the default-deny still applies to that local server unless the request opts into `allow_private_hosts`.
+Tests spin up a local loopback HTTP server on `127.0.0.1:0` to exercise the real request/response path — no mocking of HTTP. SSRF tests verify that the default-deny still applies to that local server unless the operator gate is on and the request opts into `allow_private_hosts`.
 
 ## License
 

@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { setHttpContext } from "./http.js";
+import { ALLOW_PRIVATE_HOSTS_ENV, allowPrivateHostsWarning, parseAllowPrivateHostsSetting } from "./policy.js";
 import { registerContentTools } from "./tools/content.js";
 import { registerFeedTools } from "./tools/feed.js";
 import { registerHttpTools } from "./tools/http.js";
@@ -19,8 +20,22 @@ declare const __VERSION__: string;
 const version =
   typeof __VERSION__ !== "undefined" ? __VERSION__ : createRequire(import.meta.url)("../package.json").version;
 
-export function createFetchServer(): McpServer {
-  setHttpContext({ version });
+export interface FetchServerOptions {
+  /**
+   * Operator opt-in: may a tool call set `allow_private_hosts` to reach
+   * loopback / private / link-local hosts? Default false -- such calls are
+   * refused. `startServer()` sets it from FETCH_MCP_ALLOW_PRIVATE_HOSTS.
+   *
+   * Process-wide: the policy lives in the http module's context, so the most
+   * recent createFetchServer() call decides for every server in the process.
+   * The stdio server creates exactly one; an embedder creating several must
+   * give them all the same setting.
+   */
+  allowPrivateHosts?: boolean;
+}
+
+export function createFetchServer(options: FetchServerOptions = {}): McpServer {
+  setHttpContext({ version, allowPrivateHosts: options.allowPrivateHosts === true });
   const server = new McpServer({ name: "fetch-mcp", version });
   registerHttpTools(server);
   registerContentTools(server);
@@ -34,7 +49,11 @@ export function createFetchServer(): McpServer {
 }
 
 export async function startServer(): Promise<void> {
-  const server = createFetchServer();
+  const raw = process.env[ALLOW_PRIVATE_HOSTS_ENV];
+  // stderr only: stdout is the MCP channel.
+  const warning = allowPrivateHostsWarning(raw);
+  if (warning) process.stderr.write(warning);
+  const server = createFetchServer({ allowPrivateHosts: parseAllowPrivateHostsSetting(raw) === "on" });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

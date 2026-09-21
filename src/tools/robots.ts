@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import { httpRequest } from "../http.js";
+import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 interface Group {
   agents: string[];
@@ -141,7 +142,7 @@ export function registerRobotsTools(server: McpServer) {
       user_agent: z.string().optional().describe("User-agent string to match against groups (default '*')"),
       timeout_ms: z.number().int().positive().max(60_000).optional(),
       max_redirects: z.number().int().min(0).max(20).optional(),
-      allow_private_hosts: z.boolean().optional(),
+      allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ url, user_agent, timeout_ms, max_redirects, allow_private_hosts }) => {

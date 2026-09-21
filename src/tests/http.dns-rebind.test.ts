@@ -17,8 +17,15 @@ vi.mock("node:dns/promises", () => ({
   lookup: (...args: unknown[]) => lookupMock(...args),
 }));
 
-// Spy on global fetch so we can prove it is never dialed on a refused host.
-const fetchSpy = vi.spyOn(globalThis, "fetch");
+// http.ts dials through undici's own fetch (paired with its pinned Agent), so
+// that is what we intercept to prove a refused host is never dialed. The real
+// Agent is kept: pinnedAgent() still builds one.
+const fetchSpy = vi.fn();
+
+vi.mock("undici", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("undici")>()),
+  fetch: (...args: unknown[]) => fetchSpy(...args),
+}));
 
 // Import AFTER vi.mock is registered (hoisted) so http.ts binds the mocked lookup.
 const { httpRequest, setHttpContext } = await import("../http.js");
@@ -27,7 +34,9 @@ setHttpContext({ version: "test" });
 
 beforeEach(() => {
   lookupMock.mockReset();
-  fetchSpy.mockClear();
+  fetchSpy.mockReset();
+  // No test reaches the real network: an unmocked dial fails loudly.
+  fetchSpy.mockRejectedValue(new Error("network disabled: fetch not mocked in this test"));
 });
 
 afterEach(() => {
@@ -126,18 +135,25 @@ describe("DNS-rebinding SSRF -- resolveAndPin is bypassed where it should be", (
   it("does NOT resolve-and-pin when allowPrivateHosts is true (lookup is skipped entirely)", async () => {
     // With allowPrivateHosts set, the resolveAndPin guard is skipped. We don't need a
     // live server: prove the DNS-pin path is bypassed by asserting lookup was not called.
-    // fetch will be attempted against a non-routable .invalid host and fail at the socket,
-    // but resolveAndPin must NOT have run.
-    const res = await httpRequest({
-      method: "GET",
-      url: "http://skip-pin.invalid/",
-      allowPrivateHosts: true,
-      timeoutMs: 200,
-    });
-    expect(lookupMock).not.toHaveBeenCalled();
-    // The request fails at the transport layer (host doesn't resolve), not via resolveAndPin.
-    expect(res.ok).toBe(false);
-    expect(res.error).not.toMatch(/^DNS: skip-pin\.invalid ->/);
+    // fetch is reached (and fails with the test's network-disabled error), but
+    // resolveAndPin must NOT have run. The operator has to allow the opt-in first,
+    // or the gate refuses the request before this path is reached at all.
+    setHttpContext({ version: "test", allowPrivateHosts: true });
+    try {
+      const res = await httpRequest({
+        method: "GET",
+        url: "http://skip-pin.invalid/",
+        allowPrivateHosts: true,
+        timeoutMs: 200,
+      });
+      expect(lookupMock).not.toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      // The request fails at the transport layer, not via resolveAndPin or the gate.
+      expect(res.ok).toBe(false);
+      expect(res.error).toMatch(/network disabled/);
+    } finally {
+      setHttpContext({ version: "test" });
+    }
   });
 });
 

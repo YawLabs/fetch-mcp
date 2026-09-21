@@ -30,7 +30,8 @@ afterAll(async () => {
 async function callSitemap(
   input: Record<string, unknown>,
 ): Promise<{ parsed: Record<string, unknown> | null; raw: string; isError: boolean }> {
-  const s = createFetchServer();
+  // Loopback fixtures need the operator opt-in for allow_private_hosts.
+  const s = createFetchServer({ allowPrivateHosts: true });
   const tools = (
     s as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<unknown> }> }
   )._registeredTools;
@@ -159,5 +160,29 @@ describe("fetch_sitemap integration", () => {
     });
     expect(isError).toBe(true);
     expect(raw).toContain("500");
+  });
+
+  it("caps the DECOMPRESSED size of a gzipped sitemap at max_bytes (gzip bomb)", async () => {
+    // A valid-looking sitemap padded with whitespace: tiny on the wire, huge inflated.
+    const inflated = `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${" ".repeat(8 * 1024 * 1024)}</urlset>`;
+    const bomb = gzipSync(Buffer.from(inflated, "utf8"));
+    handler = (_req, res, url) => {
+      if (url.pathname === "/bomb.xml.gz") {
+        res.setHeader("content-type", "application/x-gzip");
+        res.end(bomb);
+      } else {
+        res.statusCode = 404;
+        res.end();
+      }
+    };
+    const maxBytes = 256 * 1024;
+    expect(bomb.length).toBeLessThan(maxBytes);
+    const { raw, isError } = await callSitemap({
+      url: `${baseUrl}/bomb.xml.gz`,
+      allow_private_hosts: true,
+      max_bytes: maxBytes,
+    });
+    expect(isError).toBe(true);
+    expect(raw).toMatch(new RegExp(`decompresses past ${maxBytes} bytes`));
   });
 });

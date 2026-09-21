@@ -3,6 +3,7 @@ import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import { httpRequest } from "../http.js";
+import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export interface FeedEntry {
   title?: string;
@@ -184,7 +185,7 @@ export function registerFeedTools(server: McpServer) {
       timeout_ms: z.number().int().positive().max(60_000).optional(),
       max_bytes: z.number().int().positive().optional().describe("Max bytes to read (default 10MiB)"),
       max_redirects: z.number().int().min(0).max(20).optional(),
-      allow_private_hosts: z.boolean().optional(),
+      allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },

@@ -1,9 +1,10 @@
-import { gunzipSync } from "node:zlib";
+import { createGunzip } from "node:zlib";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { httpRequest } from "../http.js";
+import { ABSOLUTE_MAX_BYTES, httpRequest } from "../http.js";
+import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export interface SitemapUrl {
   loc: string;
@@ -20,16 +21,73 @@ export interface ParsedSitemap {
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 
 /**
+ * The per-sitemap byte budget: the caller's `max_bytes` (default 20 MiB),
+ * never above the 100 MiB ceiling `httpRequest()` applies to the wire read.
+ * One number bounds both the compressed bytes read off the wire and the
+ * DECOMPRESSED size of a gzipped payload, so a model-chosen `max_bytes` cannot
+ * lift the gzip-bomb cap past the ceiling.
+ */
+export function sitemapByteCap(maxBytes: number | undefined): number {
+  return Math.min(maxBytes ?? DEFAULT_MAX_BYTES, ABSOLUTE_MAX_BYTES);
+}
+
+/**
  * Decode a sitemap byte payload. Many sitemaps are served gzipped, either via
  * Content-Encoding (which node fetch unwraps) or as a .xml.gz file served with
  * application/x-gzip (which fetch leaves alone). We detect the gzip magic and
  * decompress manually if needed.
+ *
+ * `maxOutputLength` caps the DECOMPRESSED size. `max_bytes` only bounds the
+ * compressed bytes read off the wire, and gzip reaches ~1000:1 on repetitive
+ * input, so without a cap a 200 KB response inflates to ~200 MB (a gzip bomb
+ * past max_bytes) and takes the server down.
+ *
+ * The cap is counted by hand on a streaming gunzip rather than passed as
+ * zlib's `maxOutputLength`: oam (the launcher's preferred runtime) accepts
+ * that option and ignores it. The compressed input is fed in 1 KiB slices
+ * because oam inflates each written slice into a single output chunk, so the
+ * slice size bounds how far past the cap one chunk can land (~1 MiB) before
+ * the stream is destroyed. Node emits 16 KiB chunks either way.
  */
-export function decodeSitemapPayload(buf: Buffer): string {
+export async function decodeSitemapPayload(buf: Buffer, maxOutputLength?: number): Promise<string> {
   if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
-    return gunzipSync(buf).toString("utf8");
+    return (await gunzipCapped(buf, maxOutputLength ?? Number.POSITIVE_INFINITY)).toString("utf8");
   }
   return buf.toString("utf8");
+}
+
+const GUNZIP_SLICE_BYTES = 1024;
+
+async function gunzipCapped(buf: Buffer, cap: number): Promise<Buffer> {
+  const gunzip = createGunzip();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const finished = new Promise<void>((resolve, reject) => {
+    gunzip.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > cap) {
+        gunzip.destroy(
+          new Error(`gzipped sitemap decompresses past ${cap} bytes (the max_bytes cap); raise max_bytes to read it`),
+        );
+        return;
+      }
+      chunks.push(chunk);
+    });
+    gunzip.on("error", reject);
+    gunzip.on("end", resolve);
+  });
+  // The rejection can land while the write loop below is still running; keep
+  // it from being reported as unhandled before the await at the bottom.
+  finished.catch(() => {});
+
+  for (let offset = 0; offset < buf.length && !gunzip.destroyed; offset += GUNZIP_SLICE_BYTES) {
+    gunzip.write(buf.subarray(offset, offset + GUNZIP_SLICE_BYTES));
+    // Let the inflater run and the byte count catch up before the next slice.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  if (!gunzip.destroyed) gunzip.end();
+  await finished;
+  return Buffer.concat(chunks, total);
 }
 
 export function parseSitemapXml(xml: string): ParsedSitemap {
@@ -96,14 +154,14 @@ export function registerSitemapTools(server: McpServer) {
         .describe("Max bytes to read per sitemap response (default 20MiB)"),
       timeout_ms: z.number().int().positive().max(60_000).optional(),
       max_redirects: z.number().int().min(0).max(20).optional(),
-      allow_private_hosts: z.boolean().optional(),
+      allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ url, max_depth, max_urls, max_bytes, timeout_ms, max_redirects, allow_private_hosts, user_agent }) => {
       const depth = max_depth ?? 1;
       const cap = max_urls ?? 5000;
-      const byteCap = max_bytes ?? DEFAULT_MAX_BYTES;
+      const byteCap = sitemapByteCap(max_bytes);
       const seen = new Set<string>();
       const allUrls: SitemapUrl[] = [];
       const visitedIndexes: string[] = [];
@@ -128,7 +186,7 @@ export function registerSitemapTools(server: McpServer) {
         if (!res.bodyBase64) return { ok: false, error: "empty body" };
         const buf = Buffer.from(res.bodyBase64, "base64");
         try {
-          const xml = decodeSitemapPayload(buf);
+          const xml = await decodeSitemapPayload(buf, byteCap);
           return { ok: true, parsed: parseSitemapXml(xml) };
         } catch (err) {
           return { ok: false, error: `parse failed: ${(err as Error).message}` };

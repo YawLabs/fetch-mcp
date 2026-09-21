@@ -3,6 +3,7 @@ import TurndownService from "turndown";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import { httpRequest } from "../http.js";
+import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export function makeTurndown(): TurndownService {
   const td = new TurndownService({
@@ -51,10 +52,7 @@ const commonPageSchema = {
   timeout_ms: z.number().int().positive().max(120_000).optional().describe("Request timeout in ms (default 10000)"),
   max_bytes: z.number().int().positive().optional().describe("Max response size in bytes (default 5MiB)"),
   max_redirects: z.number().int().min(0).max(20).optional().describe("Max redirect hops (default 5)"),
-  allow_private_hosts: z
-    .boolean()
-    .optional()
-    .describe("Allow loopback / private / link-local addresses (default false)"),
+  allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
   user_agent: z.string().optional().describe("User-Agent override"),
 };
 

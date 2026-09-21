@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatHttpResponse } from "../format.js";
 import { type HttpMethod, type HttpRequestOptions, httpRequest } from "../http.js";
+import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 const commonSchema = {
   url: z.string().url().describe("Target URL (http:// or https://)"),
@@ -33,12 +34,7 @@ const commonSchema = {
     .max(5)
     .optional()
     .describe("Retries on 408/425/429/500/502/503/504 with exponential backoff (default 0)"),
-  allow_private_hosts: z
-    .boolean()
-    .optional()
-    .describe(
-      "Allow requests to loopback / private / link-local addresses. SSRF protection is on by default — only flip this when intentionally talking to localhost.",
-    ),
+  allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
   decode_text: z
     .boolean()
     .optional()
@@ -91,7 +87,7 @@ function toRequestOptions(method: HttpMethod, input: Record<string, any>): HttpR
 export function registerHttpTools(server: McpServer) {
   server.tool(
     "http_get",
-    "Perform an HTTP GET. Returns status, headers, and body. Automatically parses JSON when the server responds with application/json. Follows redirects (each hop re-validated against SSRF rules). Refuses URLs that resolve to private/loopback/link-local addresses unless allow_private_hosts is set.",
+    "Perform an HTTP GET. Returns status, headers, and body. Automatically parses JSON when the server responds with application/json. Follows redirects (each hop re-validated against SSRF rules). Refuses URLs that resolve to private/loopback/link-local addresses unless the operator enabled FETCH_MCP_ALLOW_PRIVATE_HOSTS and the call sets allow_private_hosts.",
     commonSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async (input) => formatHttpResponse(await httpRequest(toRequestOptions("GET", input))),

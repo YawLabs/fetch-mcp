@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import { httpRequest } from "../http.js";
+import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 import { decodeHtmlEntities, findTags, parseAttrs } from "./html.js";
 
 export interface ExtractedLink {
@@ -105,7 +106,7 @@ export function registerLinksTools(server: McpServer) {
       timeout_ms: z.number().int().positive().max(60_000).optional(),
       max_bytes: z.number().int().positive().optional(),
       max_redirects: z.number().int().min(0).max(20).optional(),
-      allow_private_hosts: z.boolean().optional(),
+      allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
       user_agent: z.string().optional(),
       dedupe: z.boolean().optional().describe("Drop duplicate hrefs (default true)"),
       filter: z.enum(["all", "internal", "external"]).optional().describe("Filter by type (default 'all')"),

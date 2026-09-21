@@ -1,6 +1,14 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { Agent } from "undici";
+// fetch comes from the same undici as the pinned Agent, NOT the runtime's global
+// fetch. Node's bundled undici (6.x on Node 22, 7.x on Node 24) drives a
+// dispatcher through the legacy handler API; undici 8's Agent rejects that with
+// UND_ERR_INVALID_ARG ("invalid onRequestStart method"), so every guarded
+// hostname request failed with "fetch failed" on plain Node from 0.4.0 through
+// 0.7.0 (Node 20 could not load undici 8 at all). Pairing fetch and Agent from
+// one package makes the handler API match on every runtime.
+import { Agent, type Response, fetch as undiciFetch } from "undici";
+import { PRIVATE_HOSTS_DISABLED } from "./policy.js";
 import { checkIpAddress, defaultUserAgent, validateUrl } from "./security.js";
 
 export const DEFAULT_TIMEOUT_MS = 10_000;
@@ -50,6 +58,12 @@ export interface HttpResponse {
 
 interface InternalContext {
   version: string;
+  /**
+   * Operator policy (FETCH_MCP_ALLOW_PRIVATE_HOSTS): whether a request may opt
+   * into private hosts at all. Unset means no -- a request that sets
+   * `allowPrivateHosts` is refused before any network work.
+   */
+  allowPrivateHosts?: boolean;
 }
 
 let context: InternalContext = { version: "0.0.0" };
@@ -117,7 +131,16 @@ export function parseRetryAfter(raw: string | undefined, now = Date.now()): numb
   return undefined;
 }
 
-function headersToRecord(h: Headers): Record<string, string> {
+/**
+ * Removed from every hop whose origin differs from the initial URL's. The fetch
+ * spec and curl both drop Authorization cross-origin; Cookie and
+ * Proxy-Authorization carry the same kind of secret. Arbitrary custom headers
+ * (X-Api-Key and friends) cannot be recognised by name and still follow --
+ * SECURITY.md says so.
+ */
+const CROSS_ORIGIN_STRIPPED_HEADERS = ["authorization", "proxy-authorization", "cookie"] as const;
+
+function headersToRecord(h: Response["headers"]): Record<string, string> {
   const out: Record<string, string> = {};
   h.forEach((v, k) => {
     out[k.toLowerCase()] = v;
@@ -181,7 +204,11 @@ function buildHeaders(
   if (!h.has("user-agent")) h.set("user-agent", opts.userAgent ?? defaultUserAgent(context.version));
   if (!h.has("accept")) h.set("accept", "*/*");
   if (ctx.stripAuth) {
-    h.delete("authorization");
+    // Cross-origin hop: drop the standard credential headers, whether they came
+    // from basic_auth / bearer_token or from caller `headers`. Because redirects
+    // are followed by hand (`redirect: "manual"`), undici's own cross-origin
+    // stripping never runs -- this is the only place it happens.
+    for (const name of CROSS_ORIGIN_STRIPPED_HEADERS) h.delete(name);
   } else if (opts.basicAuth) {
     const token = Buffer.from(`${opts.basicAuth.username}:${opts.basicAuth.password}`, "utf8").toString("base64");
     h.set("authorization", `Basic ${token}`);
@@ -283,17 +310,30 @@ async function sendHop(params: {
   start: number;
 }): Promise<HopResult | HopRedirect | HopError> {
   const { url, method, body, contentType, opts, timeoutMs, maxBytes, stripAuth, redirects, start } = params;
+
+  // Every URL this function dials goes through the pre-flight validator:
+  // scheme allow-list, literal-IP block list, `localhost*`. httpRequest runs
+  // it on the initial URL too, but a redirect `Location` only ever reaches the
+  // network through here, so this is the check that makes SECURITY.md's
+  // "per-hop redirect re-validation" true. Before this ran per hop, a public
+  // URL that 302'd to a literal blocked IP (`http://169.254.169.254/...`,
+  // `http://127.0.0.1/`, `http://[::1]/`, `http://2130706433/`) or to a
+  // non-http(s) scheme was fetched with no SSRF check at all.
+  const urlCheck = validateUrl(url, { allowPrivateHosts: opts.allowPrivateHosts });
+  if (!urlCheck.ok)
+    return { kind: "error", response: failure(url, urlCheck.reason ?? "URL rejected", redirects, start) };
+
   const parsed = new URL(url);
   const host = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
 
   let dispatcher: Agent | undefined;
   if (!opts.allowPrivateHosts) {
-    // Literal IP URLs are covered by validateUrl. For hostnames we must
-    // resolve and pin so fetch can't race us to a rebound address.
-    // Use isIP() (node:net) -- the same check validateUrl uses -- rather than
-    // a hand-rolled regex. The old regex matched partial addresses like "127"
-    // or "192.168" as literals, skipping pinning; on Windows "127" connects
-    // to 127.0.0.1, making this a real SSRF bypass path.
+    // A literal IP was just vetted by validateUrl -> checkIpAddress above. For
+    // hostnames we must resolve and pin so fetch can't race us to a rebound
+    // address. Use isIP() (node:net) -- the same check validateUrl uses --
+    // rather than a hand-rolled regex. The old regex matched partial addresses
+    // like "127" or "192.168" as literals, skipping pinning; on Windows "127"
+    // connects to 127.0.0.1, making this a real SSRF bypass path.
     const literal = isIP(host) !== 0;
     if (!literal) {
       const resolved = await resolveAndPin(host);
@@ -307,18 +347,14 @@ async function sendHop(params: {
   try {
     const hasBody = body !== undefined && method !== "GET" && method !== "HEAD";
     const headers = buildHeaders(opts, { stripAuth, method, hasBody, contentType });
-    // node fetch accepts a dispatcher but the field is not in lib.dom RequestInit,
-    // and `body` here is always string | Uint8Array which node fetch accepts even
-    // though the DOM type is narrower. Cast once at the boundary.
-    const fetchInit = {
+    const res = await undiciFetch(url, {
       method,
       headers,
       body: hasBody ? body : null,
-      redirect: "manual" as const,
+      redirect: "manual",
       signal: abortController.signal,
       ...(dispatcher ? { dispatcher } : {}),
-    } as unknown as RequestInit;
-    const res = await fetch(url, fetchInit);
+    });
 
     if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
       await drain(res);
@@ -382,8 +418,8 @@ async function sendHop(params: {
 /**
  * Top-level HTTP request. Applies SSRF pre-flight, then for each retry
  * attempt runs a fresh follow-redirects loop (so retry state doesn't
- * accumulate across attempts). On cross-origin redirect we strip
- * Authorization headers. On 303 we downgrade to GET; on 301/302 from
+ * accumulate across attempts). On cross-origin redirect we strip the
+ * credential headers (CROSS_ORIGIN_STRIPPED_HEADERS). On 303 we downgrade to GET; on 301/302 from
  * non-GET/HEAD we also downgrade (WHATWG fetch standard).
  */
 export async function httpRequest(opts: HttpRequestOptions): Promise<HttpResponse> {
@@ -392,6 +428,10 @@ export async function httpRequest(opts: HttpRequestOptions): Promise<HttpRespons
   const maxBytes = Math.min(opts.maxBytes ?? DEFAULT_MAX_BYTES, ABSOLUTE_MAX_BYTES);
   const maxRedirects = opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const retries = Math.max(0, opts.retries ?? 0);
+
+  // The one choke point for the operator gate: every tool reaches the network
+  // through here, so no tool can forget it.
+  if (opts.allowPrivateHosts && !context.allowPrivateHosts) return failure(opts.url, PRIVATE_HOSTS_DISABLED, [], start);
 
   const urlCheck = validateUrl(opts.url, { allowPrivateHosts: opts.allowPrivateHosts });
   if (!urlCheck.ok) return failure(opts.url, urlCheck.reason ?? "URL rejected", [], start);

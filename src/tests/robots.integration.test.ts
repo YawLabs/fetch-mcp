@@ -32,7 +32,8 @@ afterAll(async () => {
 async function callRobots(
   input: Record<string, unknown>,
 ): Promise<{ parsed: Record<string, unknown> | null; raw: string; isError: boolean }> {
-  const s = createFetchServer();
+  // Loopback fixtures need the operator opt-in for allow_private_hosts.
+  const s = createFetchServer({ allowPrivateHosts: true });
   const tools = (
     s as unknown as { _registeredTools: Record<string, { handler: (input: unknown) => Promise<unknown> }> }
   )._registeredTools;

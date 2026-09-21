@@ -152,6 +152,19 @@ import { fileURLToPath } from "node:url";
 const OAM_MIN = [0, 15, 2];
 
 /**
+ * MINIMUM NODE VERSION. The server's HTTP client is undici 8, whose own floor is
+ * Node 22.19.0. Below it the failure is not a clean error: Node 20 dies at
+ * import (`webidl.util.markAsUncloneable is not a function`), and Node 22 before
+ * 22.15 has no `zlib.createZstdDecompress`, so the FIRST response that arrives
+ * with `content-encoding: zstd` throws inside undici's stream and takes the
+ * whole server down mid-session. Every path that serves on Node checks this
+ * before it commits (and before any "runs WITHOUT --permission" note, which
+ * must never sit above an exit that served nothing). oam is not subject to it:
+ * it ships its own runtime. Keep in step with package.json `engines.node`.
+ */
+const NODE_MIN = [22, 19, 0];
+
+/**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
  * the bound only exists so a wedged binary on PATH cannot hang the launch.
  */
@@ -243,6 +256,39 @@ function oamVersion(cmd) {
     // Not executable, wrong arch, wedged, or deleted since the stat. Caller degrades.
     return null;
   }
+}
+
+/** `node --version` of `cmd` -> [major, minor, patch], or null when it cannot be read. */
+function nodeVersion(cmd) {
+  try {
+    const out = execFileSync(cmd, ["--version"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: VERSION_PROBE_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    return parseVersion(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The stderr line for a Node below NODE_MIN, or null when `version` is at the
+ * floor. `what` names the Node in question ("this process" or a path). An
+ * unreadable version is not a refusal -- the launcher has nothing to compare --
+ * so null there too; the server's own failure will name the problem.
+ *
+ * Pure on purpose, like runtimePlan.
+ */
+function nodeFloorProblem(version, what) {
+  if (!version || atLeast(version, NODE_MIN)) return null;
+  const floor = NODE_MIN.join(".");
+  return (
+    `fetch-mcp: ${what} is Node ${version.join(".")}, older than ${floor}; @yawlabs/fetch-mcp needs Node ${floor} or newer ` +
+    "(the floor of its HTTP client, undici 8 -- an older Node crashes at import or on the first zstd-encoded response).\n" +
+    "Install a newer Node, or install oam from https://oamjs.org and this launcher will use it.\n"
+  );
 }
 
 /** True when `v` is at least `min`, comparing major/minor/patch in order. */
@@ -365,11 +411,14 @@ function sandboxFlags(setting) {
   // here rather than a cop-out.
   const netFlag = "--allow-net";
 
-  // This server reads no environment variable at all, so there is no grant to
-  // make. The flag is omitted rather than emitted empty: under `--permission`
-  // an absent --allow-env already denies everything, and `--allow-env=` would
-  // state the same thing in a form that reads like an oversight.
-  return ["--permission", netFlag];
+  // The server reads exactly one environment variable: the operator's
+  // private-hosts opt-in (src/policy.ts). Grant that name and nothing else.
+  // Without the grant the variable is ABSENT under `--permission`, so an
+  // operator's FETCH_MCP_ALLOW_PRIVATE_HOSTS=1 would silently read as off --
+  // safe, but the "silent misbehaviour" the header warns about. Keep this list
+  // in step with every process.env read under src/.
+  const envFlag = "--allow-env=FETCH_MCP_ALLOW_PRIVATE_HOSTS";
+  return ["--permission", netFlag, envFlag];
 }
 
 /**
@@ -667,6 +716,13 @@ async function handOffToNode(reason, sandboxWhy) {
     await errSync(`fetch-mcp: ${what}, and no Node was found on PATH to run the server.\n${remedy}`);
     process.exit(1);
   }
+  // Before the "running on Node instead" and sandbox notes: a refusal must not
+  // sit under lines that say the server is about to serve.
+  const tooOld = nodeFloorProblem(nodeVersion(node), node);
+  if (tooOld) {
+    await errSync(tooOld);
+    process.exit(1);
+  }
   if (reason) await errSync(`fetch-mcp: ${reason}; running on ${node} instead.\n`);
   await noteSandboxNotApplied(sandboxWhy);
   await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
@@ -684,10 +740,14 @@ function fallbackTarget(hostOam) {
  * The "; using X instead" suffix for a fallback announcement -- only when the
  * fallback serves in THIS process, which cannot fail to be found. A handoff to
  * Node has not looked for Node yet; handOffToNode names it once it has, so an
- * announcement here cannot sit above "no Node was found on PATH".
+ * announcement here cannot sit above "no Node was found on PATH". Likewise a
+ * Node host below NODE_MIN: refuseOldNodeInProcess is about to exit, so the
+ * announcement must not promise a server it will not start.
  */
 function fallbackSuffix(hostOam) {
-  return fallbackInProcess(hostOam) ? `; using ${fallbackTarget(hostOam)} instead` : "";
+  if (!fallbackInProcess(hostOam)) return "";
+  if (hostOam === undefined && nodeFloorProblem(parseVersion(process.versions.node), "this process")) return "";
+  return `; using ${fallbackTarget(hostOam)} instead`;
 }
 
 /**
@@ -712,6 +772,18 @@ async function noteSandboxNotApplied(why) {
 }
 
 /**
+ * On a Node host, exit before serving in THIS process when it is below
+ * NODE_MIN. An oam host is exempt: oam runs on its own runtime.
+ */
+async function refuseOldNodeInProcess(hostOam) {
+  if (hostOam !== undefined) return;
+  const tooOld = nodeFloorProblem(parseVersion(process.versions.node), "this process");
+  if (!tooOld) return;
+  await errSync(tooOld);
+  process.exit(1);
+}
+
+/**
  * No usable oam, or it would not start, under a mode that allows a fallback.
  * `why` finishes the below-floor handoff note, so it can say which of the two
  * happened.
@@ -722,6 +794,7 @@ async function fallBack(hostOam, why) {
   // freshly spawned oam can apply a process-level flag.
   const sandboxWhy = `a fresh oam (${OAM_MIN.join(".")} or newer) is needed to apply it and none could be spawned`;
   if (fallbackInProcess(hostOam)) {
+    await refuseOldNodeInProcess(hostOam);
     await noteSandboxNotApplied(sandboxWhy);
     await runInProcess();
     return;
@@ -767,6 +840,7 @@ const plan = runtimePlan({ mode, hostOam, sandbox: sandbox.length > 0 });
 const SANDBOX_MOOT_ON_NODE = "FETCH_MCP_RUNTIME=node runs the server on Node, which has no oam sandbox";
 
 if (plan === "in-process") {
+  await refuseOldNodeInProcess(hostOam);
   await noteSandboxNotApplied(SANDBOX_MOOT_ON_NODE);
   await runInProcess().catch(startFailed);
 } else if (plan === "handoff-node") {
