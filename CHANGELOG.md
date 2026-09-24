@@ -4,6 +4,9 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Changed
+- **SECURITY.md lists [GitHub private vulnerability reporting](https://github.com/YawLabs/fetch-mcp/security/advisories/new) as the preferred channel, ahead of `contact@yaw.sh`.** Private vulnerability reporting was enabled on the repo on 2026-09-23. Before 0.7.1 the only listed contact was `support@mcp.hosting`, which stopped delivering when mcp.hosting moved to yaw.sh (the domain no longer has MX records), and the repo had no private channel to fall back on; a researcher had to open a public issue to ask for one (#48). The policy now says that such an issue -- one that only asks for a private contact, with no technical detail -- is fine when both channels fail.
+
 ## [0.8.0] — 2026-09-21
 
 ### Security
