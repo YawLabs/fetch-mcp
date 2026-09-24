@@ -2,7 +2,12 @@
 
 ## Reporting a vulnerability
 
-Email **contact@yaw.sh** with:
+Report privately through either channel:
+
+- **GitHub private vulnerability reporting** (preferred): [report it here](https://github.com/YawLabs/fetch-mcp/security/advisories/new). The report is visible only to you and the maintainers until we publish the advisory alongside the fix, credited to you.
+- **Email:** contact@yaw.sh
+
+Include:
 
 - a description of the issue,
 - reproduction steps or a PoC,
@@ -10,7 +15,7 @@ Email **contact@yaw.sh** with:
 
 We aim to acknowledge within 2 business days and have a fix scheduled within 14 days for confirmed reports.
 
-Please don't open a public issue for security problems until the fix has shipped.
+Please don't put the details of a security problem in a public issue until the fix has shipped. If neither channel above works, an issue that says only that you need a private contact -- no technical detail -- is fine, and we will reach you from there.
 
 ## Scope
 
@@ -59,4 +64,4 @@ The server refuses those calls by default.
 
 ## Disclosure policy
 
-Researchers acting in good faith will not face legal action from Yaw Labs. If you find something, tell us and we will credit you in the release notes.
+Researchers acting in good faith will not face legal action from Yaw Labs. If you find something, tell us and we will credit you in the release notes and, for reports made through GitHub, in the published advisory.
