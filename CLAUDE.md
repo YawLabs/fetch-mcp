@@ -89,7 +89,7 @@ The script runs eight steps. Each is idempotent, so after an interruption re-run
 
 `release.sh` still carries a `CI=true` mode and a hand-off-to-`release.yml` branch from the Actions era. Both stay dormant while no workflow exists.
 
-**Smoke test:** step 7 installs the just-published version with `npx` from a temp dir (retrying for up to ~5 min while the registry propagates), runs it with `--version`, and fails the release unless the output equals the version. It catches packaging regressions: a missing bin shebang, a bad `"files"` entry, broken tsup output. It depends on the argument handling in `src/index.ts` (Launch-critical #9).
+**Smoke test:** step 7 installs the just-published version with `npx` from a temp dir (retrying 60 times 10 s apart -- ~10 min of sleeps plus each npx run -- while the registry propagates), runs it with `--version`, and fails the release unless the output equals the version. It catches packaging regressions: a missing bin shebang, a bad `"files"` entry, broken tsup output. It depends on the argument handling in `src/index.ts` (Launch-critical #9).
 
 ## Sibling repos
 
