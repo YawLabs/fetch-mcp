@@ -565,11 +565,13 @@ fi
 #     revalidates), so a poll through it can keep reporting the pre-publish
 #     answer well after the version is live -- the loop would then outlast the
 #     condition it is waiting on.
-#   * The EXACT URL the MCP Registry fetches. Its npm validator requests
+#   * The same path the MCP Registry fetches. Its npm validator requests
 #     <base>/url.PathEscape(name)/<version>, and Go's PathEscape turns the scope
-#     slash into %2F (`@yawlabs%2Fpkg`, the `@` left bare). A literal-slash URL
-#     reaches the same origin but can be a different CDN cache entry, so success
-#     there would be a proxy rather than evidence about the path that fails.
+#     slash into %2F (`@yawlabs%2Fpkg`, the `@` left bare). A literal-slash
+#     path can be a different CDN cache entry. The helper's throwaway `_` query
+#     and no-cache headers only matter if npm ever starts edge-caching this
+#     document (today it is DYNAMIC); if it does, the registry's own read can
+#     still lag, and step 7's retry absorbs that.
 #   * WARN, never fail, on timeout. If propagation is genuinely stuck, letting
 #     mcp-publisher run produces its own precise error naming the version and
 #     status; a timeout message from this loop would replace that with something

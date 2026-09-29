@@ -85,7 +85,7 @@ The script runs eight steps. Each is idempotent, so after an interruption re-run
 7. Smoke test (below), then MCP Registry publish via `mcp-publisher` (token: `MCP_REGISTRY_TOKEN`, else `gh auth token`).
 8. Verify: the npm version, `package.json` and the git tag. Mismatches only warn.
 
-**Auth:** an npm automation token in `~/.npmrc`; pre-flight aborts if `npm whoami` fails. Never `npm login --auth-type=web` -- it overwrites the automation token with a 2FA-bound session and the next publish EOTPs. The tag lands in step 4, before publish, so a tag is not proof of registry presence; check `npm view "@yawlabs/fetch-mcp@X.Y.Z" version`.
+**Auth:** an npm automation token in `~/.npmrc`; pre-flight aborts if `npm whoami` fails. Never `npm login --auth-type=web` -- it overwrites the automation token with a 2FA-bound session and the next publish EOTPs. The tag lands in step 4, before publish, so a tag is not proof of registry presence; check `curl -s -o /dev/null -w '%{http_code}' https://registry.npmjs.org/@yawlabs%2Ffetch-mcp/X.Y.Z` (200 = published; `npm view` reads the packument, which Cloudflare caches for up to 5 min after a publish).
 
 `release.sh` still carries a `CI=true` mode and a hand-off-to-`release.yml` branch from the Actions era. Both stay dormant while no workflow exists.
 
