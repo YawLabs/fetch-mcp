@@ -4,6 +4,9 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Internal
+- **`release.sh` asks npm for the version's own document instead of `npm view`, and retries the MCP Registry publish while npm propagates.** `npm view @yawlabs/fetch-mcp@<version>` reads the whole packument, which registry.npmjs.org serves from Cloudflare's edge for up to 300 s, so an immediate re-run after a failed later step could miss a version npm already held, publish again, get npm's E403 "cannot publish over the previously published versions", and die with the dead-token advice. Every pinned-version read -- step 5's skip check, the propagation gate before step 7, step 8's verify and the dormant CI hand-off poll -- now goes through one helper that curls `registry.npmjs.org/@yawlabs%2Ffetch-mcp/<version>` (served uncached, and the URL the MCP Registry itself reads), and that E403 now counts as already published. The MCP Registry publish makes up to four attempts, 30, 60 and 90 s apart, but only on the registry's "version ... not found (status: 404)", "Likely transient, retry later" and "failed to fetch package metadata from NPM" answers; a duplicate version counts as done, and any other failure still stops on the first attempt. Ported from ctxlint, whose v0.27.0 registry publish needed the third retry.
+
 ## [0.8.1] — 2026-09-24
 
 ### Changed
