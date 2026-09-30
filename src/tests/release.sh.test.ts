@@ -482,6 +482,16 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
       'Error: publish failed: error sending request: Post "http://127.0.0.1:58812/v0/publish": EOF',
     ],
     ["cut off mid-answer", "Error: publish failed: error reading response: unexpected EOF"],
+    // Go quotes a malformed header line the server sent; a phrase inside those
+    // quotes must not pass for a proxy's refusal, with a colon after it or not.
+    [
+      "dropped with the server's own bytes echoed back",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": net/http: HTTP/1.x transport connection broken: malformed MIME header line: X": Bad thing',
+    ],
+    [
+      "dropped with the server's own bytes, and a colon, echoed back",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": net/http: HTTP/1.x transport connection broken: malformed MIME header line: X": Bad: thing',
+    ],
   ])("retries a connection %s, then publishes", (_name, text) => {
     const r = runRegistry([text, "ok"]);
     expect(r.status).toBe(0);
@@ -526,6 +536,10 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
     [
       "a proxy that refused it with an empty reason phrase",
       'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": ',
+    ],
+    [
+      "a proxy whose reason phrase has a colon",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": Blocked by policy: category gambling',
     ],
     [
       "a proxy whose reason phrase starts with an all-capitals word",
@@ -616,10 +630,13 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
   });
 
   // The step's first login, as release.sh writes it.
-  const LOGIN = extractBlock(
-    '  mcp_bounded "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null \\',
-    '    || mcp_login_fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"',
-  );
+  const LOGIN_START = '  mcp_bounded "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null \\';
+  const sourceLines = source.split("\n");
+  const LOGIN_END = sourceLines[sourceLines.indexOf(LOGIN_START) + 1] ?? "";
+  if (!LOGIN_END.startsWith('    || mcp_login_fail "')) {
+    throw new Error("release.sh: the first login no longer fails through mcp_login_fail on its next line");
+  }
+  const LOGIN = extractBlock(LOGIN_START, LOGIN_END);
   function runLogin(reply: string): { out: string; status: number | null } {
     const body = [HELPER_STUBS, MP_STUB, TIME_LIMIT, "MCP_REGISTRY_TOKEN=fixture", LOGIN, 'echo "LOGGED_IN"'].join(
       "\n",
@@ -635,15 +652,24 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
     expect(r.out).toContain(
       "FAIL: The MCP Registry did not answer the mcp-publisher login within 90s -- npm + GitHub release succeeded, but the MCP Registry step did not.",
     );
-    expect(r.out).not.toContain("check MCP_REGISTRY_TOKEN scopes");
+    expect(r.out).not.toContain("A 401 there is");
     expect(r.out).not.toContain("LOGGED_IN");
   });
 
-  it("keeps the token hint for a first login that failed any other way", () => {
-    const r = runLogin('Error: login failed: server returned status 401: {"title":"Unauthorized"}');
+  it("says how to read the output of a first login that failed any other way", () => {
+    // mcp-publisher v1.7.9's line for the v1.8.1 registry's 401, which it gives
+    // for a bad token and for GitHub's own API failing alike.
+    const r = runLogin(
+      'Error: failed to get token: failed to exchange token: token exchange failed with status 401: {"title":"Unauthorized","status":401,"detail":"Token exchange failed"}',
+    );
     expect(r.status).toBe(1);
-    expect(r.out).toContain("FAIL: mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes");
+    expect(r.out).toContain(
+      "FAIL: mcp-publisher login failed -- its output is above. A 401 there is the registry refusing the token exchange",
+    );
+    expect(r.out).toContain("A 429, a 5xx or a connection error is the registry or the network.");
     expect(r.out).not.toContain("did not answer");
+    // The registry checks namespace rights only at publish.
+    expect(r.out).not.toContain("read:org");
   });
 
   // Failures no wait cures: each must stop on the first attempt.
@@ -672,6 +698,20 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
     expect(r.sleeps).toEqual([]);
     expect(r.out).toContain(FAIL_LINE);
     expect(r.out).not.toContain("BLOCK_DONE");
+    expect(r.out).not.toContain("A 403 on publish");
+  });
+
+  it("says what the namespace takes when the registry refuses the publish with a 403", () => {
+    // The v1.8.1 registry's refusal, its advice trimmed.
+    const r = runRegistry([
+      'Error: publish failed: server returned status 403: {"title":"Forbidden","status":403,"detail":"You do not have permission to publish this server. You have permission to publish: io.github.jeffyaw/*. Attempting to publish: io.github.YawLabs/fetch-mcp."}',
+      "ok",
+    ]);
+    expect(r.status).toBe(1);
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain("WARN: A 403 on publish is the registry refusing the io.github.YawLabs namespace.");
+    expect(r.out).toContain("a YawLabs org Owner whose token can read org roles");
+    expect(r.out).toContain(FAIL_LINE);
   });
 
   it("gives up after four attempts, 30, 60 and 90 s apart", () => {
