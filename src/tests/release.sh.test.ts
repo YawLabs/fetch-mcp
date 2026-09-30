@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,13 +42,30 @@ function runBash(
   opts: { cwd?: string; env?: Record<string, string>; stdin?: string } = {},
 ): { stdout: string; stderr: string; status: number | null } {
   const full = `set -e\n${SOURCED}\n${body}`;
-  const result = spawnSync("bash", ["-c", full], {
-    encoding: "utf-8",
-    cwd: opts.cwd,
-    env: { ...process.env, ...opts.env, LC_ALL: "C" },
-    input: opts.stdin,
-  });
-  return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+  // bash reads the script from a file, not as `bash -c` text: on Windows that
+  // text crosses a command line msys re-parses, and a double quote inside
+  // single quotes -- as in the MCP Registry block's patterns -- comes back
+  // with its escaping backslash, or ends the parse early.
+  const dir = mkdtempSync(join(tmpdir(), "release-sh-run-"));
+  const script = join(dir, "run.sh");
+  writeFileSync(script, full);
+  // release.sh's MCP Registry time limit reads these. release.sh runs this
+  // suite before it publishes, so an operator's own setting must not reach it.
+  const inherited = { ...process.env };
+  for (const name of ["MCP_PUBLISH_TIMEOUT_S", "MCP_PUBLISH_KILL_AFTER_S", "MCP_TIMEOUT_READY"]) {
+    delete inherited[name];
+  }
+  try {
+    const result = spawnSync("bash", [script.split("\\").join("/")], {
+      encoding: "utf-8",
+      cwd: opts.cwd,
+      env: { ...inherited, ...opts.env, LC_ALL: "C" },
+      input: opts.stdin,
+    });
+    return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // These tests build a real git repo, one spawn per step: the longest makes
@@ -336,6 +353,8 @@ describe("step 5 workstation npm publish loop", { timeout: BASH_BLOCK_TIMEOUT_MS
 describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }, () => {
   // From the log's mktemp through the closing `fi` of the done/fail decision.
   const block = extractBlock("  MCP_PUBLISH_LOG=$(mktemp)", "  fi");
+  // release.sh's own time-limit helpers, which the block calls.
+  const TIME_LIMIT = ["mcp_timeout_setup", "mcp_bounded", "mcp_login_fail"].map(extractFunction).join("\n");
 
   const PKG = "@yawlabs/fetch-mcp";
   const V = "0.8.2";
@@ -359,18 +378,44 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
     '  last=$(wc -l < "$MP_REPLIES")',
     '  [ "$n" -le "$last" ] || n=$last',
     '  reply=$(sed -n "$n"p "$MP_REPLIES")',
+    // What timeout(1) returns for an attempt it stopped, and, on newer
+    // coreutils, for one that only the KILL ended.
+    '  if [ "$reply" = "timeout" ]; then return 124; fi',
+    '  if [ "$reply" = "killed" ]; then return 137; fi',
     '  if [ "$reply" = "ok" ]; then echo "published"; return 0; fi',
     "  printf '%s\\n' \"$reply\" >&2",
     "  return 1",
     "}",
     "MP=mp_stub",
+    // GNU timeout cannot run a shell function like mp_stub. This stand-in says
+    // it is coreutils, so the block wraps each call in it, skips the options
+    // and the duration it is given, and runs the rest.
+    "timeout() {",
+    '  if [ "$1" = --version ]; then echo "timeout (GNU coreutils) 9.1"; return 0; fi',
+    '  while case "$1" in -*) true ;; *) false ;; esac; do [ "$1" = -k ] && shift; shift; done',
+    "  shift",
+    '  "$@"',
+    "}",
   ].join("\n");
 
-  function runRegistry(responses: string[]): { out: string; status: number | null; calls: number; sleeps: string[] } {
-    const body = ["set -o pipefail", HELPER_STUBS, MP_STUB, `VERSION=${V}`, block, 'echo "BLOCK_DONE"'].join("\n");
+  function runRegistry(
+    responses: string[],
+    preamble = "",
+  ): { out: string; status: number | null; calls: number; sleeps: string[] } {
+    const body = [
+      "set -o pipefail",
+      HELPER_STUBS,
+      MP_STUB,
+      preamble,
+      TIME_LIMIT,
+      `VERSION=${V}`,
+      block,
+      'echo "BLOCK_DONE"',
+    ].join("\n");
     const r = runBash(body, { env: { MP_RESPONSES_TEXT: responses.join("\n") } });
     return {
-      out: r.stdout,
+      // The time limit's notes and warnings go to stderr.
+      out: r.stdout + r.stderr,
       status: r.status,
       calls: (r.stdout.match(/MP_CALL/g) ?? []).length,
       sleeps: [...r.stdout.matchAll(/^SLEEP: (\d+)$/gm)].map((m) => m[1]),
@@ -424,6 +469,181 @@ describe("step 7 MCP Registry publish retry", { timeout: BASH_BLOCK_TIMEOUT_MS }
     expect(r.calls).toBe(1);
     expect(r.out).toContain(`INFO: MCP Registry already has ${V} -- nothing to publish`);
     expect(r.out).not.toContain("FAIL:");
+  });
+
+  const DUPLICATE = `Error: publish failed: server returned status 400: {"title":"Bad Request","status":400,"detail":"invalid version: cannot publish duplicate version: io.github.YawLabs/fetch-mcp@${V} already exists"}`;
+
+  // No answer at all: mcp-publisher v1.7.9's own words for a dropped
+  // connection, captured against a local registry, and the time limit's exit
+  // code for an attempt it stopped.
+  it.each([
+    [
+      "dropped before any answer",
+      'Error: publish failed: error sending request: Post "http://127.0.0.1:58812/v0/publish": EOF',
+    ],
+    ["cut off mid-answer", "Error: publish failed: error reading response: unexpected EOF"],
+  ])("retries a connection %s, then publishes", (_name, text) => {
+    const r = runRegistry([text, "ok"]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.sleeps).toEqual(["30"]);
+    expect(r.out).toContain(
+      "WARN: MCP Registry dropped the connection without an answer -- waiting 30s, then attempt 2 of 4",
+    );
+    expect(r.out).toContain("INFO: Published to MCP Registry");
+  });
+
+  // A connection mcp-publisher v1.7.9 reports as never opened: a failed DNS
+  // lookup, a TLS handshake Go's default transport gave up on after 10 s, and
+  // a proxy that refused the CONNECT tunnel (Go reports only the proxy's
+  // reason phrase, "unknown status code" when it gives none, and nothing when
+  // it ends its status line at the code's space). The TLS and proxy texts are
+  // the real binary's, captured against a local listener that never answers
+  // the handshake and a local proxy that refused CONNECT with "502 Bad
+  // Gateway", "502 Proxy Error", a bare "502", "502 " and "505 HTTP Version
+  // Not Supported".
+  it.each([
+    [
+      "a failed lookup",
+      'Error: publish failed: error sending request: Post "https://registry.modelcontextprotocol.io/v0/publish": dial tcp: lookup registry.modelcontextprotocol.io: no such host',
+    ],
+    [
+      "a TLS handshake timeout",
+      'Error: publish failed: error sending request: Post "https://127.0.0.1:57912/v0/publish": net/http: TLS handshake timeout',
+    ],
+    [
+      "a proxy that refused the tunnel",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": Bad Gateway',
+    ],
+    [
+      "a proxy that refused it in its own words",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": Proxy Error',
+    ],
+    [
+      "a proxy that refused it with no reason phrase",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": unknown status code',
+    ],
+    [
+      "a proxy that refused it with an empty reason phrase",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": ',
+    ],
+    [
+      "a proxy whose reason phrase starts with an all-capitals word",
+      'Error: publish failed: error sending request: Post "https://registry.example.com/v0/publish": HTTP Version Not Supported',
+    ],
+  ])("retries a registry it could not reach (%s), and does not read a later duplicate as this run's", (_name, text) => {
+    const r = runRegistry([text, DUPLICATE]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.out).toContain("WARN: MCP Registry could not be reached -- waiting 30s, then attempt 2 of 4");
+    expect(r.out).toContain(`INFO: MCP Registry already has ${V} -- nothing to publish`);
+    expect(r.out).not.toContain("got no clear answer landed");
+  });
+
+  it("does not read a duplicate after a 429 as this run's attempt having landed", () => {
+    const r = runRegistry([
+      'Error: publish failed: server returned status 429: {"title":"Too Many Requests","status":429}',
+      DUPLICATE,
+    ]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.out).toContain(`INFO: MCP Registry already has ${V} -- nothing to publish`);
+    expect(r.out).not.toContain("got no clear answer landed");
+  });
+
+  it("retries an attempt the time limit stopped, then publishes", () => {
+    const r = runRegistry(["timeout", "ok"]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.out).toContain("mcp-publisher did not answer within 90s -- stopped it");
+    expect(r.out).toContain("WARN: MCP Registry did not answer within 90s -- waiting 30s, then attempt 2 of 4");
+    expect(r.out).toContain("INFO: Published to MCP Registry");
+  });
+
+  it.each(["abc", "0"])("falls back to a 10 s KILL grace for MCP_PUBLISH_KILL_AFTER_S=%s", (value) => {
+    // 0 too: timeout(1) reads a KILL grace of 0 as never sending the KILL.
+    const r = runRegistry(["ok"], `MCP_PUBLISH_KILL_AFTER_S=${value}`);
+    expect(r.status).toBe(0);
+    expect(r.out).toContain(`WARN: MCP_PUBLISH_KILL_AFTER_S='${value}' is not whole seconds above 0 -- using 10`);
+    expect(r.out).toContain("INFO: Published to MCP Registry");
+  });
+
+  it("retries an attempt that only the KILL ended (137), then publishes", () => {
+    const r = runRegistry(["killed", "ok"]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.out).toContain("mcp-publisher did not answer within 90s -- stopped it");
+    expect(r.out).toContain("WARN: MCP Registry did not answer within 90s -- waiting 30s, then attempt 2 of 4");
+    expect(r.out).toContain("INFO: Published to MCP Registry");
+  });
+
+  it("reads a duplicate after an attempt that got no answer as that attempt having landed", () => {
+    const r = runRegistry(["timeout", DUPLICATE]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.out).toContain(
+      `INFO: MCP Registry refused the retry of ${V} as a duplicate: an attempt of this run that got no clear answer landed`,
+    );
+    expect(r.out).not.toContain("FAIL:");
+  });
+
+  it("retries the registry's own 504, then publishes", () => {
+    const r = runRegistry([
+      "Error: publish failed: server returned status 504: <html><title>504 Gateway Time-out</title></html>",
+      "ok",
+    ]);
+    expect(r.status).toBe(0);
+    expect(r.calls).toBe(2);
+    expect(r.out).toContain(
+      "WARN: MCP Registry answered HTTP 504 itself -- busy or timing out, not a verdict -- waiting 30s, then attempt 2 of 4",
+    );
+  });
+
+  it("without a coreutils timeout, runs unbounded, says so, and does not read an exit of 124 as no answer", () => {
+    // Windows' own timeout.exe, asked for --version, prints this and exits 1.
+    const r = runRegistry(
+      ["timeout", "ok"],
+      [
+        'timeout() { echo "ERROR: Invalid value for timeout (/T) specified. Valid range is -1 to 99999."; return 1; }',
+        // A real gtimeout (Homebrew coreutils) could not run mp_stub either.
+        "gtimeout() { return 127; }",
+      ].join("\n"),
+    );
+    expect(r.out).toContain("WARN: Neither timeout nor gtimeout on PATH is the coreutils one");
+    expect(r.status).toBe(1);
+    expect(r.calls).toBe(1);
+    expect(r.out).toContain(FAIL_LINE);
+  });
+
+  // The step's first login, as release.sh writes it.
+  const LOGIN = extractBlock(
+    '  mcp_bounded "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null \\',
+    '    || mcp_login_fail "mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes (needs read:org for YawLabs)"',
+  );
+  function runLogin(reply: string): { out: string; status: number | null } {
+    const body = [HELPER_STUBS, MP_STUB, TIME_LIMIT, "MCP_REGISTRY_TOKEN=fixture", LOGIN, 'echo "LOGGED_IN"'].join(
+      "\n",
+    );
+    const r = runBash(body, { env: { MP_RESPONSES_TEXT: reply } });
+    return { out: r.stdout + r.stderr, status: r.status };
+  }
+
+  it("fails a first login the time limit stopped as the registry not answering, not a bad token", () => {
+    const r = runLogin("timeout");
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("mcp-publisher did not answer within 90s -- stopped it");
+    expect(r.out).toContain(
+      "FAIL: The MCP Registry did not answer the mcp-publisher login within 90s -- npm + GitHub release succeeded, but the MCP Registry step did not.",
+    );
+    expect(r.out).not.toContain("check MCP_REGISTRY_TOKEN scopes");
+    expect(r.out).not.toContain("LOGGED_IN");
+  });
+
+  it("keeps the token hint for a first login that failed any other way", () => {
+    const r = runLogin('Error: login failed: server returned status 401: {"title":"Unauthorized"}');
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("FAIL: mcp-publisher login failed -- check MCP_REGISTRY_TOKEN scopes");
+    expect(r.out).not.toContain("did not answer");
   });
 
   // Failures no wait cures: each must stop on the first attempt.
