@@ -112,7 +112,7 @@
  * sandboxed oam served it.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.15.2 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.18.0 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over for a
  * newer oam, or for Node. Below 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
@@ -149,7 +149,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The latest oam release, and the oldest one used. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 15, 2];
+const OAM_MIN = [0, 18, 0];
 
 /**
  * MINIMUM NODE VERSION. The server's HTTP client is undici 8, whose own floor is
@@ -790,7 +790,7 @@ async function refuseOldNodeInProcess(hostOam) {
  */
 async function fallBack(hostOam, why) {
   // "fresh" is the word that makes this line make sense on a host that IS an
-  // oam at the floor: it just said "using this oam 0.15.2 process", and only a
+  // oam at the floor: it just said "using this oam 0.18.0 process", and only a
   // freshly spawned oam can apply a process-level flag.
   const sandboxWhy = `a fresh oam (${OAM_MIN.join(".")} or newer) is needed to apply it and none could be spawned`;
   if (fallbackInProcess(hostOam)) {
