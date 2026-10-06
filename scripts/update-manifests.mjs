@@ -110,34 +110,41 @@ const scoopManifest = {
 };
 
 // 3. Homebrew formula (CLI -> formula, NOT cask).
-const licenseLine = proprietary ? 'license :cannot_represent' : `license "${pkg.license}"`;
+// Every value spliced into the formula goes through rb() or a pattern check:
+// the formula is Ruby that `brew` evaluates, and a double-quoted Ruby string
+// interpolates `#{...}`, so an unescaped `"` or `#{` in package.json (or in
+// --version) would end the string or run code on every machine that installs.
+const rb = (s) => `"${String(s).replace(/[\\"#]/g, (c) => `\\${c}`)}"`;
+if (!/^[A-Z][A-Za-z0-9]*$/.test(className)) throw new Error(`cannot derive a Ruby class name from ${JSON.stringify(cmd)}`);
+if (!/^[A-Za-z0-9._-]+$/.test(cmd)) throw new Error(`unexpected characters in command name ${JSON.stringify(cmd)}`);
+const licenseLine = proprietary ? 'license :cannot_represent' : `license ${rb(pkg.license)}`;
 const formula = `class ${className} < Formula
-  desc "${(pkg.description ?? '').replace(/"/g, '\\"')}"
-  homepage "${homepage}"
-  version "${version}"
+  desc ${rb(pkg.description ?? '')}
+  homepage ${rb(homepage)}
+  version ${rb(version)}
   ${licenseLine}
 
   on_macos do
     on_arm do
-      url "${dl(ASSETS.macArm64)}", using: :nounzip
-      sha256 "${hashFor(ASSETS.macArm64)}"
+      url ${rb(dl(ASSETS.macArm64))}, using: :nounzip
+      sha256 ${rb(hashFor(ASSETS.macArm64))}
     end
     on_intel do
-      url "${dl(ASSETS.macX64)}", using: :nounzip
-      sha256 "${hashFor(ASSETS.macX64)}"
+      url ${rb(dl(ASSETS.macX64))}, using: :nounzip
+      sha256 ${rb(hashFor(ASSETS.macX64))}
     end
   end
 
   on_linux do
     on_intel do
-      url "${dl(ASSETS.linuxX64)}", using: :nounzip
-      sha256 "${hashFor(ASSETS.linuxX64)}"
+      url ${rb(dl(ASSETS.linuxX64))}, using: :nounzip
+      sha256 ${rb(hashFor(ASSETS.linuxX64))}
     end
   end
 
   def install
     # Each per-arch release asset is a single bare binary; rename to the command.
-    bin.install Dir["*"].first => "${cmd}"
+    bin.install Dir["*"].first => ${rb(cmd)}
   end
 
   test do

@@ -4,9 +4,21 @@ import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 import { makeTurndown, stripHtmlToText } from "./content.js";
-import { decodeHtmlEntities, findBalancedTagContents, findTags, parseAttrs } from "./html.js";
+import {
+  type BalancedTag,
+  decodeHtmlEntities,
+  findBalancedTagContents,
+  findFirstTagText,
+  findTags,
+  matchBalancedTags,
+  parseAttrs,
+} from "./html.js";
 
 const MIN_CANDIDATE_LENGTH = 200;
+
+/** Class names common CMSes put on the article body. Tested on the parsed class value, never on raw tag text. */
+const CMS_CLASS_RE =
+  /\b(?:post-content|entry-content|article-content|article-body|story-body|article__body|markdown-body)\b/i;
 
 /**
  * Pull out the main article body. Tries, in order:
@@ -34,13 +46,10 @@ export function isolateMainContent(html: string): string {
   const main = pickLongestAbove("main");
   if (main) return main;
 
-  const itemprop = findAttrContainerContent(html, /\bitemprop\s*=\s*["']articleBody["']/i);
+  const itemprop = findAttrContainerContent(html, (attrs) => (attrs.itemprop ?? "").toLowerCase() === "articlebody");
   if (itemprop && itemprop.length > MIN_CANDIDATE_LENGTH) return itemprop;
 
-  const cms = findAttrContainerContent(
-    html,
-    /\bclass\s*=\s*["'][^"']*\b(?:post-content|entry-content|article-content|article-body|story-body|article__body|markdown-body)\b[^"']*["']/i,
-  );
+  const cms = findAttrContainerContent(html, (attrs) => CMS_CLASS_RE.test(attrs.class ?? ""));
   if (cms && cms.length > MIN_CANDIDATE_LENGTH) return cms;
 
   const body = findBalancedTagContents(html, "body")[0];
@@ -53,29 +62,33 @@ export function isolateMainContent(html: string): string {
  * section satisfies `attrPredicate`. Looks at div, section, article, main --
  * the tags that typically host article-body markers.
  */
-function findAttrContainerContent(html: string, attrPredicate: RegExp): string | null {
+function findAttrContainerContent(
+  html: string,
+  attrPredicate: (attrs: Record<string, string>) => boolean,
+): string | null {
   const tags = ["div", "section", "article", "main"];
-  let best: { content: string; start: number } | null = null;
+  let best: BalancedTag | null = null;
   for (const t of tags) {
-    for (const opener of findTags(html, t)) {
-      if (!attrPredicate.test(opener.attrsText)) continue;
-      const all = findBalancedTagContents(html.slice(opener.start), t);
-      const content = all[0];
-      if (!content) continue;
-      if (!best || content.length > best.content.length) best = { content, start: opener.start };
+    for (const tag of matchBalancedTags(html, t)) {
+      if (tag.contentEnd <= tag.contentStart) continue;
+      if (!attrPredicate(parseAttrs(tag.attrsText))) continue;
+      // Compare lengths and slice only the winner: slicing every candidate
+      // copies a nested chain of matching containers quadratically.
+      if (!best || tag.contentEnd - tag.contentStart > best.contentEnd - best.contentStart) best = tag;
     }
   }
-  return best?.content ?? null;
+  return best ? html.slice(best.contentStart, best.contentEnd) : null;
 }
 
 export function extractTitle(html: string): string | undefined {
   for (const tag of findTags(html, "meta")) {
     const attrs = parseAttrs(tag.attrsText);
     const property = (attrs.property ?? attrs.name ?? "").toLowerCase();
-    if (property === "og:title" && attrs.content) return decodeHtmlEntities(attrs.content.trim());
+    // parseAttrs has already decoded entities; decoding again turns `&amp;lt;` into `<`.
+    if (property === "og:title" && attrs.content) return attrs.content.trim();
   }
-  const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (t) return decodeHtmlEntities(t[1]!.trim().replace(/\s+/g, " "));
+  const t = findFirstTagText(html, "title");
+  if (t !== undefined) return decodeHtmlEntities(t.trim().replace(/\s+/g, " "));
   const h1Contents = findBalancedTagContents(html, "h1");
   if (h1Contents.length > 0) {
     const text = stripHtmlToText(h1Contents[0]!);
@@ -88,12 +101,12 @@ export function extractByline(html: string): string | undefined {
   for (const tag of findTags(html, "meta")) {
     const attrs = parseAttrs(tag.attrsText);
     const name = (attrs.name ?? "").toLowerCase();
-    if (name === "author" && attrs.content) return decodeHtmlEntities(attrs.content.trim());
+    if (name === "author" && attrs.content) return attrs.content.trim();
   }
   for (const tag of findTags(html, "meta")) {
     const attrs = parseAttrs(tag.attrsText);
     const property = (attrs.property ?? "").toLowerCase();
-    if (property === "article:author" && attrs.content) return decodeHtmlEntities(attrs.content.trim());
+    if (property === "article:author" && attrs.content) return attrs.content.trim();
   }
   return undefined;
 }
