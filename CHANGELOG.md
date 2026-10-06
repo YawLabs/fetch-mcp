@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-10-06
+
 ### Security
 - **The MCP SDK moves from 1.30.0 to 1.32.1** (GHSA-6qxp-vccf-f47h, high: the SDK's OAuth client could send credentials to an authorization server chosen by the MCP server; this server does not import that client, but the SDK version it runs on changes). The SDK is a runtime dependency that `dist` imports, and `scripts/build-binary.mjs` bundles it into the standalone binaries, so the dependency floor is now `^1.32.1`. Its `fast-uri`, which the server loads through ajv and the binaries bundle, moves from 3.1.7 to 3.1.8 (GHSA-hrr3-gc8f-f4qj, moderate: inconsistent host case normalisation via percent-encoded octets). Installed with the package through the SDK's own dependencies but never loaded by this stdio server, and not in the binaries: `proxy-addr` 2.0.8 (GHSA-jqcg-44mw-7w3h, critical: IP spoofing via an IPv4-mapped IPv6 trust subnet; through express) and `ip-address` 10.7.3 (GHSA-j6r3-76f7-8jcv and GHSA-h3mg-xc3c-68pw, moderate: cross-family subnet checks and an unbounded parse diagnostic; through express-rate-limit). Development-scope only: `source-map-js` 1.2.2 (GHSA-68fv-2mgg-jv7q, high: event-loop denial of service via indexed source-map section offsets; through tsup > postcss). No `overrides` entry was needed; the existing `tsup > esbuild` floor is unrelated. `npm audit` reports 0 vulnerabilities.
 
