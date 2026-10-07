@@ -3,7 +3,8 @@ import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
-import { decodeHtmlEntities, findTags, parseAttrs } from "./html.js";
+import { stripHtmlToText } from "./content.js";
+import { type FoundTag, findTagEnd, parseAttrs } from "./html.js";
 
 export interface ExtractedLink {
   href: string;
@@ -19,36 +20,198 @@ function normalizeHost(h: string): string {
   return lower.startsWith("www.") ? lower.slice(4) : lower;
 }
 
+/** A tag name runs, as in a browser, to whitespace, `/` or `>`. */
+const TAG_NAME_RE = /[a-zA-Z][^\t\n\f\r />]*/y;
+
+/** Comment ends: `-->`, or `--!>`, which a browser also accepts. */
+const COMMENT_END_RE = /--!?>/g;
+
 /**
- * Replace each `<...>` with a space (`<>` stays as text), by hand: `/<[^>]+>/g` searched to the
- * end of the text from every `<` with no `>` after it, quadratic in the number
- * of them. A `<` with no `>` after it, and everything after it, stay as text.
+ * Elements whose content is raw text or RCDATA: a `<a>` written inside one is
+ * text, not an anchor. `<script>` is handled on its own (escape states).
  */
-function stripTags(s: string): string {
-  let out = "";
-  let i = 0;
+const RAW_TEXT_ELEMENTS = ["style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript"];
+const RAW_END_RE = new Map(
+  RAW_TEXT_ELEMENTS.map((name) => [name, new RegExp(`</${name}(?=[\\t\\n\\f\\r />]|$)`, "gi")]),
+);
+
+const isNameEnd = (ch: string | undefined) =>
+  ch === undefined ||
+  ch === "/" ||
+  ch === ">" ||
+  ch === " " ||
+  ch === "\t" ||
+  ch === "\n" ||
+  ch === "\f" ||
+  ch === "\r";
+
+/** Index just past the `<!--` comment whose body starts at `from`; the end of the input when unterminated. */
+function commentEnd(html: string, from: number): number {
+  // `<!-->` and `<!--->` are complete (empty) comments.
+  if (html[from] === ">") return from + 1;
+  if (html.startsWith("->", from)) return from + 2;
+  COMMENT_END_RE.lastIndex = from;
+  const m = COMMENT_END_RE.exec(html);
+  return m === null ? html.length : m.index + m[0].length;
+}
+
+/** Index just past the end tag of `name` whose `<` is at `close`. */
+function endTagEnd(html: string, close: number, name: string): number {
+  const end = findTagEnd(html, close + 2 + name.length);
+  return end === null ? html.length : end.pos + 1;
+}
+
+/**
+ * Index of the `</script` that ends a script whose content starts at `from`,
+ * or -1. Inside `<!-- ... -->` in a script, a `<script` opens a nested
+ * ("double-escaped") region whose own `</script>` does not end the element.
+ */
+function scriptEndTag(html: string, from: number): number {
+  let state: "data" | "escaped" | "double" = "data";
+  let i = from;
   for (;;) {
-    const lt = s.indexOf("<", i);
-    if (lt === -1) return out + s.slice(i);
-    const gt = s.indexOf(">", lt + 1);
-    if (gt === -1) return out + s.slice(i);
-    out += `${s.slice(i, lt)}${gt > lt + 1 ? " " : "<>"}`;
-    i = gt + 1;
+    const nextLt = html.indexOf("<", i);
+    // Only `-->` leaves an escaped region, and it holds no `<`: the one that
+    // matters lies before the next `<`, so only that stretch is searched.
+    if (state !== "data") {
+      const stop = nextLt === -1 ? html.length : nextLt;
+      let k = i;
+      while (k + 3 <= stop && !html.startsWith("-->", k)) k++;
+      if (k + 3 <= stop) {
+        state = "data";
+        i = k + 3;
+        continue;
+      }
+    }
+    if (nextLt === -1) return -1;
+    const lt = nextLt;
+    i = lt + 1;
+    if (html.startsWith("<!--", lt)) {
+      if (state === "data") state = "escaped";
+      // Resume inside the `<!--` so the `-->` of `<!-->` and `<!--->` closes it at once.
+      i = lt + 2;
+      continue;
+    }
+    const closing = html[lt + 1] === "/";
+    const at = lt + (closing ? 2 : 1);
+    if (html.slice(at, at + 6).toLowerCase() !== "script" || !isNameEnd(html[at + 6])) continue;
+    if (closing) {
+      if (state !== "double") return lt;
+      state = "escaped";
+    } else if (state === "escaped") {
+      state = "double";
+    }
   }
 }
 
-export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
-  let base = baseUrl;
-  for (const baseTag of findTags(html, "base")) {
-    const attrs = parseAttrs(baseTag.attrsText);
-    if (attrs.href) {
-      try {
-        base = new URL(attrs.href, baseUrl).toString();
-      } catch {
-        /* ignore */
+interface VisibleMarkup {
+  /** Each `<a>` start tag, in document order. */
+  anchors: FoundTag[];
+  /** Offset of the `<` of each `</a>` end tag, ascending. */
+  closes: number[];
+  /** The first `<base>` tag, if any. */
+  base: FoundTag | undefined;
+}
+
+/**
+ * Every `<a>` start tag a browser would read as one, in document order, in one
+ * left-to-right pass. `findTags(html, "a")` matched `<a` anywhere, so anchors
+ * written inside a comment, a `<script>` or `<style>` (or any raw-text
+ * element), a `<template>`, or another tag's attribute value came back as
+ * links. Here a comment or bogus comment runs to its end, a raw-text element
+ * to its end tag (in any case, with whitespace or attributes before the `>`),
+ * and either runs to the end of the input when it never ends; markup inside a
+ * `<template>` is skipped to its matching `</template>`, and `<plaintext>`
+ * hides the rest of the page. The same pass finds the first `<base>` and every
+ * `</a>`, so a `<base href>` or `</a>` written in hidden markup does not
+ * re-root every link or cut an anchor's text short.
+ */
+function scanVisible(html: string): VisibleMarkup {
+  const n = html.length;
+  const anchors: FoundTag[] = [];
+  const closes: number[] = [];
+  let base: FoundTag | undefined;
+  let template = 0;
+  let i = 0;
+  while (i < n) {
+    const lt = html.indexOf("<", i);
+    if (lt === -1) break;
+    if (html.startsWith("<!--", lt)) {
+      i = commentEnd(html, lt + 4);
+      continue;
+    }
+    const next = html[lt + 1];
+    if (next === "!" || next === "?") {
+      // <!DOCTYPE>, <?xml ?> and other bogus comments run to the next `>`.
+      const gt = html.indexOf(">", lt + 2);
+      i = gt === -1 ? n : gt + 1;
+      continue;
+    }
+    const closing = next === "/";
+    TAG_NAME_RE.lastIndex = lt + (closing ? 2 : 1);
+    const m = TAG_NAME_RE.exec(html);
+    if (m === null) {
+      if (closing) {
+        // `</>` is dropped; `</ ...>` and friends are bogus comments.
+        const gt = html.indexOf(">", lt + 2);
+        i = gt === -1 ? n : gt + 1;
+      } else {
+        i = lt + 1; // a `<` that starts no tag is text
+      }
+      continue;
+    }
+    const name = m[0].toLowerCase();
+    const end = findTagEnd(html, TAG_NAME_RE.lastIndex);
+    // A tag cut off by the end of the input swallows everything after it.
+    if (end === null) break;
+    const after = end.pos + 1;
+    i = after;
+    if (closing) {
+      if (name === "template" && template > 0) template--;
+      else if (name === "a" && template === 0) closes.push(lt);
+      continue;
+    }
+    if ((name === "a" || (name === "base" && base === undefined)) && template === 0) {
+      const rawAttrs = html.slice(lt + 1 + name.length, end.pos);
+      const tag: FoundTag = {
+        start: lt,
+        contentStart: after,
+        // Drop only a self-closing `/`: in `<a href=/blog/>` the slash belongs to the value.
+        attrsText: end.selfClosing ? rawAttrs.slice(0, -1) : rawAttrs,
+        selfClosing: end.selfClosing,
+      };
+      if (name === "a") anchors.push(tag);
+      else base = tag;
+    } else if (name === "template") {
+      template++;
+    } else if (name === "plaintext") {
+      break;
+    } else if (name === "script") {
+      // A browser ignores the self-closing slash here: `<script src=x />` still runs to `</script>`.
+      const close = scriptEndTag(html, after);
+      i = close === -1 ? n : endTagEnd(html, close, name);
+    } else {
+      const re = RAW_END_RE.get(name);
+      if (re !== undefined) {
+        re.lastIndex = after;
+        const close = re.exec(html);
+        i = close === null ? n : endTagEnd(html, close.index, name);
       }
     }
-    break;
+  }
+  return { anchors, closes, base };
+}
+
+export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
+  const { anchors, closes, base: baseTag } = scanVisible(html);
+  let base = baseUrl;
+  const baseHref = baseTag ? parseAttrs(baseTag.attrsText).href : undefined;
+  if (baseHref) {
+    try {
+      base = new URL(baseHref, baseUrl).toString();
+    } catch {
+      /* ignore */
+    }
   }
 
   let baseHost = "";
@@ -58,15 +221,11 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     /* no baseHost -- everything classified external */
   }
 
-  // Finds the `</a>` that ends each anchor, searched case-insensitively in
-  // place. A lowercased copy of the page can differ in length ("\u0130"
-  // lowercases to two code units), which shifted every later index.
-  const closeA = /<\/a\s*>/gi;
-  /** The next `</a>` found so far: undefined before a search, null once there is none. */
-  let close: RegExpExecArray | null | undefined;
+  // Index into `closes` of the first `</a>` at or past the current anchor.
+  // Anchors come in document order, so it only moves forward: linear overall.
+  let c = 0;
 
   const links: ExtractedLink[] = [];
-  const anchors = [...findTags(html, "a")];
   for (let k = 0; k < anchors.length; k++) {
     const tag = anchors[k]!;
     const attrs = parseAttrs(tag.attrsText);
@@ -88,29 +247,24 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
     const abs = parsed.toString();
 
-    // Anchors come in document order, so a close found for an earlier anchor
-    // that lies past this one is this one's too, and once none is left none
-    // ever will be. Searching afresh from every anchor read to the end of the
-    // input once per unclosed anchor: quadratic.
-    if (close !== null && close !== undefined && close.index < tag.contentStart) close = undefined;
-    if (close === undefined) {
-      closeA.lastIndex = tag.contentStart;
-      close = closeA.exec(html);
-    }
+    while (c < closes.length && closes[c]! < tag.contentStart) c++;
+    const close = c < closes.length ? closes[c]! : -1;
     // A new <a> also ends the one before it, as in a browser, so the text of
     // anchors that share one far-off </a> is not copied once per anchor.
     // With no </a> anywhere after it, an anchor has no text: running it to
     // the end of the page would hand back the rest of the document, scripts
     // and all, as one link's text.
     const nextStart = anchors[k + 1]?.start ?? html.length;
-    const innerEnd = close ? Math.min(close.index, nextStart) : tag.contentStart;
-    const text = stripTags(html.slice(tag.contentStart, innerEnd)).replace(/\s+/g, " ").trim();
+    const innerEnd = close !== -1 ? Math.min(close, nextStart) : tag.contentStart;
+    // stripHtmlToText drops script, style, template and comment content and
+    // decodes entities once, after every tag is gone.
+    const text = stripHtmlToText(html.slice(tag.contentStart, innerEnd)).replace(/\s+/g, " ").trim();
 
     const host = normalizeHost(parsed.host);
 
     const link: ExtractedLink = {
       href: abs,
-      text: decodeHtmlEntities(text),
+      text,
       type: host === baseHost ? "internal" : "external",
     };
     if (attrs.rel) link.rel = attrs.rel;

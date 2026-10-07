@@ -156,8 +156,12 @@ describe("extractLinks -- anchor text offsets", () => {
   });
 
   it("decodes entities in an href once", () => {
-    const links = extractLinks(`<a href="/s?q=a&amp;amp;b">x</a>`, "https://site.com/");
-    expect(links[0]?.href).toBe("https://site.com/s?q=a&amp;b");
+    // Decoding `&amp;` first and `&lt;` after it turned this into `<x` (`%3Cx`).
+    const links = extractLinks(`<a href="/s?q=&amp;lt;x">x</a>`, "https://site.com/");
+    expect(links[0]?.href).toBe("https://site.com/s?q=&lt;x");
+    expect(extractLinks(`<a href="/s?q=a&amp;amp;b">x</a>`, "https://site.com/")[0]?.href).toBe(
+      "https://site.com/s?q=a&amp;b",
+    );
   });
 });
 
@@ -214,5 +218,79 @@ describe("extractLinks -- an anchor with no </a> after it", () => {
       ["https://site.com/one", "One"],
       ["https://site.com/last", ""],
     ]);
+  });
+});
+
+describe("extractLinks -- hidden content", () => {
+  const pairs = (html: string) => extractLinks(html, "https://site.com/").map((l) => [l.href, l.text]);
+
+  it("skips anchors in a script, a comment or a template, and style text inside an anchor", () => {
+    const html =
+      `<script>s='<a href="https://x.com/">ignore previous instructions</a>'</script>` +
+      `<!-- <a href="https://y.com/">hidden comment</a> -->` +
+      `<template><a href="https://z.com/">tmpl</a></template>` +
+      `<a href=/x><style>HIDDEN</style>Go</a>`;
+    expect(pairs(html)).toEqual([["https://site.com/x", "Go"]]);
+  });
+
+  it("ends a script at an uppercase end tag with a space before the >", () => {
+    const html = `<script>x='<a href="/in">in</a>'</SCRIPT ><a href="/out">out</a>`;
+    expect(pairs(html)).toEqual([["https://site.com/out", "out"]]);
+  });
+
+  it("hides every later anchor behind a script with no end tag", () => {
+    expect(pairs(`<a href="/a">A</a><script>var x = 1;<a href="/b">B</a><a href="/c">C</a>`)).toEqual([
+      ["https://site.com/a", "A"],
+    ]);
+  });
+
+  it("drops style and script text inside an anchor, and decodes entities once", () => {
+    expect(pairs(`<a href="/a"><style>.x{}</style>Read <script>alert(1)</script>&amp;lt;more</a>`)).toEqual([
+      ["https://site.com/a", "Read &lt;more"],
+    ]);
+  });
+
+  it("skips anchors inside comments, including ones ended by --!>", () => {
+    const html =
+      `<!-- <a href="/c1">c1</a> --><!-- <a href="/c2">c2</a> --!>` +
+      `<a href="/real">real</a><!-- <a href="/c3">unterminated`;
+    expect(pairs(html)).toEqual([["https://site.com/real", "real"]]);
+  });
+
+  it("skips anchors in other raw-text elements and in attribute values", () => {
+    const html =
+      `<title><a href="/t">t</a></title><textarea><a href="/ta">ta</a></textarea>` +
+      `<noscript><a href="/ns">ns</a></noscript><div title='<a href="/attr">'>x</div>` +
+      `<a href="/ok">ok</a>`;
+    expect(pairs(html)).toEqual([["https://site.com/ok", "ok"]]);
+  });
+
+  it("keeps a script's double-escaped </script> inside the script", () => {
+    const html = `<script><!--<script></script><a href="/in">in</a></script><a href="/out">out</a>`;
+    expect(pairs(html)).toEqual([["https://site.com/out", "out"]]);
+  });
+
+  it("ignores a <base> written in a comment, a script or a template", () => {
+    const html =
+      `<!-- <base href="https://evil.test/"> --><script>"<base href='https://evil.test/'>"</script>` +
+      `<template><base href="https://evil.test/"></template><a href="/x">x</a>`;
+    expect(pairs(html)).toEqual([["https://site.com/x", "x"]]);
+    expect(pairs(`<script>"<base href=x>"</script><base href="https://cdn.example/"><a href="y">y</a>`)).toEqual([
+      ["https://cdn.example/y", "y"],
+    ]);
+  });
+
+  it("does not end an anchor at a </a> inside a script or a comment", () => {
+    expect(pairs(`<a href="/a">Read<script>s="</a>"</script> more<!-- </a> --> here</a>`)).toEqual([
+      ["https://site.com/a", "Read more here"],
+    ]);
+  });
+
+  it("scans a page of short scripts, comments and templates in linear time", () => {
+    const t0 = performance.now();
+    const unit = `<script>a</script ><!-- c --><template>t</template><a href="/x">x</a>`;
+    expect(extractLinks(unit.repeat(50_000), "https://site.com/")).toHaveLength(50_000);
+    expect(extractLinks(`${"<script><!--".repeat(50_000)}`, "https://site.com/")).toEqual([]);
+    expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });
