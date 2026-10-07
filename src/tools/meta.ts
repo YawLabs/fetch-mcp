@@ -3,7 +3,7 @@ import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
-import { decodeHtmlEntities, findTags, parseAttrs } from "./html.js";
+import { decodeHtmlEntities, findFirstTagText, findTags, parseAttrs } from "./html.js";
 
 export interface PageMeta {
   url: string;
@@ -44,11 +44,11 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
   const headEnd = html.search(/<\/head>/i);
   const head = headEnd >= 0 ? html.slice(0, headEnd) : html;
 
-  const titleMatch = head.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch ? decodeHtmlEntities(titleMatch[1]!.trim().replace(/\s+/g, " ")) : undefined;
+  const titleText = findFirstTagText(head, "title");
+  const title = titleText !== undefined ? decodeHtmlEntities(titleText.trim().replace(/\s+/g, " ")) : undefined;
 
-  const htmlTagMatch = html.match(/<html\b[^>]*>/i);
-  const language = htmlTagMatch ? parseAttrs(htmlTagMatch[0].slice(5, -1)).lang : undefined;
+  const htmlTag = findTags(html, "html").next();
+  const language = htmlTag.done ? undefined : parseAttrs(htmlTag.value.attrsText).lang;
 
   const og: Record<string, string> = {};
   const twitter: Record<string, string> = {};
@@ -99,9 +99,24 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
   }
 
   const jsonLd: unknown[] = [];
-  const jsonLdRe = /<script\b[^>]*\btype\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  for (const m of html.matchAll(jsonLdRe)) {
-    const raw = m[1]!.trim();
+  // Each block runs to the next `</script>`. Scripts come in document order,
+  // so one `</script>` search serves every opener before it, and once none is
+  // left no later block can close: the lazy regex this replaced searched to
+  // the end of the input from every opener, which was quadratic.
+  const scriptClose = /<\/script\s*>/gi;
+  let close: RegExpExecArray | null | undefined;
+  let consumed = 0;
+  for (const tag of findTags(html, "script")) {
+    if (tag.start < consumed) continue;
+    if ((parseAttrs(tag.attrsText).type ?? "").trim().toLowerCase() !== "application/ld+json") continue;
+    if (close !== null && close !== undefined && close.index < tag.contentStart) close = undefined;
+    if (close === undefined) {
+      scriptClose.lastIndex = tag.contentStart;
+      close = scriptClose.exec(html);
+    }
+    if (close === null) break;
+    consumed = close.index + close[0].length;
+    const raw = html.slice(tag.contentStart, close.index).trim();
     if (!raw) continue;
     try {
       jsonLd.push(JSON.parse(raw));

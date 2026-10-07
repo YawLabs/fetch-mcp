@@ -177,3 +177,45 @@ describe("parseHtmlMeta", () => {
     expect(meta.og.title).toBe("Real title");
   });
 });
+
+describe("parseHtmlMeta -- title", () => {
+  it("reads no title from a page of unclosed <title>s, quickly", () => {
+    const t0 = performance.now();
+    expect(parseHtmlMeta("<title>x ".repeat(200_000), "https://site.com/").title).toBeUndefined();
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("decodes the title once", () => {
+    expect(parseHtmlMeta("<title>a &amp;lt; b</title>", "https://site.com/").title).toBe("a &lt; b");
+  });
+});
+
+describe("parseHtmlMeta -- <html lang> and JSON-LD in linear time", () => {
+  it("reads lang and every JSON-LD block", () => {
+    const html = `<html lang="en"><head><script type="application/ld+json">{"a":1}</script><script>x</script><script type=' Application/LD+JSON '>{"b":2}</script ></head></html>`;
+    const meta = parseHtmlMeta(html, "https://site.com/");
+    expect(meta.language).toBe("en");
+    expect(meta.jsonLd).toEqual([{ a: 1 }, { b: 2 }]);
+  });
+
+  it("handles many <html> and <script> openers and unclosed JSON-LD quickly", () => {
+    const t0 = performance.now();
+    parseHtmlMeta("<html ".repeat(200_000), "https://site.com/");
+    parseHtmlMeta("<script ".repeat(200_000), "https://site.com/");
+    expect(parseHtmlMeta('<script type="application/ld+json">'.repeat(100_000), "https://site.com/").jsonLd).toEqual(
+      [],
+    );
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("reader -- article, main and h1 in linear time", () => {
+  it("handles nested and unclosed article, main and h1 quickly", async () => {
+    const { isolateMainContent, extractTitle } = await import("../tools/reader.js");
+    const t0 = performance.now();
+    isolateMainContent(`${"<main>".repeat(50_000)}${"x".repeat(300)}${"</main>".repeat(50_000)}`);
+    isolateMainContent(`${"<article>".repeat(100_000)}</article>`);
+    expect(extractTitle(`${"<h1>".repeat(100_000)}</h1>`)).toBeUndefined();
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});

@@ -19,6 +19,24 @@ function normalizeHost(h: string): string {
   return lower.startsWith("www.") ? lower.slice(4) : lower;
 }
 
+/**
+ * Replace each `<...>` with a space (`<>` stays as text), by hand: `/<[^>]+>/g` searched to the
+ * end of the text from every `<` with no `>` after it, quadratic in the number
+ * of them. A `<` with no `>` after it, and everything after it, stay as text.
+ */
+function stripTags(s: string): string {
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const lt = s.indexOf("<", i);
+    if (lt === -1) return out + s.slice(i);
+    const gt = s.indexOf(">", lt + 1);
+    if (gt === -1) return out + s.slice(i);
+    out += `${s.slice(i, lt)}${gt > lt + 1 ? " " : "<>"}`;
+    i = gt + 1;
+  }
+}
+
 export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
   let base = baseUrl;
   for (const baseTag of findTags(html, "base")) {
@@ -40,50 +58,55 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     /* no baseHost -- everything classified external */
   }
 
-  // Lowercased view of the source, computed once. extractLinks is hot on large
-  // pages with thousands of anchors; computing this inside the loop allocates
-  // an N-byte string per anchor and turns link extraction into O(N*K) memory churn.
-  const htmlLower = html.toLowerCase();
+  // Finds the `</a>` that ends each anchor, searched case-insensitively in
+  // place. A lowercased copy of the page can differ in length ("\u0130"
+  // lowercases to two code units), which shifted every later index.
+  const closeA = /<\/a\s*>/gi;
+  /** The next `</a>` found so far: undefined before a search, null once there is none. */
+  let close: RegExpExecArray | null | undefined;
 
   const links: ExtractedLink[] = [];
-  for (const tag of findTags(html, "a")) {
+  const anchors = [...findTags(html, "a")];
+  for (let k = 0; k < anchors.length; k++) {
+    const tag = anchors[k]!;
     const attrs = parseAttrs(tag.attrsText);
     const href = attrs.href;
     if (!href) continue;
     const trimmed = href.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
-    const lower = trimmed.toLowerCase();
-    if (
-      lower.startsWith("javascript:") ||
-      lower.startsWith("mailto:") ||
-      lower.startsWith("tel:") ||
-      lower.startsWith("data:") ||
-      lower.startsWith("file:")
-    )
-      continue;
 
-    let abs: string;
+    // Keep http(s) only, judged on the parsed URL. A prefix deny-list on the
+    // raw href missed vbscript: and every scheme nobody listed, and the URL
+    // parser drops tabs and newlines and leading control characters, so
+    // "java\tscript:" and "\x01javascript:" both parse as javascript:.
+    let parsed: URL;
     try {
-      abs = new URL(trimmed, base).toString();
+      parsed = new URL(trimmed, base);
     } catch {
       continue;
     }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+    const abs = parsed.toString();
 
-    // Extract inner text: find the end of this <a> by searching from contentStart
-    // for the next </a>. Keep it simple -- nested <a> is invalid HTML.
-    const closeIdx = htmlLower.indexOf("</a>", tag.contentStart);
-    const innerHtml = closeIdx >= 0 ? html.slice(tag.contentStart, closeIdx) : "";
-    const text = innerHtml
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    let host: string;
-    try {
-      host = normalizeHost(new URL(abs).host);
-    } catch {
-      continue;
+    // Anchors come in document order, so a close found for an earlier anchor
+    // that lies past this one is this one's too, and once none is left none
+    // ever will be. Searching afresh from every anchor read to the end of the
+    // input once per unclosed anchor: quadratic.
+    if (close !== null && close !== undefined && close.index < tag.contentStart) close = undefined;
+    if (close === undefined) {
+      closeA.lastIndex = tag.contentStart;
+      close = closeA.exec(html);
     }
+    // A new <a> also ends the one before it, as in a browser, so the text of
+    // anchors that share one far-off </a> is not copied once per anchor.
+    // With no </a> anywhere after it, an anchor has no text: running it to
+    // the end of the page would hand back the rest of the document, scripts
+    // and all, as one link's text.
+    const nextStart = anchors[k + 1]?.start ?? html.length;
+    const innerEnd = close ? Math.min(close.index, nextStart) : tag.contentStart;
+    const text = stripTags(html.slice(tag.contentStart, innerEnd)).replace(/\s+/g, " ").trim();
+
+    const host = normalizeHost(parsed.host);
 
     const link: ExtractedLink = {
       href: abs,
@@ -100,7 +123,7 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
 export function registerLinksTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_links",
-    "Extract every outbound link from an HTML page, resolved to absolute URLs. Each entry includes href, anchor text, optional rel/title, and an internal/external classification (bare-domain and www. treated as the same host). Anchors (#), javascript:, mailto:, tel:, data:, and file: URIs are skipped. Respects <base href>.",
+    "Extract every outbound link from an HTML page, resolved to absolute URLs. Each entry includes href, anchor text, optional rel/title, and an internal/external classification (bare-domain and www. treated as the same host). Only http and https links are returned: anchors (#) and every other scheme (javascript:, mailto:, tel:, data:, file:, ...) are skipped. Respects <base href>.",
     {
       url: z.string().url(),
       timeout_ms: z.number().int().positive().max(60_000).optional(),

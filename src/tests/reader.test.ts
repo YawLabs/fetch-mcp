@@ -154,3 +154,65 @@ describe("isolateMainContent", () => {
     expect(content).toContain("embedded card article");
   });
 });
+
+describe("extractTitle / extractByline -- attribute values are decoded once", () => {
+  it("does not decode og:title a second time", () => {
+    expect(extractTitle(`<meta property="og:title" content="a &amp;lt;b&amp;gt;">`)).toBe("a &lt;b&gt;");
+  });
+
+  it("does not decode the author a second time", () => {
+    expect(extractByline(`<meta name="author" content="A &amp;amp; B">`)).toBe("A &amp; B");
+    expect(extractByline(`<meta property="article:author" content="A &amp;amp; B">`)).toBe("A &amp; B");
+  });
+});
+
+describe("reader -- linear time on unclosed and nested containers", () => {
+  it("extracts no title from a page of unclosed <title>s, quickly", () => {
+    const t0 = performance.now();
+    expect(extractTitle("<title>x ".repeat(200_000))).toBeUndefined();
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("reads the first <title> up to its close", () => {
+    expect(extractTitle("<title>One</title ><title>Two</title>")).toBe("One");
+  });
+
+  it("isolates nothing from a page of unclosed matching containers, quickly", () => {
+    const html = `<body>${'<div class="post-content">'.repeat(100_000)}</body>`;
+    const t0 = performance.now();
+    isolateMainContent(html);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("picks the outermost of nested matching containers, quickly", () => {
+    const n = 20_000;
+    const body = "word ".repeat(100);
+    const html = `${'<div class="entry-content">'.repeat(n)}${body}${"</div>".repeat(n)}`;
+    const t0 = performance.now();
+    const out = isolateMainContent(html);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+    expect(out.startsWith('<div class="entry-content">')).toBe(true);
+    expect(out.length).toBe(html.length - '<div class="entry-content">'.length - "</div>".length);
+  });
+
+  it("still finds an itemprop=articleBody container", () => {
+    const text = "Body text. ".repeat(30);
+    const html = `<div class="x">nav</div><section itemprop="articleBody"><p>${text}</p></section>`;
+    expect(isolateMainContent(html)).toBe(`<p>${text}</p>`);
+  });
+});
+
+describe("reader -- container attributes are read parsed", () => {
+  it("finds a CMS container by class token, and not by text inside another attribute", () => {
+    const text = "Body text. ".repeat(30);
+    expect(isolateMainContent(`<div class="wrap entry-content x"><p>${text}</p></div>`)).toBe(`<p>${text}</p>`);
+    const decoy = `<div title='class="post-content"'><p>${text}</p></div><body>fallback</body>`;
+    expect(isolateMainContent(decoy)).toBe("fallback");
+  });
+
+  it("matches the class regex in linear time on a long unquoted value", () => {
+    const t0 = performance.now();
+    isolateMainContent(`<div x=class="${"post-content ".repeat(100_000)}>${"word ".repeat(100)}</div>`);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});

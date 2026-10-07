@@ -123,3 +123,96 @@ describe("extractLinks", () => {
     expect(links[0]?.href).toBe("https://site.com/a");
   });
 });
+
+describe("extractLinks -- scheme allow-list (CodeQL #9)", () => {
+  it.each([
+    ["vbscript:", `<a href="vbscript:msgbox(1)">x</a>`],
+    ["javascript: with an encoded tab", `<a href="java&#9;script:alert(1)">x</a>`],
+    ["javascript: with a literal newline", `<a href="java\nscript:alert(1)">x</a>`],
+    ["javascript: behind a control character", `<a href="\u0001javascript:alert(1)">x</a>`],
+    ["JavaScript: in mixed case", `<a href="JaVaScRiPt:alert(1)">x</a>`],
+    ["ftp:", `<a href="ftp://files.example.com/a">x</a>`],
+    ["blob:", `<a href="blob:https://site.com/uuid">x</a>`],
+    ["sms:", `<a href="sms:+1234">x</a>`],
+  ])("skips %s", (_, html) => {
+    expect(extractLinks(html, "https://site.com/")).toEqual([]);
+  });
+
+  it("skips relative hrefs when <base href> points at a non-http scheme", () => {
+    expect(extractLinks(`<base href="ftp://files.example.com/"><a href="a">x</a>`, "https://site.com/")).toEqual([]);
+  });
+
+  it("keeps http and https links", () => {
+    const links = extractLinks(`<a href="http://a.com/">a</a><a href="HTTPS://b.com/">b</a>`, "https://site.com/");
+    expect(links.map((l) => l.href)).toEqual(["http://a.com/", "https://b.com/"]);
+  });
+});
+
+describe("extractLinks -- anchor text offsets", () => {
+  it("reads each anchor's text correctly after characters whose lowercase form is longer", () => {
+    const html = `\u0130\u0130\u0130\u0130<a href="/one">One</A><a href="/two">Two</a >`;
+    const links = extractLinks(html, "https://site.com/");
+    expect(links.map((l) => l.text)).toEqual(["One", "Two"]);
+  });
+
+  it("decodes entities in an href once", () => {
+    const links = extractLinks(`<a href="/s?q=a&amp;amp;b">x</a>`, "https://site.com/");
+    expect(links[0]?.href).toBe("https://site.com/s?q=a&amp;b");
+  });
+});
+
+describe("extractLinks -- quotes outside quoted values", () => {
+  it("finds the links after an anchor with an apostrophe in an unquoted attribute", () => {
+    const html = `<a href=/a title=Bob's>A</a><a href="/b">B</a>`;
+    const links = extractLinks(html, "https://site.com/");
+    expect(links.map((l) => [l.href, l.text])).toEqual([
+      ["https://site.com/a", "A"],
+      ["https://site.com/b", "B"],
+    ]);
+  });
+});
+
+describe("extractLinks -- unquoted values ending in a slash", () => {
+  it("keeps the trailing slash of an unquoted href", () => {
+    const links = extractLinks(
+      `<a href=/blog/>Blog</a><a href=https://x.com/a/>X</a><a href="/q/" />`,
+      "https://site.com/",
+    );
+    expect(links.map((l) => l.href)).toEqual(["https://site.com/blog/", "https://x.com/a/", "https://site.com/q/"]);
+  });
+});
+
+describe("extractLinks -- unclosed anchors", () => {
+  it("ends an anchor's text at its </a> or at the next <a>, as a browser does", () => {
+    const links = extractLinks(`<a href="/a">A <a href="/b">B</a> tail <a href="/c">C`, "https://site.com/");
+    expect(links.map((l) => l.text)).toEqual(["A", "B", ""]);
+  });
+
+  it("handles many anchors sharing one far-off </a>, and text full of <, in linear time", () => {
+    const t0 = performance.now();
+    expect(extractLinks(`${"<a href=http://x/>t".repeat(100_000)}</a>`, "http://x/")).toHaveLength(100_000);
+    const [only] = extractLinks(`<a href=http://x/>${"<".repeat(1_000_000)}</a>`, "http://x/");
+    expect(only?.text).toBe("<".repeat(1_000_000));
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("handles a page of unclosed anchors in linear time", () => {
+    // Searching for </a> afresh from every anchor read to the end each time:
+    // 2 MB took 58 s.
+    const t0 = performance.now();
+    const links = extractLinks('<a href="https://e.com/x">t '.repeat(100_000), "https://e.com/");
+    expect(links).toHaveLength(100_000);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("extractLinks -- an anchor with no </a> after it", () => {
+  it("has no text, rather than the rest of the page", () => {
+    const html = `<a href="/one">One</a><a href="/last">Last<p>footer</p><script>var secret = 1;</script></body></html>`;
+    const links = extractLinks(html, "https://site.com/");
+    expect(links.map((l) => [l.href, l.text])).toEqual([
+      ["https://site.com/one", "One"],
+      ["https://site.com/last", ""],
+    ]);
+  });
+});
