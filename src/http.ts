@@ -22,7 +22,7 @@ export const ABSOLUTE_MAX_BYTES = 100 * 1024 * 1024; // 100 MiB — hard ceiling
  */
 export const ABSOLUTE_MAX_TOTAL_MS = 5 * 60 * 1000;
 
-const CANCELLED = "request cancelled by the client";
+export const CANCELLED = "request cancelled by the client";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
 

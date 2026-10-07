@@ -219,3 +219,69 @@ describe("reader -- article, main and h1 in linear time", () => {
     expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });
+
+describe("parseHtmlMeta -- tags in hidden text are not metadata", () => {
+  it("ignores meta, link and title in a comment, a script, a style or a template", () => {
+    const html =
+      `<html lang=en><head><!-- <meta property="og:title" content="SECRET"> <html lang=xx> -->` +
+      `<script>"<link rel=canonical href=/secret><meta name=description content=SECRET>"</script>` +
+      `<style><title>SECRET3</title></style>` +
+      `<template><meta name=robots content=SECRET><link rel=icon href=/secret.ico></template>` +
+      `<meta property="og:title" content="Real"><title>Real</title></head></html>`;
+    const meta = parseHtmlMeta(html, "https://site.com/");
+    expect(JSON.stringify(meta)).not.toMatch(/SECRET|secret/);
+    expect(meta.og).toEqual({ title: "Real" });
+    expect(meta.title).toBe("Real");
+    expect(meta.language).toBe("en");
+    expect(meta.canonical).toBeUndefined();
+    expect(meta.icons).toEqual([]);
+  });
+
+  it("reads the reviewer's repro as no metadata", () => {
+    const meta = parseHtmlMeta(
+      `<head><!-- <meta property="og:title" content="SECRET"> --><script>"<link rel=canonical href=/secret>"</script><style><title>SECRET3</title></style></head>`,
+      "https://x/",
+    );
+    expect(meta.og).toEqual({});
+    expect(meta.canonical).toBeUndefined();
+    expect(meta.title).toBeUndefined();
+  });
+
+  it("ignores JSON-LD and a title inside an <svg>, and a </head> in a comment", () => {
+    const html =
+      `<head><!-- </head> --><meta name=description content=Kept>` +
+      `<svg><title>Logo</title><script type="application/ld+json">{"svg":1}</script></svg>` +
+      `<script type="application/ld+json">{"a":1}</script></head>`;
+    const meta = parseHtmlMeta(html, "https://site.com/");
+    expect(meta.description).toBe("Kept");
+    expect(meta.title).toBeUndefined();
+    expect(meta.jsonLd).toEqual([{ a: 1 }]);
+  });
+
+  it("builds the mask in linear time on a page of comments and scripts", () => {
+    const t0 = performance.now();
+    parseHtmlMeta(`<head>${"<!-- <meta name=a content=b> -->".repeat(100_000)}</head>`, "https://site.com/");
+    parseHtmlMeta(`<head>${"<script><meta name=a content=b></script>".repeat(100_000)}`, "https://site.com/");
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("parseHtmlMeta -- a JSON-LD block ends where the browser ends the script", () => {
+  it.each([
+    ["an end tag with an attribute", '{"a":"</script x><!--SECRET1-->"}'],
+    ["a self-closing end tag", '{"a":"</script/><style>SECRET2</style>"}'],
+    ["an end tag with a quoted attribute", '{"a":"</script x=\\">\\"<!--SECRET4-->"}'],
+  ])("reads nothing past %s", (_, json) => {
+    expect(JSON.parse(json)).toBeTypeOf("object");
+    const html = `<head><script type="application/ld+json">${json}</script><script type="application/ld+json">{"b":2}</script></head>`;
+    const meta = parseHtmlMeta(html, "https://site.com/");
+    expect(JSON.stringify(meta)).not.toContain("SECRET");
+    expect(meta.jsonLd).toEqual([{ b: 2 }]);
+  });
+
+  it("keeps a </script> in a double-escaped region inside the block", () => {
+    const json = '{"a":"<!--<script></script>-->"}';
+    const meta = parseHtmlMeta(`<script type="application/ld+json">${json}</script>`, "https://site.com/");
+    expect(meta.jsonLd).toEqual([{ a: "<!--<script></script>-->" }]);
+  });
+});

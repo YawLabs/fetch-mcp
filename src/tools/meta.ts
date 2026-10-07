@@ -3,7 +3,8 @@ import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
-import { decodeHtmlEntities, findFirstTagText, findTags, parseAttrs } from "./html.js";
+import { scriptEndTag, visibleTagMask } from "./content.js";
+import { decodeHtmlEntities, findFirstTagText, findTags, parseAttrs, type TagMask } from "./html.js";
 
 export interface PageMeta {
   url: string;
@@ -40,14 +41,31 @@ function pruneSingles(all: Record<string, string[]>): Record<string, string[]> {
   return out;
 }
 
+/** Offset of the first `</head>` the mask marks, or -1. */
+function headEndOffset(html: string, mask: TagMask): number {
+  const re = /<\/head>/gi;
+  for (;;) {
+    const m = re.exec(html);
+    if (m === null) return -1;
+    if (mask[m.index] === 1) return m.index;
+  }
+}
+
+/**
+ * Only tags `visibleTagMask` marks count: a `<meta>`, `<link>` or `<title>`
+ * written in a comment, a script, a style or a template is not metadata, and
+ * reporting it handed hidden text to the caller as the page's own.
+ */
 export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
-  const headEnd = html.search(/<\/head>/i);
+  const mask = visibleTagMask(html);
+  // The head is a prefix of the page, so the mask's offsets hold for it too.
+  const headEnd = headEndOffset(html, mask);
   const head = headEnd >= 0 ? html.slice(0, headEnd) : html;
 
-  const titleText = findFirstTagText(head, "title");
+  const titleText = findFirstTagText(head, "title", mask);
   const title = titleText !== undefined ? decodeHtmlEntities(titleText.trim().replace(/\s+/g, " ")) : undefined;
 
-  const htmlTag = findTags(html, "html").next();
+  const htmlTag = findTags(html, "html", mask).next();
   const language = htmlTag.done ? undefined : parseAttrs(htmlTag.value.attrsText).lang;
 
   const og: Record<string, string> = {};
@@ -59,7 +77,7 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
   let description: string | undefined;
   let robots: string | undefined;
 
-  for (const tag of findTags(head, "meta")) {
+  for (const tag of findTags(head, "meta", mask)) {
     const attrs = parseAttrs(tag.attrsText);
     const rawName = attrs.property ?? attrs.name ?? attrs.itemprop ?? "";
     const name = rawName.toLowerCase();
@@ -75,7 +93,7 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
   let canonical: string | undefined;
   const icons: PageMeta["icons"] = [];
   const feeds: PageMeta["feeds"] = [];
-  for (const tag of findTags(head, "link")) {
+  for (const tag of findTags(head, "link", mask)) {
     const attrs = parseAttrs(tag.attrsText);
     const rel = (attrs.rel ?? "").toLowerCase();
     const href = attrs.href;
@@ -99,24 +117,17 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
   }
 
   const jsonLd: unknown[] = [];
-  // Each block runs to the next `</script>`. Scripts come in document order,
-  // so one `</script>` search serves every opener before it, and once none is
-  // left no later block can close: the lazy regex this replaced searched to
-  // the end of the input from every opener, which was quadratic.
-  const scriptClose = /<\/script\s*>/gi;
-  let close: RegExpExecArray | null | undefined;
-  let consumed = 0;
-  for (const tag of findTags(html, "script")) {
-    if (tag.start < consumed) continue;
+  // Each block ends where a browser ends the script: at the `</script` the
+  // scan itself stops at (escape states and `</script x>` / `</script/>`
+  // included), not at the next `</script>` spelled one way, which read the
+  // markup after a `</script x>` -- comments, styles -- into the JSON. The
+  // mask marks only scripts outside one another, so the blocks do not
+  // overlap and the searches stay linear.
+  for (const tag of findTags(html, "script", mask)) {
     if ((parseAttrs(tag.attrsText).type ?? "").trim().toLowerCase() !== "application/ld+json") continue;
-    if (close !== null && close !== undefined && close.index < tag.contentStart) close = undefined;
-    if (close === undefined) {
-      scriptClose.lastIndex = tag.contentStart;
-      close = scriptClose.exec(html);
-    }
-    if (close === null) break;
-    consumed = close.index + close[0].length;
-    const raw = html.slice(tag.contentStart, close.index).trim();
+    const close = scriptEndTag(html, tag.contentStart);
+    if (close === -1) break;
+    const raw = html.slice(tag.contentStart, close).trim();
     if (!raw) continue;
     try {
       jsonLd.push(JSON.parse(raw));

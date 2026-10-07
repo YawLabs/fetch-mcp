@@ -1,87 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { makeTurndown, stripHtmlToText } from "../tools/content.js";
-
-describe("makeTurndown", () => {
-  const td = makeTurndown();
-
-  it("converts basic HTML to markdown", () => {
-    const html = "<h1>Title</h1><p>Hello <strong>world</strong>.</p>";
-    const md = td.turndown(html);
-    expect(md).toContain("# Title");
-    expect(md).toContain("Hello **world**.");
-  });
-
-  it("renders headings with atx style", () => {
-    const html = "<h1>One</h1><h2>Two</h2><h3>Three</h3>";
-    const md = td.turndown(html);
-    expect(md).toContain("# One");
-    expect(md).toContain("## Two");
-    expect(md).toContain("### Three");
-  });
-
-  it("renders unordered lists with dash bullets", () => {
-    const html = "<ul><li>apple</li><li>banana</li><li>cherry</li></ul>";
-    const md = td.turndown(html);
-    expect(md).toMatch(/^-\s+apple/m);
-    expect(md).toMatch(/^-\s+banana/m);
-    expect(md).toMatch(/^-\s+cherry/m);
-  });
-
-  it("renders fenced code blocks", () => {
-    const html = "<pre><code>const x = 1;\nconsole.log(x);</code></pre>";
-    const md = td.turndown(html);
-    expect(md).toMatch(/```[\s\S]*const x = 1;[\s\S]*```/);
-  });
-
-  it("preserves links", () => {
-    const html = '<p>See <a href="https://example.com">example</a>.</p>';
-    const md = td.turndown(html);
-    expect(md).toContain("[example](https://example.com)");
-  });
-
-  it("strips script tags", () => {
-    const html = "<p>before</p><script>alert('xss')</script><p>after</p>";
-    const md = td.turndown(html);
-    expect(md).not.toContain("alert");
-    expect(md).toContain("before");
-    expect(md).toContain("after");
-  });
-
-  it("strips style tags", () => {
-    const html = "<style>body{color:red}</style><p>visible</p>";
-    const md = td.turndown(html);
-    expect(md).not.toContain("color:red");
-    expect(md).toContain("visible");
-  });
-
-  it("strips noscript, iframe, svg, canvas", () => {
-    const html = [
-      "<noscript>no-js</noscript>",
-      "<iframe src='x'></iframe>",
-      "<svg><circle/></svg>",
-      "<canvas></canvas>",
-      "<p>kept</p>",
-    ].join("");
-    const md = td.turndown(html);
-    expect(md).not.toContain("no-js");
-    expect(md).not.toContain("iframe");
-    expect(md).toContain("kept");
-  });
-
-  it("strips NAV, FOOTER, ASIDE", () => {
-    const html = [
-      "<nav>menu items</nav>",
-      "<main><p>main content</p></main>",
-      "<aside>sidebar</aside>",
-      "<footer>copyright</footer>",
-    ].join("");
-    const md = td.turndown(html);
-    expect(md).not.toContain("menu items");
-    expect(md).not.toContain("sidebar");
-    expect(md).not.toContain("copyright");
-    expect(md).toContain("main content");
-  });
-});
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { CANCELLED } from "../http.js";
+import { createFetchServer } from "../server.js";
+import { stripHtmlToText } from "../tools/content.js";
 
 describe("stripHtmlToText", () => {
   it("removes all HTML tags", () => {
@@ -153,7 +75,6 @@ describe("stripHtmlToText -- end tags and sanitization (CodeQL #1-#5, #8)", () =
     ["a newline before the >", "a<script>secret()</script\n>b"],
     ["upper case and junk in the end tag", "a<SCRIPT>secret()</Script foo>b"],
     ["a slash in the end tag", "a<script>secret()</script/>b"],
-    ["attributes holding a quoted >", `a<script data-x="</b>">secret()</script>b`],
   ])("drops script content when the end tag has %s", (_, html) => {
     expect(stripHtmlToText(html)).toBe("ab");
   });
@@ -166,14 +87,6 @@ describe("stripHtmlToText -- end tags and sanitization (CodeQL #1-#5, #8)", () =
     expect(stripHtmlToText("a<script>secret(); <p>still script</p>")).toBe("a");
   });
 
-  it("does not end a script on a longer tag name that starts with script", () => {
-    expect(stripHtmlToText("a<script>x = '</scripts>'; secret()</script>b")).toBe("ab");
-  });
-
-  it("keeps the content of an element whose name only starts with script", () => {
-    expect(stripHtmlToText("<scripts>kept</scripts>")).toBe("kept");
-  });
-
   it("does not splice a new tag together out of the pieces around a removed one", () => {
     // A browser reads `<scr<script>` as one tag named "scr<script", so what
     // follows is page text there too; the point is that no `<script` survives.
@@ -182,14 +95,6 @@ describe("stripHtmlToText -- end tags and sanitization (CodeQL #1-#5, #8)", () =
 
   it("drops comments, including unclosed ones and the --!> and <!--> forms", () => {
     expect(stripHtmlToText("a<!-- secret -->b<!-- secret --!>c<!-->d<!--->e<!-- secret")).toBe("abcde");
-  });
-
-  it("drops a doctype, processing instructions and CDATA", () => {
-    expect(stripHtmlToText("<!DOCTYPE html><?xml version='1.0'?>a<![CDATA[secret]]>b")).toBe("ab");
-  });
-
-  it("keeps a < that does not start a tag", () => {
-    expect(stripHtmlToText("a < b and c<3")).toBe("a < b and c<3");
   });
 
   it("drops a tag cut off by the end of the input", () => {
@@ -202,11 +107,38 @@ describe("stripHtmlToText -- end tags and sanitization (CodeQL #1-#5, #8)", () =
 
   it("decodes entities once, after the tags are gone", () => {
     expect(stripHtmlToText("a &amp;lt;b&amp;gt; c")).toBe("a &lt;b&gt; c");
-    expect(stripHtmlToText("&lt;script&gt;alert(1)&lt;/script&gt;")).toBe("<script>alert(1)</script>");
   });
 
   it("decodes numeric entities", () => {
     expect(stripHtmlToText("it&#8217;s &#x2014; &#X41;")).toBe("it\u2019s \u2014 A");
+  });
+});
+
+// The regex chain these replaced already passed each case here; they pin
+// that the tokenizer keeps it, and are not part of the CodeQL fixes above.
+describe("stripHtmlToText -- behaviour kept from the regex version", () => {
+  it("drops script content when the start tag has an attribute holding a quoted >", () => {
+    expect(stripHtmlToText(`a<script data-x="</b>">secret()</script>b`)).toBe("ab");
+  });
+
+  it("does not end a script on a longer tag name that starts with script", () => {
+    expect(stripHtmlToText("a<script>x = '</scripts>'; secret()</script>b")).toBe("ab");
+  });
+
+  it("keeps the content of an element whose name only starts with script", () => {
+    expect(stripHtmlToText("<scripts>kept</scripts>")).toBe("kept");
+  });
+
+  it("drops a doctype, processing instructions and CDATA", () => {
+    expect(stripHtmlToText("<!DOCTYPE html><?xml version='1.0'?>a<![CDATA[secret]]>b")).toBe("ab");
+  });
+
+  it("keeps a < that does not start a tag", () => {
+    expect(stripHtmlToText("a < b and c<3")).toBe("a < b and c<3");
+  });
+
+  it("decodes an escaped tag to text, not markup", () => {
+    expect(stripHtmlToText("&lt;script&gt;alert(1)&lt;/script&gt;")).toBe("<script>alert(1)</script>");
   });
 
   it("keeps indices straight around characters whose lowercase form is longer", () => {
@@ -356,9 +288,11 @@ describe("stripHtmlToText -- foreign content, round 3", () => {
   });
 
   it("treats annotation-xml as an integration point only with an HTML encoding", () => {
+    // The scan does not read the encoding: a comment that runs across the
+    // script's HTML end tag desynchronizes the readings, and the rest is hidden.
     expect(
       stripHtmlToText("<math><annotation-xml><script><!--</script>SECRET--></script></annotation-xml></math>ok"),
-    ).toBe("ok");
+    ).toBe("");
     expect(
       stripHtmlToText(
         `<math><annotation-xml encoding="text/html"><style>.secret{}</style>Shown</annotation-xml></math>`,
@@ -507,9 +441,8 @@ describe("stripHtmlToText -- island tracking, round 8", () => {
   });
 
   it("still reads ordinary SVG, MathML, templates and selects", () => {
-    expect(stripHtmlToText("<svg><title>Chart</title><g><text>Label</text></g></svg><p>after</p>")).toBe(
-      "ChartLabelafter",
-    );
+    // An SVG <title> is a tooltip, and hidden like every raw-text or RCDATA name in an island.
+    expect(stripHtmlToText("<svg><title>Chart</title><g><text>Label</text></g></svg><p>after</p>")).toBe("Labelafter");
     expect(stripHtmlToText("<template><math><mi><mrow></template><p>Main</p>")).toBe("Main");
     expect(stripHtmlToText("<select><option>One</option><option>Two</option></select><title>T</title>x")).toBe(
       "OneTwoT\nx",
@@ -556,5 +489,204 @@ describe("stripHtmlToText -- end tags inside SVG CDATA", () => {
 
   it("closes again once the CDATA has ended", () => {
     expect(stripHtmlToText("<svg><script><![CDATA[ x ]]></script></svg>after")).toBe("after");
+  });
+
+  it("finds CDATA ends in linear time", () => {
+    // Each `<![CDATA[` searched to the end of the input for a `]]>` that is not there.
+    const t0 = performance.now();
+    stripHtmlToText(`<svg>${"<![CDATA[>".repeat(400_000)}`);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("stripHtmlToText -- self-closed raw-text elements in plain SVG / MathML, round 10", () => {
+  it.each([
+    ["svg style", "<svg><style/><text>Label</text></svg>after", "Labelafter"],
+    ["svg script", "<svg viewBox='0 0 1 1'><script href=a.js /><path d=x/></svg><p>after</p>", "after"],
+    ["math noscript", "<math><noscript/><mi>x</mi></math>after", "xafter"],
+  ])("reads it as an empty element, not raw text to the end of the page (%s)", (_, html, text) => {
+    expect(stripHtmlToText(html)).toBe(text);
+  });
+
+  it.each([
+    ["after a breakout", "<svg><p><style/>SECRET"],
+    ["after an end tag that can leave the island", "<div><svg></div><style/>SECRET"],
+    ["after an unmatched end tag", "<svg></g><script/>SECRET"],
+    ["in an integration point", "<svg><desc><style/>SECRET"],
+    ["in a MathML text integration point", "<math><mi><script/>SECRET"],
+    ["back at the root after an integration point", "<svg><desc><p></desc><style/>SECRET"],
+    ["in an svg inside a select", "<select><svg><style/>SECRET"],
+    ["in a nested svg", "<svg><foreignObject><svg><style/>SECRET"],
+    ["after a font", "<svg><font color=red><style/>SECRET"],
+  ])("still hides what may be raw text to the end of the page: %s", (_, html) => {
+    expect(stripHtmlToText(html)).not.toContain("SECRET");
+  });
+});
+
+describe("stripHtmlToText -- end tags measured once", () => {
+  it("measures a shared raw-text end tag inside a <select> once", () => {
+    // Every <style> opener re-read the end tag's attributes, which never reach a `>`.
+    const t0 = performance.now();
+    stripHtmlToText(`<select>${"<style>".repeat(20_000)}</style ${"a ".repeat(50_000)}`);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("measures each end tag once when openers of different names alternate", () => {
+    // A single memo slot: <style> and <iframe> evicted each other's end tag,
+    // so every opener re-read an unclosed quoted attribute to the end (14 s).
+    const t0 = performance.now();
+    const k = 16_000;
+    expect(stripHtmlToText(`<select>${"<style><iframe>".repeat(k)}</style x="</iframe y="${"a".repeat(15 * k)}`)).toBe(
+      "",
+    );
+    const five = "<style><iframe><noscript><noembed><noframes>";
+    const ends = `</style a="</iframe b="</noscript c="</noembed d="</noframes e="`;
+    expect(stripHtmlToText(`<select>${five.repeat(k)}${ends}${"a".repeat(15 * k)}`)).toBe("");
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("fetch_html_to_markdown -- hostile pages, through the tool (Launch-critical #22)", () => {
+  // Through 0.8.3 the markdown step parsed the page in one synchronous call:
+  // a 1,200-deep page threw a stack overflow, and neither the
+  // budget nor cancellation could stop a slow parse.
+  let fixture: Server;
+  let base: string;
+  let page = "";
+
+  beforeAll(async () => {
+    fixture = createServer((_req, res) => {
+      res.setHeader("content-type", "text/html");
+      res.end(page);
+    });
+    await new Promise<void>((done) => fixture.listen(0, "127.0.0.1", () => done()));
+    base = `http://127.0.0.1:${(fixture.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    fixture.closeAllConnections();
+    await new Promise<void>((done) => fixture.close(() => done()));
+  });
+
+  const call = async (input: Record<string, unknown>, signal: AbortSignal = new AbortController().signal) => {
+    const tools = (
+      createFetchServer({ allowPrivateHosts: true }) as unknown as {
+        _registeredTools: Record<
+          string,
+          {
+            handler: (
+              input: unknown,
+              extra: { signal: AbortSignal },
+            ) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+          }
+        >;
+      }
+    )._registeredTools;
+    return tools.fetch_html_to_markdown!.handler(
+      { url: `${base}/page`, allow_private_hosts: true, ...input },
+      { signal },
+    );
+  };
+
+  it("returns the depth error for a 1,200-deep page instead of throwing", async () => {
+    page = `<html><body>${"<div>".repeat(1200)}x${"</div>".repeat(1200)}</body></html>`;
+    const out = await call({});
+    expect(out.isError).toBe(true);
+    expect(out.content[0]!.text).toContain("page nests elements");
+  });
+
+  it("a call cancelled while it converts a hostile page returns the cancelled error", async () => {
+    page = `<html><body>${"<ul><li>".repeat(20_000)}x</body></html>`;
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 300);
+    const t0 = performance.now();
+    const out = await call({}, cancel.signal);
+    expect(out.isError).toBe(true);
+    expect(out.content[0]!.text).toContain(CANCELLED);
+    expect(performance.now() - t0).toBeLessThan(2_000);
+  });
+
+  it("the conversion stops at timeout_ms", async () => {
+    page = `<html><body>${"<ul><li>".repeat(20_000)}x</body></html>`;
+    const t0 = performance.now();
+    const out = await call({ timeout_ms: 500 });
+    expect(out.isError).toBe(true);
+    expect(out.content[0]!.text).toContain("exceeded its 500 ms budget");
+    expect(performance.now() - t0).toBeLessThan(2_500);
+  });
+});
+
+describe("stripHtmlToText -- a <template> inside a <select>", () => {
+  it.each([
+    ["a style", "<select><template><style></template>SECRET</style>SECRET2</template>after"],
+    [
+      "a self-closed style",
+      "<select><template><Style title=\"x\"/></template><script x='</style>'>SECRET</template>after",
+    ],
+    ["an iframe", "<select><template><iframe></template>SECRET</iframe>SECRET2</template>after"],
+  ])("reads %s in the template's content as raw text, as a browser does", (_, html) => {
+    const out = stripHtmlToText(html);
+    expect(out).not.toContain("SECRET");
+    expect(out).toBe("after");
+  });
+
+  it("goes back to the select's reading when the template closes", () => {
+    expect(stripHtmlToText("<select><template></template><style><template></style>SECRET")).toBe("");
+    expect(stripHtmlToText("<select><option>A</option><template>x</template><option>B</option></select>C")).toBe("ABC");
+  });
+});
+
+describe("stripHtmlToText -- raw-text readings in an island meet again, round 12", () => {
+  it.each([
+    ["a comment in an SVG <title> after a breakout", "<svg><b><title><!--</title><script>-->SECRET</script>"],
+    ["a quoted attribute in an SVG <title>", '<svg><b><title><a x="</title><script>">SECRET</script>'],
+    ["a comment in a MathML <xmp>", "<math><span><xmp><!--</xmp><template>-->SECRET"],
+    ["a title closed again after the swallowed tags", "<svg><b><title><!--</title><script>--></title>SECRET</script>"],
+    ["a tag across the end of CDATA", '<svg><script><![CDATA[ x> <a y="]]><script>">SECRET'],
+    ["a tag across the end of CDATA in plain SVG", '<svg><g><![CDATA[ x> <a y="]]><script>">SECRET'],
+    [
+      "two scripts whose raw readings end apart",
+      "<svg><script><!--x--!><b><script><!--</script><style>--></script></script>SECRET</style>",
+    ],
+  ])("hides the rest: %s", (_, html) => {
+    expect(stripHtmlToText(html)).not.toContain("SECRET");
+  });
+
+  it.each([
+    ["a table", "<svg><table><select></svg><svg><script/>SECRET"],
+    ["a <p>", "<svg><p><select></svg><svg><script/>SECRET"],
+    ["a <b>", "<svg><b><select></svg><svg><script/>SECRET"],
+    ["a MathML table", "<math><table><select></math><svg><script/>SECRET"],
+    ["a foreignObject", "<svg><foreignObject><select></foreignObject></svg><svg><script/>SECRET"],
+    ["a desc, then a style", "<svg><desc><select></desc></svg><svg><style/>SECRET"],
+  ])("tracks a <select> opened in an island after %s", (_, html) => {
+    expect(stripHtmlToText(html)).not.toContain("SECRET");
+  });
+
+  it.each([
+    ["a <title> after it", '<svg><select></svg><title><a x="</title><script>">SECRET</script>'],
+    ["a second <select>", "<svg><select></svg><select><style><template></style>SECRET"],
+    ["a style in a real select", '<select><style><a x="</style><script>">SECRET</script>'],
+  ])("reads a select that may not be one both ways: %s", (_, html) => {
+    expect(stripHtmlToText(html)).not.toContain("SECRET");
+  });
+
+  it("still reads SVG with CDATA styles and scripts, and closed titles", () => {
+    expect(
+      stripHtmlToText(
+        "<svg><style><![CDATA[.a>b{fill:red}]]></style><script><![CDATA[if(a<b){x='y>'}]]></script><text>L</text></svg><p>after</p>",
+      ),
+    ).toBe("Lafter");
+    expect(stripHtmlToText("<svg><title>T1</title><g><title>T2</title><text>L</text></g></svg>after")).toBe("Lafter");
+    expect(stripHtmlToText("<svg><![CDATA[a<b]]><text>L</text></svg>after")).toBe("Lafter");
+    expect(stripHtmlToText("<svg><style><!--</style><p>HIDDEN</p>--></style></svg>ok")).toBe("ok");
+  });
+
+  it("stays linear on many raw-text openers in an island", () => {
+    const t0 = performance.now();
+    stripHtmlToText(`<svg><b>${"<style>x</style><title>y</title><script>z</script>".repeat(30_000)}`);
+    stripHtmlToText(`<select>${"<style><iframe>".repeat(50_000)}`);
+    stripHtmlToText(`<svg><select></svg>${"<title><xmp>".repeat(50_000)}`);
+    expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });

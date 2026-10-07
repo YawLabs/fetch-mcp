@@ -220,4 +220,32 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
     },
     TIMEOUT_MS,
   );
+
+  it(
+    "fetch_html_to_markdown stops a hostile page at timeout_ms, and the server keeps answering (Launch-critical #22)",
+    async () => {
+      const s = await startOnOam({ FETCH_MCP_ALLOW_PRIVATE_HOSTS: "1" });
+      try {
+        // 20,000 unclosed <ul><li>: 51 s of synchronous parsing through 0.8.3.
+        const hostile = `<html><body>${"<ul><li>".repeat(20_000)}x</body></html>`;
+        handler = (req, res) => {
+          res.setHeader("content-type", "text/html");
+          res.end(req.url === "/hostile" ? hostile : "fine");
+        };
+        const out = await s.call("fetch_html_to_markdown", {
+          url: `${base}/hostile`,
+          allow_private_hosts: true,
+          timeout_ms: 1000,
+        });
+        expect(out.isError).toBe(true);
+        expect(out.text).toContain("exceeded its 1000 ms budget");
+        expect(out.ms).toBeLessThan(1000 + 2000);
+        const next = await s.call("http_get", { url: `${base}/next`, allow_private_hosts: true });
+        expect(next.text).toContain("fine");
+      } finally {
+        s.close();
+      }
+    },
+    TIMEOUT_MS,
+  );
 });

@@ -37,16 +37,15 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@mixmark-io/domino": "2.2.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "fast-xml-parser": "^5.7.1",
-    "turndown": "^7.2.1",
     "undici": "^8.9.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.11",
     "@types/node": "^26.0.1",
-    "@types/turndown": "^5.0.5",
     "esbuild": "^0.28.1",
     "postject": "^1.0.0-alpha.6",
     "tsup": "^8.4.0",

@@ -1,7 +1,7 @@
 /**
  * Small, pragmatic HTML utilities shared by the reader / meta / links tools.
- * We intentionally avoid pulling in a full DOM parser — the turndown library
- * used by the markdown path already carries that weight, and these helpers
+ * We intentionally avoid pulling in a full DOM parser — the markdown path
+ * (src/markdown.ts, domino plus vendored Turndown) already carries that weight, and these helpers
  * only need to survive real-world HTML well enough to find head metadata,
  * anchor tags, and article bodies.
  *
@@ -10,7 +10,26 @@
  *     naive `<tag[^>]+>` regex
  *   - article / main / section can nest, so non-greedy regex picks the wrong
  *     closing tag; we pair openers and closers in one bracket-matching pass
+ *   - a `<article>` written inside a script, a comment or other raw text is
+ *     not a tag: callers that slice content out of a page pass a `TagMask`
+ *     (`visibleTagMask()` in content.ts), and only the tags it marks count
  */
+
+/**
+ * `mask[i] === 1` when a start or end tag that a browser reads as rendered
+ * markup begins at offset `i`; 0 inside comments, raw text (script, style,
+ * ...), template content and other hidden extents, and 0 for a raw-text or
+ * RCDATA tag (`<title>`, `<script>`) whose content a browser may read as
+ * markup there (inside `<svg>` / `<math>`, a `<title>` in a `<select>`). Built by
+ * `visibleTagMask()` in content.ts, from the same scan as `stripHtmlToText`.
+ */
+export type TagMask = Uint8Array;
+
+/**
+ * A tag name ends, as in a browser, at whitespace, `/`, `>` or the end of the
+ * input: `<article-list>` and `<a.b>` are other elements, which `\b` matched.
+ */
+const NAME_END = "(?=[\\t\\n\\f\\r />]|$)";
 
 /**
  * Parse a single tag's attribute text ("name=\"foo\" content=\"a > b\"")
@@ -107,14 +126,15 @@ export interface FoundTag {
  * position + attribute text. Tolerates `>` inside quoted attribute values.
  * Yields self-closing tags too so callers can treat e.g. <link .../> naturally.
  */
-export function* findTags(html: string, tagName: string): Generator<FoundTag> {
+export function* findTags(html: string, tagName: string, mask?: TagMask): Generator<FoundTag> {
   const name = tagName.toLowerCase();
-  const pattern = new RegExp(`<${name}\\b`, "gi");
+  const pattern = new RegExp(`<${name}${NAME_END}`, "gi");
   pattern.lastIndex = 0;
   for (;;) {
     const m = pattern.exec(html);
     if (m === null) break;
     const start = m.index;
+    if (mask !== undefined && mask[start] !== 1) continue;
     const end = findTagEnd(html, start + m[0].length);
     if (end === null) return;
     const rawAttrs = html.slice(start + m[0].length, end.pos);
@@ -179,56 +199,77 @@ export function findTagEnd(html: string, from: number): TagEnd | null {
   }
 }
 
-export interface BalancedTag {
-  /** Offset of the opening tag's `<`. */
-  start: number;
-  /** Offset just past the opening tag's `>`. */
-  contentStart: number;
-  /** Offset of the matching close tag's `<`, or -1 when the element never closes. */
-  contentEnd: number;
-  /** The opening tag's attribute text, as `findTags` gives it. */
-  attrsText: string;
-  /** The opening tag ended in `/>`. */
-  selfClosing: boolean;
-}
+/**
+ * Called by `forEachBalancedTag` for each pair as it closes. `contentEnd` is
+ * the offset of the close tag's `<` (`contentStart` for a self-closing
+ * opener); `depth` is how many openers of the name enclose the pair. Return
+ * true to stop the walk.
+ */
+export type BalancedTagVisitor = (
+  start: number,
+  contentStart: number,
+  contentEnd: number,
+  depth: number,
+) => boolean | undefined;
 
 /**
- * Every `<tagName>` opener paired with its matching close, in one pass over
- * the input: openers and closers are matched like brackets, which pairs each
- * opener with the same close a depth-counting walk from it would find. Walking
- * from each opener separately made a page of many unclosed openers quadratic.
- * An opening tag cut off by the end of the input ends the scan, as it swallows
- * everything after it in a browser.
+ * Pair every `<tagName>` opener with its matching close in one pass over the
+ * input, matching openers and closers like brackets -- the close a
+ * depth-counting walk from each opener would find; walking from each opener
+ * separately made a page of many unclosed openers quadratic. Each pair is
+ * reported as it closes, a self-closing opener at once, so the pairs at
+ * depth 0 come in document order; an opener that never closes is never
+ * reported, and neither is anything inside it. The open openers are held as
+ * offsets in a typed array and nothing is kept per pair: materializing a
+ * record per opener took 2.8 GB for 100 MiB of `<div>`.
+ *
+ * A tag cut off by the end of the input ends the walk, as it swallows
+ * everything after it in a browser. An end tag is `</name` followed by
+ * whitespace, `/` or `>`, attributes and all (`</ name>` is a bogus comment).
+ * With `mask`, a tag counts only where the mask marks it, so an `<article>`
+ * inside a `<script>` or a comment neither opens nor closes anything.
  */
-export function matchBalancedTags(html: string, tagName: string): BalancedTag[] {
+export function forEachBalancedTag(
+  html: string,
+  tagName: string,
+  mask: TagMask | undefined,
+  visit: BalancedTagVisitor,
+): void {
   const name = tagName.toLowerCase();
-  const re = new RegExp(`<${name}\\b|</\\s*${name}\\s*>`, "gi");
-  const all: BalancedTag[] = [];
-  const open: BalancedTag[] = [];
+  const re = new RegExp(`</?${name}${NAME_END}`, "gi");
+  let open = new Int32Array(64);
+  let depth = 0;
   for (;;) {
     const m = re.exec(html);
-    if (m === null) break;
-    if (m[0][1] === "/") {
-      const opener = open.pop();
-      if (opener) opener.contentEnd = m.index;
-      continue;
-    }
+    if (m === null) return;
+    if (mask !== undefined && mask[m.index] !== 1) continue;
     const end = findTagEnd(html, m.index + m[0].length);
-    if (end === null) break;
-    const rawAttrs = html.slice(m.index + m[0].length, end.pos);
-    const tag: BalancedTag = {
-      start: m.index,
-      contentStart: end.pos + 1,
-      contentEnd: -1,
-      attrsText: end.selfClosing ? rawAttrs.slice(0, -1) : rawAttrs,
-      selfClosing: end.selfClosing,
-    };
-    all.push(tag);
-    if (end.selfClosing) tag.contentEnd = tag.contentStart;
-    else open.push(tag);
+    if (end === null) return;
+    // Past the whole tag: `</article x="<article>">` opens nothing.
     re.lastIndex = end.pos + 1;
+    if (m[0][1] === "/") {
+      if (depth === 0) continue;
+      depth--;
+      const start = open[depth]!;
+      // Measured again rather than stored: only an opener that closes pays.
+      const contentStart = findTagEnd(html, start + 1 + name.length)!.pos + 1;
+      if (visit(start, contentStart, m.index, depth) === true) return;
+    } else if (end.selfClosing) {
+      if (visit(m.index, end.pos + 1, end.pos + 1, depth) === true) return;
+    } else {
+      if (depth === open.length) {
+        const grown = new Int32Array(open.length * 2);
+        grown.set(open);
+        open = grown;
+      }
+      open[depth++] = m.index;
+    }
   }
-  return all;
+}
+
+/** The attribute text of an opener `forEachBalancedTag` reported with a close tag (not self-closing). */
+export function balancedTagAttrs(html: string, tagName: string, start: number, contentStart: number): string {
+  return html.slice(start + 1 + tagName.length, contentStart - 1);
 }
 
 /**
@@ -237,10 +278,11 @@ export function matchBalancedTags(html: string, tagName: string): BalancedTag[] 
  * from the first opener: a lazy `<title>([\s\S]*?)</title>` regex retried
  * from every opener, so a page of unclosed `<title>`s was quadratic.
  */
-export function findFirstTagText(html: string, tagName: string): string | undefined {
-  const first = findTags(html, tagName).next();
+export function findFirstTagText(html: string, tagName: string, mask?: TagMask): string | undefined {
+  const first = findTags(html, tagName, mask).next();
   if (first.done) return undefined;
-  const close = new RegExp(`</${tagName.toLowerCase()}\\s*>`, "gi");
+  // The text runs to the first `</name`, as an RCDATA element's does in a browser.
+  const close = new RegExp(`</${tagName.toLowerCase()}${NAME_END}`, "gi");
   close.lastIndex = first.value.contentStart;
   const m = close.exec(html);
   return m === null ? undefined : html.slice(first.value.contentStart, m.index);
@@ -251,23 +293,27 @@ export function findFirstTagText(html: string, tagName: string): string | undefi
  * order they open, outermost only: for `<article><article>inner</article></article>`
  * the result is the outer article's content, which holds the inner tag. A
  * self-closing opener gives "". Stops at the first opener that never closes.
- * Built on `matchBalancedTags`, so it is one linear pass; the depth walk it
+ * Built on `forEachBalancedTag`, so it is one linear pass; the depth walk it
  * replaced re-searched the input from every nested opener.
  */
-export function findBalancedTagContents(html: string, tagName: string): string[] {
+export function findBalancedTagContents(html: string, tagName: string, mask?: TagMask): string[] {
   const results: string[] = [];
-  let outerEnd = 0;
-  for (const tag of matchBalancedTags(html, tagName)) {
-    if (tag.start < outerEnd) continue;
-    if (tag.selfClosing) {
-      results.push("");
-      continue;
-    }
-    if (tag.contentEnd === -1) break;
-    results.push(html.slice(tag.contentStart, tag.contentEnd));
-    outerEnd = tag.contentEnd;
-  }
+  forEachBalancedTag(html, tagName, mask, (_start, contentStart, contentEnd, depth) => {
+    if (depth === 0) results.push(html.slice(contentStart, contentEnd));
+    return undefined;
+  });
   return results;
+}
+
+/** The first of `findBalancedTagContents`, without walking past it. */
+export function firstBalancedTagContent(html: string, tagName: string, mask?: TagMask): string | undefined {
+  let found: string | undefined;
+  forEachBalancedTag(html, tagName, mask, (_start, contentStart, contentEnd, depth) => {
+    if (depth !== 0) return undefined;
+    found = html.slice(contentStart, contentEnd);
+    return true;
+  });
+  return found;
 }
 
 /**
@@ -278,8 +324,9 @@ export function findFirstBalancedTagWhere(
   html: string,
   tagName: string,
   accept: (content: string) => boolean,
+  mask?: TagMask,
 ): string | null {
-  for (const content of findBalancedTagContents(html, tagName)) {
+  for (const content of findBalancedTagContents(html, tagName, mask)) {
     if (accept(content)) return content;
   }
   return null;
