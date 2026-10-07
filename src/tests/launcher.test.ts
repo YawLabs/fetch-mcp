@@ -90,11 +90,11 @@ describe("launcher runtimePlan()", () => {
     // asking what it was already running on. `auto` and `oam` both have to take
     // the shortcut -- `oam` demands oam, and the host already is one.
     //
-    // 0.15.2 pins the floor as inclusive (it IS the supported release), and
-    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.15.2 as a string, so a
+    // 0.18.0 pins the floor as inclusive (it IS the supported release), and
+    // 0.100.0 pins a numeric compare: it sorts BEFORE 0.18.0 as a string, so a
     // compare over the raw text would treat a newer oam as too old.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.15.2", "0.16.0", "0.100.0", "1.0.0", "0.16.0-dev"]) {
+      for (const hostOam of ["0.18.0", "0.19.0", "0.100.0", "1.0.0", "0.19.0-dev"]) {
         expect(runtimePlan({ mode, hostOam, sandbox: false }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
       }
     }
@@ -105,7 +105,7 @@ describe("launcher runtimePlan()", () => {
     // Serving in-process here would silently drop the sandbox the user asked
     // for -- a security downgrade that no other symptom would reveal.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of [undefined, "0.15.2", "1.0.0"]) {
+      for (const hostOam of [undefined, "0.18.0", "1.0.0"]) {
         expect(runtimePlan({ mode, hostOam, sandbox: true }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -117,7 +117,7 @@ describe("launcher runtimePlan()", () => {
     // anything older than the latest release is not what the server is
     // verified on.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.15.1", "0.9.0", "0.8.2", "0.0.1"]) {
+      for (const hostOam of ["0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
         for (const sandbox of [false, true]) {
           expect(runtimePlan({ mode, hostOam, sandbox }), `mode=${mode} hostOam=${hostOam} sandbox=${sandbox}`).toBe(
             "discover",
@@ -141,7 +141,7 @@ describe("launcher runtimePlan()", () => {
     // The sandbox is moot here: Node has no `--permission` to apply.
     for (const sandbox of [false, true]) {
       expect(runtimePlan({ mode: "node", hostOam: undefined, sandbox }), `sandbox=${sandbox}`).toBe("in-process");
-      for (const hostOam of ["0.8.2", "0.15.2", "1.0.0", "dev"]) {
+      for (const hostOam of ["0.8.2", "0.18.0", "1.0.0", "dev"]) {
         expect(runtimePlan({ mode: "node", hostOam, sandbox }), `hostOam=${hostOam} sandbox=${sandbox}`).toBe(
           "handoff-node",
         );
@@ -155,25 +155,25 @@ describe("launcher pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    expect(floor).toEqual([0, 15, 2]);
+    expect(floor).toEqual([0, 18, 0]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug: discovery stopped at the first binary that existed, so an older
     // copy in an earlier location (the installed dir is searched before PATH)
     // hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 15, 2]), at("path-a", [0, 16, 0]), at("path-b", [0, 15, 9])]);
+    const chosen = pickNewest([at("installed", [0, 18, 0]), at("path-a", [0, 19, 0]), at("path-b", [0, 18, 9])]);
     expect(chosen?.path).toBe("path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
-    expect(pickNewest([at("a", [0, 16, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
-    expect(pickNewest([at("first", [0, 15, 2]), at("second", [0, 15, 2])])?.path).toBe("first");
+    expect(pickNewest([at("a", [0, 19, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
+    expect(pickNewest([at("first", [0, 18, 0]), at("second", [0, 18, 0])])?.path).toBe("first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 15, 2])])?.path).toBe("good");
-    expect(pickNewest([at("old", [0, 15, 1]), at("broken", null)])).toBeNull();
+    expect(pickNewest([at("old", [0, 9, 0]), at("broken", null), at("good", [0, 18, 0])])?.path).toBe("good");
+    expect(pickNewest([at("old", [0, 17, 0]), at("broken", null)])).toBeNull();
     expect(pickNewest([])).toBeNull();
   });
 });
@@ -184,13 +184,13 @@ describe("launcher fallbackInProcess()", () => {
   it("serves a fallback in-process on Node, and on an oam host at the floor", () => {
     // The oam case is the sandbox one: a host at the floor only reaches a
     // fallback because FETCH_MCP_SANDBOX=1 sent it to discovery.
-    for (const hostOam of [undefined, "0.15.2", "1.0.0"]) {
+    for (const hostOam of [undefined, "0.18.0", "1.0.0"]) {
       expect(fallbackInProcess(hostOam), `hostOam=${hostOam}`).toBe(true);
     }
   });
 
   it("never serves a fallback in-process on an oam host below the floor, or one with no readable version", () => {
-    for (const hostOam of ["0.15.1", "0.9.0", "0.8.2", "", "dev"]) {
+    for (const hostOam of ["0.17.0", "0.15.2", "0.9.0", "0.8.2", "", "dev"]) {
       expect(fallbackInProcess(hostOam), `hostOam=${hostOam}`).toBe(false);
     }
   });
@@ -355,7 +355,7 @@ function recordedSpawnStdio(run: { stderr: string }): unknown {
  * The version string a host has to claim for the Node running this suite to
  * pass as that host's own oam: hostOamCandidate probes `process.execPath
  * --version` and accepts it only when it agrees with `process.versions.oam`.
- * Posing "0.15.2" on a Node execPath is therefore NOT a candidate (Node says
+ * Posing "0.18.0" on a Node execPath is therefore NOT a candidate (Node says
  * v22.x), which keeps every other test's "nothing to spawn" premise intact;
  * posing Node's own version IS one.
  */
@@ -507,7 +507,7 @@ const IN_CHILD = /LAUNCHER_ARGV1=.*fetch-mcp\.mjs/;
 const SANDBOX_DROPPED =
   /^fetch-mcp: FETCH_MCP_SANDBOX=\S+ was not applied -- .*so the server runs WITHOUT --permission\.$/m;
 const SANDBOX_REMEDY =
-  /^To apply it, install or update oam \(0\.15\.2 or newer\) from https:\/\/oamjs\.org or set OAM_BIN=\/path\/to\/oam; set FETCH_MCP_RUNTIME=oam to make this fatal instead\.$/m;
+  /^To apply it, install or update oam \(0\.18\.0 or newer\) from https:\/\/oamjs\.org or set OAM_BIN=\/path\/to\/oam; set FETCH_MCP_RUNTIME=oam to make this fatal instead\.$/m;
 
 /**
  * An environment with no oam anywhere: HOME and LOCALAPPDATA point at an
@@ -545,7 +545,7 @@ describe("launcher on an oam host", () => {
     async () => {
       const envs: Record<string, string>[] = [{}, { FETCH_MCP_RUNTIME: "oam" }];
       for (const extraEnv of envs) {
-        const run = await runLauncher("0.15.2", extraEnv);
+        const run = await runLauncher("0.18.0", extraEnv);
         expect(servedInProcess(run), `${JSON.stringify(extraEnv)} -> ${JSON.stringify(run)}`).toBe(true);
         expect(run.stderr).toMatch(IN_LAUNCHER_PROCESS);
       }
@@ -556,7 +556,7 @@ describe("launcher on an oam host", () => {
   it.skipIf(!buildAvailable)(
     "still spawns under FETCH_MCP_SANDBOX=1, so --permission is not dropped",
     async () => {
-      const run = await runLauncher("0.15.2", { FETCH_MCP_SANDBOX: "1" });
+      const run = await runLauncher("0.18.0", { FETCH_MCP_SANDBOX: "1" });
       expect(servedInProcess(run), `the sandbox must force a spawn, got ${JSON.stringify(run)}`).toBe(false);
       expect(run.code).not.toBe(0);
       // A spawned child failing, not the launcher diagnosing: every launcher
@@ -576,7 +576,7 @@ describe("launcher on an oam host", () => {
       // oam PATH holds and serves through it -- so assert the shape, not the
       // outcome. (The stdout==version heuristic read the served-by-child case as
       // a shortcut and flaked a release run.)
-      const run = await runLauncher("0.15.1");
+      const run = await runLauncher("0.17.0");
       expect(run.stderr, `a below-floor host must not shortcut, got ${JSON.stringify(run)}`).toMatch(IN_CHILD);
       expect(run.stderr).not.toMatch(IN_LAUNCHER_PROCESS);
     },
@@ -690,7 +690,7 @@ describe("launcher on an oam host", () => {
       // OAM), and the MCP session completes through the pipes. The child is
       // the Node running this suite, posing as oam; SERVE_AS_OAM records the
       // oam-shaped argv and translates it so Node can serve.
-      const session = await serveLauncher("0.15.2", { FETCH_MCP_SANDBOX: "1" }, SERVE_AS_OAM);
+      const session = await serveLauncher("0.18.0", { FETCH_MCP_SANDBOX: "1" }, SERVE_AS_OAM);
       expect(session.answered, JSON.stringify(session)).toEqual([1, 2]);
       expect(session.exitedOnItsOwn, JSON.stringify(session)).toBe(false);
       const args = recordedSpawnArgs(session);
@@ -742,11 +742,11 @@ describe("launcher on an oam host", () => {
     "does not mistake a host whose binary reports a different version for its own oam",
     async () => {
       // The guard that keeps the case above honest: a wrapper on execPath, or
-      // a Node posing as "0.15.2", is not an oam that can spawn a sandboxed
+      // a Node posing as "0.18.0", is not an oam that can spawn a sandboxed
       // child. With nothing else to spawn, that host falls back in-process
       // and says so.
       const run = await runLauncher(
-        "0.15.2",
+        "0.18.0",
         isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }),
         RECORD_SPAWN_ARGS,
       );
@@ -789,7 +789,7 @@ describe("launcher with no usable oam", () => {
       expect(run.code, JSON.stringify(run)).toBe(0);
       expect(run.stdout.trim(), "the Node child must still serve").toBe(PACKAGE_VERSION);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.15\.2, and no newer oam was found; running on .*node/,
+        /this process is oam 0\.9\.0, older than 0\.18\.0, and no newer oam was found; running on .*node/,
       );
       // The OAM_BIN note names no target: Node has not been looked for at
       // that point, and the handoff line above names it once it has been
@@ -818,10 +818,13 @@ describe("launcher with no usable oam", () => {
   it.skipIf(!buildAvailable)(
     "hands FETCH_MCP_RUNTIME=node off to Node even on a supported oam host",
     async () => {
-      const run = await runLauncher("0.15.2", isolated({ FETCH_MCP_RUNTIME: "node" }));
+      // The host sits AT the floor, so this exercises the "node was asked for"
+      // branch, not the below-floor handoff: no below-floor reason may appear.
+      const run = await runLauncher("0.18.0", isolated({ FETCH_MCP_RUNTIME: "node" }));
       expect(run.code, JSON.stringify(run)).toBe(0);
       expect(run.stdout.trim()).toBe(PACKAGE_VERSION);
       expect(run.stderr).toMatch(IN_CHILD);
+      expect(run.stderr).not.toMatch(/older than \d+\.\d+\.\d+/);
     },
     TIMEOUT_MS,
   );
@@ -829,11 +832,11 @@ describe("launcher with no usable oam", () => {
   it.skipIf(!buildAvailable)(
     "under FETCH_MCP_SANDBOX=1, a supported oam host with nothing to spawn serves in-process, as it always has",
     async () => {
-      const run = await runLauncher("0.15.2", isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }));
+      const run = await runLauncher("0.18.0", isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }));
       expect(run.code, JSON.stringify(run)).toBe(0);
       expect(run.stdout.trim()).toBe(PACKAGE_VERSION);
       expect(run.stderr).toMatch(IN_LAUNCHER_PROCESS);
-      expect(run.stderr).toMatch(/^fetch-mcp: OAM_BIN=.*does not exist; using this oam 0\.15\.2 process instead\.$/m);
+      expect(run.stderr).toMatch(/^fetch-mcp: OAM_BIN=.*does not exist; using this oam 0\.18\.0 process instead\.$/m);
     },
     TIMEOUT_MS,
   );
@@ -842,13 +845,13 @@ describe("launcher with no usable oam", () => {
     "under FETCH_MCP_SANDBOX=1 and FETCH_MCP_RUNTIME=oam, nothing to spawn is fatal even on a supported oam host",
     async () => {
       const run = await runLauncher(
-        "0.15.2",
+        "0.18.0",
         isolated({ FETCH_MCP_SANDBOX: "1", FETCH_MCP_RUNTIME: "oam", OAM_BIN: MISSING_OAM }),
       );
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim(), "nothing may be served").toBe("");
       expect(run.stderr).toMatch(
-        /FETCH_MCP_RUNTIME=oam but no usable oam \(0\.15\.2 or newer\) was found, and FETCH_MCP_SANDBOX=\S+ needs one\./,
+        /FETCH_MCP_RUNTIME=oam but no usable oam \(0\.18\.0 or newer\) was found, and FETCH_MCP_SANDBOX=\S+ needs one\./,
       );
       // The advice must not loop back: plain "use FETCH_MCP_RUNTIME=node"
       // would drop the sandbox the user just asked for without saying so.
@@ -867,7 +870,7 @@ describe("launcher with no usable oam", () => {
       const run = await runLauncher("0.9.0", isolated({ FETCH_MCP_RUNTIME: "oam", OAM_BIN: MISSING_OAM }));
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stderr).toMatch(
-        /^fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam \(0\.15\.2 or newer\) was found\.$/m,
+        /^fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam \(0\.18\.0 or newer\) was found\.$/m,
       );
       expect(run.stderr).toMatch(/, or use FETCH_MCP_RUNTIME=node\.$/m);
       expect(run.stderr).not.toMatch(/SANDBOX/);
@@ -878,16 +881,16 @@ describe("launcher with no usable oam", () => {
   it.skipIf(!buildAvailable)(
     "under FETCH_MCP_SANDBOX=1, a supported oam host with nothing to spawn serves in-process and says so",
     async () => {
-      const run = await runLauncher("0.15.2", isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }));
+      const run = await runLauncher("0.18.0", isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: MISSING_OAM }));
       expect(run.code, JSON.stringify(run)).toBe(0);
       expect(run.stdout.trim()).toBe(PACKAGE_VERSION);
       expect(run.stderr).toMatch(IN_LAUNCHER_PROCESS);
-      expect(run.stderr).toMatch(/^fetch-mcp: OAM_BIN=.*does not exist; using this oam 0\.15\.2 process instead\.$/m);
+      expect(run.stderr).toMatch(/^fetch-mcp: OAM_BIN=.*does not exist; using this oam 0\.18\.0 process instead\.$/m);
       // The downgrade is never silent; the line explains itself on a host
       // that IS an oam ("fresh"), says how to get the sandbox applied, and
       // names the way to make its absence fatal.
       expect(run.stderr).toMatch(SANDBOX_DROPPED);
-      expect(run.stderr).toMatch(/a fresh oam \(0\.15\.2 or newer\) is needed to apply it and none could be spawned/);
+      expect(run.stderr).toMatch(/a fresh oam \(0\.18\.0 or newer\) is needed to apply it and none could be spawned/);
       expect(run.stderr).toMatch(SANDBOX_REMEDY);
     },
     TIMEOUT_MS,
@@ -957,7 +960,7 @@ describe("launcher with no usable oam", () => {
       // RUNTIME=node is the ONLY obstacle to serving. A below-floor host
       // (covered above) cannot serve here, so the hint is empty.
       const noNode = mkdtempSync(join(tmpdir(), "fetch-mcp-launcher-nopath-"));
-      const run = await runLauncher("0.15.2", {
+      const run = await runLauncher("0.18.0", {
         ...isolated(),
         PATH: noNode,
         OAM_BIN: join(noNode, "oam.exe"),
@@ -966,7 +969,7 @@ describe("launcher with no usable oam", () => {
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim(), "nothing may be served").toBe("");
       expect(run.stderr).toMatch(/no Node was found on PATH/);
-      expect(run.stderr).toMatch(/or remove FETCH_MCP_RUNTIME=node to serve on this oam 0\.15\.2\./);
+      expect(run.stderr).toMatch(/or remove FETCH_MCP_RUNTIME=node to serve on this oam 0\.18\.0\./);
     },
     TIMEOUT_MS,
   );
@@ -989,7 +992,7 @@ describe("launcher with no usable oam", () => {
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim(), "nothing may be served").toBe("");
       expect(run.stderr).toMatch(
-        /FETCH_MCP_RUNTIME=oam but no usable oam \(0\.15\.2 or newer\) was found, and FETCH_MCP_SANDBOX=1 needs one\./,
+        /FETCH_MCP_RUNTIME=oam but no usable oam \(0\.18\.0 or newer\) was found, and FETCH_MCP_SANDBOX=1 needs one\./,
       );
       expect(run.stderr).toMatch(
         /or drop FETCH_MCP_SANDBOX=1 and use FETCH_MCP_RUNTIME=node \(Node cannot apply the sandbox\)\./,
@@ -1023,7 +1026,7 @@ describe("launcher with no usable oam", () => {
         .find((l) => l.startsWith("fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam"));
       expect(fatalLine, JSON.stringify(run)).toBeDefined();
       expect(fatalLine, `fatal line must be the plain RUNTIME=oam opening: ${fatalLine}`).toMatch(
-        /^fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam \(0\.15\.2 or newer\) was found\.$/,
+        /^fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam \(0\.18\.0 or newer\) was found\.$/,
       );
       expect(fatalLine, `loop-aware text must not appear in the fatal: ${fatalLine}`).not.toMatch(
         /drop FETCH_MCP_SANDBOX/,
@@ -1056,7 +1059,7 @@ describe("launcher with no usable oam", () => {
       // the failure case -- either way, it's the wrong place.
       expect(run.stderr).toMatch(/^fetch-mcp: failed to launch oam at .*\)\.$/m);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.15\.2, and the newer oam would not start; running on .*node/,
+        /this process is oam 0\.9\.0, older than 0\.18\.0, and the newer oam would not start; running on .*node/,
       );
       expect(run.stderr).toMatch(IN_CHILD);
     },
@@ -1067,19 +1070,19 @@ describe("launcher with no usable oam", () => {
     "under FETCH_MCP_SANDBOX=1, a supported oam host keeps serving in-process when the chosen oam fails to spawn",
     async () => {
       // fetch-mcp's own fallback, which the case above cannot reach. The
-      // sandbox sends a 0.15.2 host to discovery. When the spawn fails, the
+      // sandbox sends a 0.18.0 host to discovery. When the spawn fails, the
       // documented fallback serves in THIS process, and it has to keep serving.
       // Before the fix it answered `initialize` and then either exited on the
       // dead child's 'close', or, with stdin already piped into that child,
       // stopped reading stdin. Both lose the second request.
       const session = await serveLauncher(
-        "0.15.2",
+        "0.18.0",
         isolated({ FETCH_MCP_SANDBOX: "1", OAM_BIN: process.execPath }),
         FAIL_FIRST_SPAWN,
       );
       expect(session.answered, JSON.stringify(session)).toEqual([1, 2]);
       expect(session.exitedOnItsOwn, JSON.stringify(session)).toBe(false);
-      expect(session.stderr).toMatch(/failed to launch oam at .*; using this oam 0\.15\.2 process instead\./);
+      expect(session.stderr).toMatch(/failed to launch oam at .*; using this oam 0\.18\.0 process instead\./);
     },
     TIMEOUT_MS,
   );

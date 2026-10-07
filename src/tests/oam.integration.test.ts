@@ -190,10 +190,13 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
 
         // (4) notifications/cancelled: the cancelled call gets no answer and the
         // server keeps serving. NOT asserted: that the fixture sees the slow
-        // connection close. On Node it closes the moment the cancel lands; on
-        // oam 0.16.3 an aborted fetch leaves its socket open (to the response or
-        // process exit) -- an oam divergence, reported upstream, that
-        // fetch-mcp cannot fix from here. `closedEarly` records it for a reader.
+        // connection close. On Node it closes the moment the cancel lands, and
+        // so it does on oam 0.18.0 (measured: within ~50ms of the cancel). On
+        // oam 0.16.3 and 0.17.0 an aborted fetch left its socket open (to the
+        // response or process exit) -- an oam divergence that fetch-mcp could
+        // not fix from here, and the launcher no longer serves on either.
+        // `closedEarly` records it for a reader, but cannot tell a close on
+        // cancel from one at process exit, so it is not asserted.
         handler = (req, res) => {
           if (req.url === "/slow") setTimeout(() => res.end("too late"), 4000);
           else res.end("fast");
