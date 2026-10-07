@@ -4,7 +4,7 @@ import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 import { stripHtmlToText } from "./content.js";
-import { type FoundTag, findTagEnd, findTags, parseAttrs } from "./html.js";
+import { type FoundTag, findTagEnd, parseAttrs } from "./html.js";
 
 export interface ExtractedLink {
   href: string;
@@ -104,6 +104,15 @@ function scriptEndTag(html: string, from: number): number {
   }
 }
 
+interface VisibleMarkup {
+  /** Each `<a>` start tag, in document order. */
+  anchors: FoundTag[];
+  /** Offset of the `<` of each `</a>` end tag, ascending. */
+  closes: number[];
+  /** The first `<base>` tag, if any. */
+  base: FoundTag | undefined;
+}
+
 /**
  * Every `<a>` start tag a browser would read as one, in document order, in one
  * left-to-right pass. `findTags(html, "a")` matched `<a` anywhere, so anchors
@@ -113,11 +122,15 @@ function scriptEndTag(html: string, from: number): number {
  * to its end tag (in any case, with whitespace or attributes before the `>`),
  * and either runs to the end of the input when it never ends; markup inside a
  * `<template>` is skipped to its matching `</template>`, and `<plaintext>`
- * hides the rest of the page.
+ * hides the rest of the page. The same pass finds the first `<base>` and every
+ * `</a>`, so a `<base href>` or `</a>` written in hidden markup does not
+ * re-root every link or cut an anchor's text short.
  */
-function visibleAnchors(html: string): FoundTag[] {
+function scanVisible(html: string): VisibleMarkup {
   const n = html.length;
   const anchors: FoundTag[] = [];
+  const closes: number[] = [];
+  let base: FoundTag | undefined;
   let template = 0;
   let i = 0;
   while (i < n) {
@@ -155,17 +168,20 @@ function visibleAnchors(html: string): FoundTag[] {
     i = after;
     if (closing) {
       if (name === "template" && template > 0) template--;
+      else if (name === "a" && template === 0) closes.push(lt);
       continue;
     }
-    if (name === "a" && template === 0) {
-      const rawAttrs = html.slice(lt + 2, end.pos);
-      anchors.push({
+    if ((name === "a" || (name === "base" && base === undefined)) && template === 0) {
+      const rawAttrs = html.slice(lt + 1 + name.length, end.pos);
+      const tag: FoundTag = {
         start: lt,
         contentStart: after,
         // Drop only a self-closing `/`: in `<a href=/blog/>` the slash belongs to the value.
         attrsText: end.selfClosing ? rawAttrs.slice(0, -1) : rawAttrs,
         selfClosing: end.selfClosing,
-      });
+      };
+      if (name === "a") anchors.push(tag);
+      else base = tag;
     } else if (name === "template") {
       template++;
     } else if (name === "plaintext") {
@@ -183,21 +199,19 @@ function visibleAnchors(html: string): FoundTag[] {
       }
     }
   }
-  return anchors;
+  return { anchors, closes, base };
 }
 
 export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
+  const { anchors, closes, base: baseTag } = scanVisible(html);
   let base = baseUrl;
-  for (const baseTag of findTags(html, "base")) {
-    const attrs = parseAttrs(baseTag.attrsText);
-    if (attrs.href) {
-      try {
-        base = new URL(attrs.href, baseUrl).toString();
-      } catch {
-        /* ignore */
-      }
+  const baseHref = baseTag ? parseAttrs(baseTag.attrsText).href : undefined;
+  if (baseHref) {
+    try {
+      base = new URL(baseHref, baseUrl).toString();
+    } catch {
+      /* ignore */
     }
-    break;
   }
 
   let baseHost = "";
@@ -207,15 +221,11 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     /* no baseHost -- everything classified external */
   }
 
-  // Finds the `</a>` that ends each anchor, searched case-insensitively in
-  // place. A lowercased copy of the page can differ in length ("\u0130"
-  // lowercases to two code units), which shifted every later index.
-  const closeA = /<\/a\s*>/gi;
-  /** The next `</a>` found so far: undefined before a search, null once there is none. */
-  let close: RegExpExecArray | null | undefined;
+  // Index into `closes` of the first `</a>` at or past the current anchor.
+  // Anchors come in document order, so it only moves forward: linear overall.
+  let c = 0;
 
   const links: ExtractedLink[] = [];
-  const anchors = visibleAnchors(html);
   for (let k = 0; k < anchors.length; k++) {
     const tag = anchors[k]!;
     const attrs = parseAttrs(tag.attrsText);
@@ -237,22 +247,15 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
     const abs = parsed.toString();
 
-    // Anchors come in document order, so a close found for an earlier anchor
-    // that lies past this one is this one's too, and once none is left none
-    // ever will be. Searching afresh from every anchor read to the end of the
-    // input once per unclosed anchor: quadratic.
-    if (close !== null && close !== undefined && close.index < tag.contentStart) close = undefined;
-    if (close === undefined) {
-      closeA.lastIndex = tag.contentStart;
-      close = closeA.exec(html);
-    }
+    while (c < closes.length && closes[c]! < tag.contentStart) c++;
+    const close = c < closes.length ? closes[c]! : -1;
     // A new <a> also ends the one before it, as in a browser, so the text of
     // anchors that share one far-off </a> is not copied once per anchor.
     // With no </a> anywhere after it, an anchor has no text: running it to
     // the end of the page would hand back the rest of the document, scripts
     // and all, as one link's text.
     const nextStart = anchors[k + 1]?.start ?? html.length;
-    const innerEnd = close ? Math.min(close.index, nextStart) : tag.contentStart;
+    const innerEnd = close !== -1 ? Math.min(close, nextStart) : tag.contentStart;
     // stripHtmlToText drops script, style, template and comment content and
     // decodes entities once, after every tag is gone.
     const text = stripHtmlToText(html.slice(tag.contentStart, innerEnd)).replace(/\s+/g, " ").trim();

@@ -159,6 +159,9 @@ describe("extractLinks -- anchor text offsets", () => {
     // Decoding `&amp;` first and `&lt;` after it turned this into `<x` (`%3Cx`).
     const links = extractLinks(`<a href="/s?q=&amp;lt;x">x</a>`, "https://site.com/");
     expect(links[0]?.href).toBe("https://site.com/s?q=&lt;x");
+    expect(extractLinks(`<a href="/s?q=a&amp;amp;b">x</a>`, "https://site.com/")[0]?.href).toBe(
+      "https://site.com/s?q=a&amp;b",
+    );
   });
 });
 
@@ -265,6 +268,22 @@ describe("extractLinks -- hidden content", () => {
   it("keeps a script's double-escaped </script> inside the script", () => {
     const html = `<script><!--<script></script><a href="/in">in</a></script><a href="/out">out</a>`;
     expect(pairs(html)).toEqual([["https://site.com/out", "out"]]);
+  });
+
+  it("ignores a <base> written in a comment, a script or a template", () => {
+    const html =
+      `<!-- <base href="https://evil.test/"> --><script>"<base href='https://evil.test/'>"</script>` +
+      `<template><base href="https://evil.test/"></template><a href="/x">x</a>`;
+    expect(pairs(html)).toEqual([["https://site.com/x", "x"]]);
+    expect(pairs(`<script>"<base href=x>"</script><base href="https://cdn.example/"><a href="y">y</a>`)).toEqual([
+      ["https://cdn.example/y", "y"],
+    ]);
+  });
+
+  it("does not end an anchor at a </a> inside a script or a comment", () => {
+    expect(pairs(`<a href="/a">Read<script>s="</a>"</script> more<!-- </a> --> here</a>`)).toEqual([
+      ["https://site.com/a", "Read more here"],
+    ]);
   });
 
   it("scans a page of short scripts, comments and templates in linear time", () => {
