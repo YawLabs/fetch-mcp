@@ -104,13 +104,14 @@ function scriptEndTag(html: string, from: number): number {
   }
 }
 
+/** What `scanVisible` reports, in document order. */
 interface VisibleMarkup {
-  /** Each `<a>` start tag, in document order. */
-  anchors: FoundTag[];
-  /** Offset of the `<` of each `</a>` end tag, ascending. */
-  closes: number[];
-  /** The first `<base>` tag, if any. */
-  base: FoundTag | undefined;
+  /** An `<a>` start tag. Return true to stop the scan. */
+  anchor(tag: FoundTag): boolean;
+  /** The `<` of an `</a>` end tag. */
+  close(lt: number): void;
+  /** The first `<base>` tag. */
+  base(tag: FoundTag): void;
 }
 
 /**
@@ -125,12 +126,13 @@ interface VisibleMarkup {
  * hides the rest of the page. The same pass finds the first `<base>` and every
  * `</a>`, so a `<base href>` or `</a>` written in hidden markup does not
  * re-root every link or cut an anchor's text short.
+ *
+ * Reported as found, not collected: a page of 20 million `<a>` tags built
+ * every one of them before fetch_links kept its first thousand.
  */
-function scanVisible(html: string): VisibleMarkup {
+function scanVisible(html: string, visit: VisibleMarkup): void {
   const n = html.length;
-  const anchors: FoundTag[] = [];
-  const closes: number[] = [];
-  let base: FoundTag | undefined;
+  let sawBase = false;
   let template = 0;
   let i = 0;
   while (i < n) {
@@ -168,10 +170,10 @@ function scanVisible(html: string): VisibleMarkup {
     i = after;
     if (closing) {
       if (name === "template" && template > 0) template--;
-      else if (name === "a" && template === 0) closes.push(lt);
+      else if (name === "a" && template === 0) visit.close(lt);
       continue;
     }
-    if ((name === "a" || (name === "base" && base === undefined)) && template === 0) {
+    if ((name === "a" || (name === "base" && !sawBase)) && template === 0) {
       const rawAttrs = html.slice(lt + 1 + name.length, end.pos);
       const tag: FoundTag = {
         start: lt,
@@ -180,8 +182,12 @@ function scanVisible(html: string): VisibleMarkup {
         attrsText: end.selfClosing ? rawAttrs.slice(0, -1) : rawAttrs,
         selfClosing: end.selfClosing,
       };
-      if (name === "a") anchors.push(tag);
-      else base = tag;
+      if (name === "a") {
+        if (visit.anchor(tag)) return;
+      } else {
+        sawBase = true;
+        visit.base(tag);
+      }
     } else if (name === "template") {
       template++;
     } else if (name === "plaintext") {
@@ -199,11 +205,57 @@ function scanVisible(html: string): VisibleMarkup {
       }
     }
   }
-  return { anchors, closes, base };
 }
 
+export interface LinkOptions {
+  /** Keep only internal or only external links (default all). */
+  filter?: "all" | "internal" | "external";
+  /** Skip a link whose href was already kept (default false; fetch_links turns it on). */
+  dedupe?: boolean;
+  /** Keep at most this many links (default no cap). */
+  limit?: number;
+}
+
+export interface LinkResult {
+  links: ExtractedLink[];
+  /** Whether the page has a link past `limit` that would also have been kept. */
+  truncated: boolean;
+}
+
+interface ResolvedHref {
+  abs: string;
+  type: ExtractedLink["type"];
+}
+
+/** Trimmed hrefs whose resolution `collectLinks` remembers at a time. */
+const RESOLVED_CACHE_SIZE = 1024;
+
 export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
-  const { anchors, closes, base: baseTag } = scanVisible(html);
+  return collectLinks(html, baseUrl).links;
+}
+
+/**
+ * The links of a page, filtered, deduplicated and capped as they are found.
+ * The walk stops at the first link past `limit`, and only kept links get
+ * their text extracted, so memory and time past the scan scale with the cap,
+ * not with the number of anchors on the page.
+ */
+export function collectLinks(html: string, baseUrl: string, opts: LinkOptions = {}): LinkResult {
+  // A first pass, keeping nothing, finds the `<base>` (it applies to the
+  // anchors before it too) and the last `</a>`: an anchor with none after it
+  // has no text.
+  let baseTag: FoundTag | undefined;
+  let lastClose = -1;
+  scanVisible(html, {
+    anchor: () => false,
+    close: (lt) => {
+      lastClose = lt;
+    },
+    base: (tag) => {
+      baseTag = tag;
+    },
+  });
+
   let base = baseUrl;
   const baseHref = baseTag ? parseAttrs(baseTag.attrsText).href : undefined;
   if (baseHref) {
@@ -221,57 +273,89 @@ export function extractLinks(html: string, baseUrl: string): ExtractedLink[] {
     /* no baseHost -- everything classified external */
   }
 
-  // Index into `closes` of the first `</a>` at or past the current anchor.
-  // Anchors come in document order, so it only moves forward: linear overall.
-  let c = 0;
-
-  const links: ExtractedLink[] = [];
-  for (let k = 0; k < anchors.length; k++) {
-    const tag = anchors[k]!;
-    const attrs = parseAttrs(tag.attrsText);
-    const href = attrs.href;
-    if (!href) continue;
-    const trimmed = href.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    // Keep http(s) only, judged on the parsed URL. A prefix deny-list on the
-    // raw href missed vbscript: and every scheme nobody listed, and the URL
-    // parser drops tabs and newlines and leading control characters, so
-    // "java\tscript:" and "\x01javascript:" both parse as javascript:.
+  // Keep http(s) only, judged on the parsed URL. A prefix deny-list on the
+  // raw href missed vbscript: and every scheme nobody listed, and the URL
+  // parser drops tabs and newlines and leading control characters, so
+  // "java\tscript:" and "\x01javascript:" both parse as javascript:.
+  const resolve = (href: string): ResolvedHref | null => {
     let parsed: URL;
     try {
-      parsed = new URL(trimmed, base);
+      parsed = new URL(href, base);
     } catch {
-      continue;
+      return null;
     }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
-    const abs = parsed.toString();
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return { abs: parsed.toString(), type: normalizeHost(parsed.host) === baseHost ? "internal" : "external" };
+  };
+  const resolved = new Map<string, ResolvedHref | null>();
 
-    while (c < closes.length && closes[c]! < tag.contentStart) c++;
-    const close = c < closes.length ? closes[c]! : -1;
-    // A new <a> also ends the one before it, as in a browser, so the text of
-    // anchors that share one far-off </a> is not copied once per anchor.
-    // With no </a> anywhere after it, an anchor has no text: running it to
-    // the end of the page would hand back the rest of the document, scripts
-    // and all, as one link's text.
-    const nextStart = anchors[k + 1]?.start ?? html.length;
-    const innerEnd = close !== -1 ? Math.min(close, nextStart) : tag.contentStart;
+  const filter = opts.filter ?? "all";
+  const seen = opts.dedupe ? new Set<string>() : undefined;
+  const limit = opts.limit ?? Number.POSITIVE_INFINITY;
+  const links: ExtractedLink[] = [];
+  let truncated = false;
+  // The last kept link, until the next `<a>` or the end of the page ends its
+  // text, and the first `</a>` after its start tag (-1 until one is seen).
+  let open: { link: ExtractedLink; contentStart: number; close: number } | undefined;
+
+  // A new <a> also ends the one before it, as in a browser, so the text of
+  // anchors that share one far-off </a> is not copied once per anchor. With
+  // no </a> anywhere after it, an anchor has no text: running it to the end
+  // of the page would hand back the rest of the document, scripts and all, as
+  // one link's text.
+  const endText = (nextStart: number) => {
+    if (open === undefined) return;
+    const { link, contentStart, close } = open;
+    open = undefined;
+    let innerEnd = contentStart;
+    if (close !== -1) innerEnd = Math.min(close, nextStart);
+    else if (lastClose >= contentStart) innerEnd = nextStart;
     // stripHtmlToText drops script, style, template and comment content and
     // decodes entities once, after every tag is gone.
-    const text = stripHtmlToText(html.slice(tag.contentStart, innerEnd)).replace(/\s+/g, " ").trim();
+    link.text = stripHtmlToText(html.slice(contentStart, innerEnd)).replace(/\s+/g, " ").trim();
+  };
 
-    const host = normalizeHost(parsed.host);
+  scanVisible(html, {
+    anchor: (tag) => {
+      endText(tag.start);
+      const attrs = parseAttrs(tag.attrsText);
+      const href = attrs.href;
+      if (!href) return false;
+      const trimmed = href.trim();
+      if (!trimmed || trimmed.startsWith("#")) return false;
 
-    const link: ExtractedLink = {
-      href: abs,
-      text,
-      type: host === baseHost ? "internal" : "external",
-    };
-    if (attrs.rel) link.rel = attrs.rel;
-    if (attrs.title) link.title = attrs.title;
-    links.push(link);
-  }
-  return links;
+      let target = resolved.get(trimmed);
+      if (target === undefined) {
+        target = resolve(trimmed);
+        // Pages repeat a few hrefs many times; a page of all-distinct ones
+        // just keeps restarting the cache.
+        if (resolved.size >= RESOLVED_CACHE_SIZE) resolved.clear();
+        resolved.set(trimmed, target);
+      }
+      if (target === null) return false;
+      const { abs, type } = target;
+      if (filter !== "all" && type !== filter) return false;
+      if (seen?.has(abs)) return false;
+      if (links.length >= limit) {
+        truncated = true;
+        return true;
+      }
+      seen?.add(abs);
+
+      const link: ExtractedLink = { href: abs, text: "", type };
+      if (attrs.rel) link.rel = attrs.rel;
+      if (attrs.title) link.title = attrs.title;
+      links.push(link);
+      open = { link, contentStart: tag.contentStart, close: -1 };
+      return false;
+    },
+    close: (lt) => {
+      if (open !== undefined && open.close === -1) open.close = lt;
+    },
+    base: () => {},
+  });
+  endText(html.length);
+  return { links, truncated };
 }
 
 export function registerLinksTools(server: McpServer, request: HttpRequester) {
@@ -308,19 +392,11 @@ export function registerLinksTools(server: McpServer, request: HttpRequester) {
       if (res.error) return formatError(res.error);
       if (!res.ok) return formatError(`HTTP ${res.status} ${res.statusText}`);
       if (!res.bodyText) return formatError("empty body");
-      let links = extractLinks(res.bodyText, res.url);
-      if (filter && filter !== "all") links = links.filter((l) => l.type === filter);
-      if (dedupe !== false) {
-        const seen = new Set<string>();
-        links = links.filter((l) => {
-          if (seen.has(l.href)) return false;
-          seen.add(l.href);
-          return true;
-        });
-      }
-      const cap = limit ?? 1000;
-      const truncated = links.length > cap;
-      if (truncated) links = links.slice(0, cap);
+      const { links, truncated } = collectLinks(res.bodyText, res.url, {
+        filter,
+        dedupe: dedupe !== false,
+        limit: limit ?? 1000,
+      });
       return formatJson({ url: res.url, linkCount: links.length, truncated, links });
     },
   );

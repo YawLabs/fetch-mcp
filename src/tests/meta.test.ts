@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseHtmlMeta } from "../tools/meta.js";
+import { formatJson } from "../format.js";
+import { jsonNestsDeeperThan, MAX_JSON_LD_DEPTH, MAX_META_KEYS, MAX_META_LIST, parseHtmlMeta } from "../tools/meta.js";
 
 describe("parseHtmlMeta", () => {
   it("extracts title, description, and canonical", () => {
@@ -283,5 +284,73 @@ describe("parseHtmlMeta -- a JSON-LD block ends where the browser ends the scrip
     const json = '{"a":"<!--<script></script>-->"}';
     const meta = parseHtmlMeta(`<script type="application/ld+json">${json}</script>`, "https://site.com/");
     expect(meta.jsonLd).toEqual([{ a: "<!--<script></script>-->" }]);
+  });
+});
+
+describe("parseHtmlMeta -- bounded output", () => {
+  const ld = (json: string) => `<script type="application/ld+json">${json}</script>`;
+
+  it("drops a JSON-LD block nested past the limit, before it is parsed", () => {
+    const at = (d: number) => `${"[".repeat(d)}${"]".repeat(d)}`;
+    const meta = parseHtmlMeta(
+      `<head>${ld(at(MAX_JSON_LD_DEPTH))}${ld(at(MAX_JSON_LD_DEPTH + 1))}</head>`,
+      "https://e.com/",
+    );
+    expect(meta.jsonLd).toHaveLength(1);
+    expect(meta.truncated).toEqual(["jsonLd"]);
+  });
+
+  it("counts depth outside strings only", () => {
+    expect(jsonNestsDeeperThan(`{"a":"${"[".repeat(500)}\\"{{"}`, 2)).toBe(false);
+    expect(jsonNestsDeeperThan(`[[[`, 2)).toBe(true);
+  });
+
+  it("formats a page of deeply nested JSON-LD blocks in bounded output, without throwing", () => {
+    const deep = `${"[".repeat(4000)}${"]".repeat(4000)}`;
+    const shallow = `${"[".repeat(60)}{"x":1}${"]".repeat(60)}`;
+    const html = `<head>${ld(deep)}${ld(shallow).repeat(100)}</head>`;
+    const t0 = Date.now();
+    const out = formatJson(parseHtmlMeta(html, "https://e.com/"));
+    expect(out.isError).toBeUndefined();
+    const text = out.content[0]!.text;
+    expect(text.length).toBeLessThan(50_200);
+    expect(text).toMatch(/\[\.\.\. truncated \d+ chars \.\.\.\]$/);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("caps icons and feeds, and does not resolve the links it drops", () => {
+    const base = `https://example.com/${"a".repeat(2000)}/`;
+    const html = `<head>${'<link rel=icon href=x><link rel=alternate type="application/rss+xml" href=f>'.repeat(20_000)}</head>`;
+    const meta = parseHtmlMeta(html, base);
+    expect(meta.icons).toHaveLength(MAX_META_LIST);
+    expect(meta.feeds).toHaveLength(MAX_META_LIST);
+    expect(meta.icons[0]!.href).toBe(`${base}x`);
+    expect(meta.truncated).toEqual(["icons", "feeds"]);
+    expect(formatJson(meta).content[0]!.text.length).toBeLessThan(50_200);
+  });
+
+  it("caps og keys and values per key, and flags each family", () => {
+    const keys = Array.from({ length: MAX_META_KEYS + 5 }, (_, i) => `<meta property="og:k${i}" content=v>`).join("");
+    const vals = '<meta name="twitter:image" content=i>'.repeat(MAX_META_LIST + 5);
+    const meta = parseHtmlMeta(`<head>${keys}${vals}<meta property="article:tag" content=t></head>`, "https://e.com/");
+    expect(Object.keys(meta.og)).toHaveLength(MAX_META_KEYS);
+    expect(meta.twitterAll.image).toHaveLength(MAX_META_LIST);
+    expect(meta.article).toEqual({ tag: "t" });
+    expect(meta.truncated).toEqual(["og", "twitter"]);
+  });
+
+  it("omits truncated when nothing was cut", () => {
+    expect(parseHtmlMeta("<head><link rel=icon href=x></head>", "https://e.com/").truncated).toBeUndefined();
+  });
+
+  it("keeps prototype-named keys as ordinary keys", () => {
+    const html =
+      '<head><meta property="og:constructor" content=a><meta property="og:constructor" content=b><meta property="og:__proto__" content=c></head>';
+    const meta = parseHtmlMeta(html, "https://e.com/");
+    expect(Object.hasOwn(meta.og, "constructor")).toBe(true);
+    expect(meta.og.constructor).toBe("a");
+    expect(meta.ogAll.constructor).toEqual(["a", "b"]);
+    expect(Object.hasOwn(meta.og, "__proto__")).toBe(true);
+    expect(JSON.parse(formatJson(meta).content[0]!.text).og).toEqual(JSON.parse('{"constructor":"a","__proto__":"c"}'));
   });
 });

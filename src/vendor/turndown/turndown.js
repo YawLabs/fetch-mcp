@@ -65,7 +65,12 @@
  *       the instance has a numeric `maxOutput`, process() throws
  *       ConversionLimitError as soon as the output it is collecting for one
  *       parent passes it, before joining it: nesting cannot amplify a page
- *       into an O(depth x content) string. `work` is the counter.
+ *       into an O(depth x content) string. `work` is the counter; when
+ *       the instance has a numeric `maxWork`, charge() throws
+ *       ConversionLimitError (kind 'work') as soon as `work` passes it, before
+ *       the work runs: nested blockquotes or list items around flat text
+ *       re-prefix every line at each level without growing any one parent's
+ *       output past `maxOutput`.
  *   (h) RootNode(): collapseWhitespace() runs with the document's private
  *       `modclock` at 0, so domino's modify() does not walk every ancestor
  *       on each node it removes (O(depth) per removal); restored afterwards.
@@ -1058,6 +1063,7 @@ function checkDeadline(service) {
 var WORK_CHECK_EVERY = 65536;
 function charge(service, amount) {
   var work = service.work += amount;
+  if (service.maxWork !== undefined && work > service.maxWork) throw new ConversionLimitError(service.maxWork, 'work');
   if (work >= service.workCheckAt) {
     service.workCheckAt = work + WORK_CHECK_EVERY;
     checkDeadline(service);
@@ -1361,13 +1367,15 @@ class ConversionDeadlineError extends Error {
 
 /**
  * PATCH (g): thrown once the output collected for one parent passes the
- * instance's `maxOutput` (characters).
+ * instance's `maxOutput` (characters; `kind` 'output'), or the replacement
+ * work charged so far passes its `maxWork` (characters; `kind` 'work').
  */
 class ConversionLimitError extends Error {
-  constructor(limit) {
-    super('HTML-to-markdown output limit exceeded');
+  constructor(limit, kind) {
+    super('HTML-to-markdown ' + (kind || 'output') + ' limit exceeded');
     this.name = 'ConversionLimitError';
     this.limit = limit;
+    this.kind = kind || 'output';
   }
 }
 

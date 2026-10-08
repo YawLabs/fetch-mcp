@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAllowed, parseRobots } from "../tools/robots.js";
+import { isAllowed, parseRobots, robotsPathMatches } from "../tools/robots.js";
 
 describe("parseRobots", () => {
   it("parses groups with user-agents and rules", () => {
@@ -143,5 +143,135 @@ Disallow: /x
 Allow: /x
 `);
     expect(isAllowed(r, "Bot", "/x").allowed).toBe(true);
+  });
+});
+
+/**
+ * The RegExp matcher `robotsPathMatches` replaced (through 0.8.3). It is the
+ * reference semantics: the linear matcher must agree with it on every input
+ * it can evaluate in reasonable time.
+ */
+function regexOracle(pattern: string, path: string): boolean {
+  if (!pattern) return false;
+  const anchored = pattern.endsWith("$");
+  const raw = anchored ? pattern.slice(0, -1) : pattern;
+  const re = new RegExp(`^${raw.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}${anchored ? "$" : ""}`);
+  return re.test(path);
+}
+
+/** Deterministic PRNG (mulberry32) so the differential sample is reproducible. */
+function rng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+describe("robotsPathMatches", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["", "/", false],
+    ["", "", false],
+    ["/", "/", true],
+    ["/", "", false],
+    ["/foo", "/foo/bar", true],
+    ["/foo", "/fo", false],
+    ["/foo$", "/foo", true],
+    ["/foo$", "/foo/", false],
+    ["$", "", true],
+    ["$", "/", false],
+    ["*", "", true],
+    ["*$", "/any", true],
+    ["*$", "/a\nb", false],
+    ["/a$b", "/a$b/c", true],
+    ["/a$b$", "/a$b", true],
+    ["/a$$", "/a$", true],
+    ["/a$$", "/a", false],
+    ["/*.json$", "/x.json", true],
+    ["/*.json$", "/x.json?y", false],
+    ["/*.json", "/x.json?y", true],
+    ["/*.json", "/xjson", false],
+    ["/a*b*c", "/abc", true],
+    ["/a*b*c", "/acb", false],
+    ["/a**b", "/ab", true],
+    ["/a*a$", "/aa", true],
+    ["/a*a$", "/a", false],
+    ["/a*ba$", "/aba", true],
+    ["/a*ba$", "/ababa", true],
+    ["/a*b", "/a\nb", false],
+    ["/a*b", "/ab\nb", true],
+    ["/a*\nb", "/ax\nb", true],
+    ["/a*\nb", "/a\nx\nb", false],
+    ["/a*b", "/a\u2028b", false],
+    ["/a*b", "/a\rb", false],
+    ["/%2F*", "/%2Fx", true],
+    ["/%2f", "/%2F", false],
+    ["/[a](b)+?{1}|^.\\", "/[a](b)+?{1}|^.\\z", true],
+    ["/[a]", "/a", false],
+  ];
+  it.each(cases)("pattern %j against %j -> %s", (pattern, path, expected) => {
+    expect(robotsPathMatches(pattern, path)).toBe(expected);
+    expect(regexOracle(pattern, path)).toBe(expected);
+  });
+
+  it("agrees with the old RegExp matcher on a randomized sample", () => {
+    const patternAlphabet = ["*", "*", "$", "%", "/", "-", "a", "b", ".", "\n", "2"];
+    const pathAlphabet = ["*", "$", "%", "/", "-", "a", "a", "b", "b", ".", "\n", "\r", "2"];
+    const rand = rng(0x5eed);
+    const pick = (alphabet: string[], max: number) => {
+      const len = Math.floor(rand() * (max + 1));
+      let out = "";
+      for (let i = 0; i < len; i++) out += alphabet[Math.floor(rand() * alphabet.length)];
+      return out;
+    };
+    let matched = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const pattern = pick(patternAlphabet, 8);
+      // Bias toward paths that share the pattern's literal prefix, or almost
+      // every sample is a trivial first-character mismatch.
+      const path =
+        rand() < 0.5
+          ? pattern.replace(/[*$]/g, () => pick(pathAlphabet, 3)) + pick(pathAlphabet, 3)
+          : pick(pathAlphabet, 10);
+      const expected = regexOracle(pattern, path);
+      if (expected) matched++;
+      if (robotsPathMatches(pattern, path) !== expected) {
+        throw new Error(
+          `mismatch: pattern ${JSON.stringify(pattern)} path ${JSON.stringify(path)} expected ${expected}`,
+        );
+      }
+    }
+    // The sample must exercise both outcomes, not just rejections.
+    expect(matched).toBeGreaterThan(2_000);
+  });
+
+  it("does not throw on a pattern too large to compile as a RegExp", () => {
+    const pattern = `${"*a".repeat(100_000)}`;
+    expect(() => regexOracle(pattern, "/a")).toThrow();
+    const t0 = performance.now();
+    expect(robotsPathMatches(pattern, "/a")).toBe(false);
+    expect(robotsPathMatches(pattern, `/${"a".repeat(100_000)}`)).toBe(true);
+    const r = parseRobots(`User-agent: *\nDisallow: ${pattern}\n`);
+    expect(isAllowed(r, "Bot", "/a").allowed).toBe(true);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+
+  it("matches many-wildcard rules against a hyphenated slug in linear time", () => {
+    // 20 rules of 10 wildcards each backtracked C(hyphens, 10) ways per rule
+    // under the RegExp matcher: ~12 s on this slug.
+    const rules = Array.from({ length: 20 }, (_, i) => `Disallow: /${"*-".repeat(10)}X${i}$`).join("\n");
+    const r = parseRobots(`User-agent: *\n${rules}\n`);
+    const slug =
+      "how-to-make-the-best-of-a-long-weekend-in-the-city-with-your-kids-and-friends-on-a-budget-in-2026-guide";
+    const t0 = performance.now();
+    expect(isAllowed(r, "Bot", `/blog/${slug}`).allowed).toBe(true);
+    expect(isAllowed(r, "Bot", `/blog/${slug}-X7`)).toEqual({
+      allowed: false,
+      rule: `Disallow: /${"*-".repeat(10)}X7$`,
+    });
+    expect(performance.now() - t0).toBeLessThan(100);
   });
 });

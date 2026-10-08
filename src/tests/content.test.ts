@@ -690,3 +690,87 @@ describe("stripHtmlToText -- raw-text readings in an island meet again, round 12
     expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });
+
+describe("stripHtmlToText -- output built from ranges, round 14", () => {
+  it("squeezes blank lines and trims line ends the way the regex chain did", () => {
+    expect(stripHtmlToText("a \n\t\n \n\nb")).toBe("a\n\nb");
+    expect(stripHtmlToText("a\n\nb\n \nc")).toBe("a\n\nb\n\nc");
+    expect(stripHtmlToText(" \n\n\n  a  \n\n\n\n")).toBe("a");
+    // Entities decode before lines are tidied: &#32; and &nbsp; (a plain space here) are blanks, &#10; a line break.
+    expect(stripHtmlToText("a&#32;\nb&#10;&#10;&#10;c&nbsp;\nd")).toBe("a\nb\n\nc\nd");
+    // An entity split by a tag is whole once the tag is gone.
+    expect(stripHtmlToText("&am<b>p;lt;")).toBe("&lt;");
+  });
+
+  it("keeps a hidden extent's partial text and the newline after a text element", () => {
+    expect(stripHtmlToText("<title>T</title>x<br>y<p>z</p>w")).toBe("T\nx\nyz\nw");
+    expect(stripHtmlToText("<select><style>a</style>b</select>c")).toBe("bc");
+  });
+
+  // 'Peak' is the process's peak RSS growth: a forked worker per file, so the
+  // other suites do not count. A high-water mark, so a case after one that
+  // regressed may pass, but the suite is red either way; each case alone
+  // fails on the old code. Before: 34-43 bytes per input character on
+  // these (a page of '<' x 100 MiB peaked at 3.5 GB), from `out += piece` per
+  // one-character piece and a String.replace callback per entity.
+  const peakGrowth = (run: () => void) => {
+    const before = Math.max(process.resourceUsage().maxRSS * 1024, process.memoryUsage.rss());
+    run();
+    return process.resourceUsage().maxRSS * 1024 - before;
+  };
+
+  it.each([
+    ["'<'", "<", (n: number) => n],
+    ["'<\\n'", "<\n", (n: number) => n - 1],
+    ["'&amp;'", "&amp;", (n: number) => n / 5],
+    ["'x<br>'", "x<br>", (n: number) => (2 * n) / 5 - 1],
+  ])(
+    "strips 32 MiB of %s in memory a few times the page",
+    (_, unit, outLength) => {
+      const html = unit.repeat(Math.floor((32 * 1024 * 1024) / unit.length));
+      let length = 0;
+      const growth = peakGrowth(() => {
+        length = stripHtmlToText(html).length;
+      });
+      expect(length).toBe(outLength(html.length));
+      expect(growth).toBeLessThan(4 * html.length);
+    },
+    60_000,
+  );
+});
+
+describe("stripHtmlToText -- raw extents read both ways, round 15", () => {
+  it.each([
+    ["a title", "<template><svg><select></svg><title></template>SECRET"],
+    ["a title, then a block", "<template><svg><select></svg><title></template><p>SECRET</p>"],
+    ["an xmp", "<template><svg><select></svg><xmp></template>SECRET</xmp>SECRET2"],
+    ["a plaintext", "<template><svg><select></svg><plaintext></template>SECRET"],
+    ["a style", "<template><svg><select></svg><style></template>SECRET</style>SECRET2"],
+  ])("hides %s that SVG's select leaves as raw text in a template", (_, html) => {
+    expect(stripHtmlToText(html)).toBe("");
+  });
+
+  it("hides a title's raw extent in a select inside a template, reading the markup in it too", () => {
+    expect(stripHtmlToText("<template><select><title></template>x</title>SECRET")).toBe("");
+    expect(stripHtmlToText("<template><select><xmp></template>x</xmp>SECRET</template>after")).toBe("");
+    expect(stripHtmlToText("<select><title><template></title>SECRET</template>after")).toBe("after");
+    // Outside a template there is nothing for it to close: the text shows, as a classic parser shows it.
+    expect(stripHtmlToText("<select><option>A<title>t</title>B</select>C")).toBe("AtBC");
+  });
+
+  it("hides the rest when a start tag follows a </template> an island element may hold as raw text", () => {
+    // SVG reads the style as markup, so the first </template> closes the
+    // template and the second <svg> opens in the document; read as raw text,
+    // the second </template> closes it and the textarea is HTML raw text.
+    expect(
+      stripHtmlToText("<template><svg><style></template></style><svg></template><textarea></svg><noscript>SECRET"),
+    ).toBe("");
+    expect(stripHtmlToText("<template><svg><style></template></style><b></template>after")).toBe("");
+    // Only end tags in between: both readings are out of the template at the second </template>.
+    expect(stripHtmlToText("<template><svg><style></template></style></svg></template>after")).toBe("after");
+    // A later template starts afresh.
+    expect(
+      stripHtmlToText("<template><svg><style></template></style></svg></template>a<template><p></template>b"),
+    ).toBe("ab");
+  });
+});

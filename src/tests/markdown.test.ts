@@ -19,13 +19,17 @@ import {
   MAX_NODE_BUDGET,
   MAX_TAG_NAME_CHARS,
   MAX_TAG_NAMES,
+  MAX_TURNDOWN_MS,
   MIN_NODE_BUDGET,
   makeTurndown,
   NODE_BUDGET_CHARS,
   OUTPUT_FACTOR,
   OUTPUT_SLACK,
+  turndownSteps,
+  WORK_FACTOR,
+  WORK_SLACK,
 } from "../markdown.js";
-import { ConversionDeadlineError, ConversionLimitError } from "../vendor/turndown/turndown.js";
+import TurndownService, { ConversionDeadlineError, ConversionLimitError } from "../vendor/turndown/turndown.js";
 
 // HTML-to-markdown, bounded (CLAUDE.md Launch-critical #22).
 //
@@ -54,6 +58,15 @@ async function err(html: string, opts?: Parameters<typeof htmlToMarkdown>[1]): P
 
 const BUDGET_ERROR = /HTML-to-markdown conversion exceeded its \d+ ms budget/;
 const OUTPUT_ERROR = /page's markdown grows past \d+ characters while converting/;
+const WORK_ERROR = /page's markdown takes more than \d+ characters of conversion work/;
+const STEP_ERROR = /ran past its \d+ ms limit for the markdown step/;
+
+/** The sixth review's repro: flat lines under 200 nested blockquotes, each level re-prefixing every line. */
+function blockquoteLines(chars: number): string {
+  const head = "<blockquote>".repeat(200);
+  const line = `${"a".repeat(200)}<br>`;
+  return head + line.repeat(Math.floor((chars - head.length) / line.length));
+}
 
 /** Runs a conversion, recording the longest gap a 2 ms interval timer saw (the event-loop stall). */
 async function timed(html: string, budgetMs: number) {
@@ -547,6 +560,159 @@ describe("htmlToMarkdown -- Turndown phase bounds", () => {
     const { result, ms } = await timed(html, 1_000);
     expect(ms).toBeLessThan(1_000 + 1_000);
     expect("error" in result && result.error).toMatch(OUTPUT_ERROR);
+  });
+
+  // Sixth review: the Turndown step is synchronous, so a budget of up to
+  // 120 s let one page hold the event loop -- every other call, every
+  // cancellation -- for as long as it ran. Times are the previous version's.
+  it.each([
+    1, 3,
+  ])(`refuses 200 nested <blockquote>s around %i MiB of lines at the work cap, well inside MAX_TURNDOWN_MS, on a 120 s budget (was: a 16.6 s stall at 1 MiB, 37 s at 3 MiB)`, async (mib) => {
+    const html = blockquoteLines(mib * 1024 * 1024);
+    const { result, ms, maxGapMs } = await timed(html, 120_000);
+    expect(ms).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+    expect(maxGapMs).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+    expect("error" in result && result.error).toMatch(WORK_ERROR);
+    expect("error" in result && result.error).toContain(`${WORK_FACTOR * html.length + WORK_SLACK} characters`);
+    expect("error" in result && result.error).toContain("fetch_html_to_text");
+  });
+
+  it("a queued call's deadline and cancellation land within MAX_TURNDOWN_MS of the Turndown step ahead of it (was: a 2 s budget returned at 32 s, a cancel at 3 s at 41 s)", async () => {
+    const page = blockquoteLines(3 * 1024 * 1024);
+    const running = Array.from({ length: MAX_CONCURRENT_CONVERSIONS }, () =>
+      htmlToMarkdown(page, { budgetMs: 120_000 }),
+    );
+    const cancel = new AbortController();
+    const t0 = performance.now();
+    const settled = (p: Promise<unknown>) => p.then((r) => ({ r, ms: performance.now() - t0 }));
+    const queued = settled(htmlToMarkdown("<p>q</p>", { budgetMs: 2_000 }));
+    const cancelled = settled(htmlToMarkdown("<p>c</p>", { signal: cancel.signal, budgetMs: 120_000 }));
+    expect(conversionSlots()).toMatchObject({ active: MAX_CONCURRENT_CONVERSIONS, waiting: 2 });
+    setTimeout(() => cancel.abort(), 100);
+    const q = await queued;
+    const c = await cancelled;
+    // Served once a slot frees, or refused at its budget; either way on time.
+    expect([{ markdown: "q" }, { error: expect.stringMatching(BUDGET_ERROR) }]).toContainEqual(q.r);
+    expect(q.ms).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+    expect(c.r).toEqual({ error: CANCELLED });
+    expect(c.ms).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+    for (const r of await Promise.all(running)) expect(r).toEqual({ error: expect.stringMatching(WORK_ERROR) });
+    expect(conversionSlots()).toEqual({ active: 0, waiting: 0, chars: 0 });
+  });
+
+  it("stops the Turndown step at its own cap, whatever the budget, and converts the same page under it", async () => {
+    // ~120,000 nodes of flat paragraphs: a Turndown step of tens of ms or more.
+    const html = "<p>xxxx yyyy</p>".repeat(60_000);
+    const e = await err(html, { budgetMs: 120_000, turndownMs: 1 });
+    expect(e).toMatch(STEP_ERROR);
+    expect(e).toContain("1 ms");
+    expect(e).toContain("fetch_html_to_text");
+    expect(await md(html, { budgetMs: 120_000 })).toMatch(/^xxxx yyyy\n\nxxxx yyyy/);
+    // A budget shorter than the cap reports the budget, as before.
+    expect(await err(html, { budgetMs: 1, turndownMs: 1 })).toMatch(BUDGET_ERROR);
+  });
+
+  // Seventh review: two admitted conversions whose parses finished together
+  // ran their synchronous steps back to back, so the stall was the sum (two
+  // of these pages: 3.2-4.4 s, vs 1.5-2.2 s alone; a 100 ms abort timer fired
+  // at 4.1 s, after the call it was meant to cancel had converted).
+  describe("one synchronous step per event-loop turn", () => {
+    const sixMiB = 6 * 1024 * 1024;
+    const preHead = `${"<blockquote>".repeat(20)}<pre>`;
+    const prePage = preHead + "aaa\n".repeat(Math.floor((sixMiB - preHead.length) / 4));
+
+    /** Runs the calls together, recording the longest timer gap and how many timer ticks fell between settles. */
+    async function together(calls: Array<() => Promise<{ markdown: string } | { error: string }>>) {
+      let last = performance.now();
+      let maxGapMs = 0;
+      let ticks = 0;
+      const timer = setInterval(() => {
+        const now = performance.now();
+        maxGapMs = Math.max(maxGapMs, now - last);
+        last = now;
+        ticks++;
+      }, 1);
+      const t0 = performance.now();
+      try {
+        const settled = await Promise.all(
+          calls.map((call) => call().then((r) => ({ r, ms: performance.now() - t0, ticks }))),
+        );
+        return { settled, maxGapMs: Math.max(maxGapMs, performance.now() - last) };
+      } finally {
+        clearInterval(timer);
+      }
+    }
+
+    it("runs two coincident 6 MiB steps on separate turns: the stall is one step's, not the sum", async () => {
+      expect(2 * prePage.length).toBeLessThanOrEqual(MAX_INPUT_IN_FLIGHT); // both admitted at once
+      const { settled, maxGapMs } = await together([
+        () => htmlToMarkdown(prePage, { budgetMs: 120_000 }),
+        () => htmlToMarkdown(prePage, { budgetMs: 120_000 }),
+      ]);
+      for (const { r } of settled) expect(r).toEqual({ error: expect.stringMatching(OUTPUT_ERROR) });
+      expect(maxGapMs).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+      // Timers ran between the two steps (they used to settle on the same tick).
+      const [a, b] = [...settled].sort((x, y) => x.ms - y.ms);
+      expect(b!.ticks).toBeGreaterThan(a!.ticks);
+      expect(turndownSteps()).toEqual({ running: false, waiting: 0 });
+      expect(conversionSlots()).toEqual({ active: 0, waiting: 0, chars: 0 });
+    });
+
+    it("settles a call aborted at 100 ms while it waits for the step, once the step ahead of it ends", async () => {
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(), 100);
+      const { settled, maxGapMs } = await together([
+        () => htmlToMarkdown(prePage, { budgetMs: 120_000 }),
+        () => htmlToMarkdown(prePage, { budgetMs: 120_000, signal: cancel.signal }),
+      ]);
+      expect(settled[0]!.r).toEqual({ error: expect.stringMatching(OUTPUT_ERROR) });
+      expect(settled[1]!.r).toEqual({ error: CANCELLED });
+      expect(settled[1]!.ms).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+      expect(maxGapMs).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+      expect(turndownSteps()).toEqual({ running: false, waiting: 0 });
+      expect(conversionSlots()).toEqual({ active: 0, waiting: 0, chars: 0 });
+    });
+
+    it("yields before the step even when the parse finishes in its first slice (never in the caller's microtask)", async () => {
+      const pending = htmlToMarkdown("<p>x</p>");
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+      expect(turndownSteps()).toEqual({ running: false, waiting: 1 });
+      expect(await pending).toEqual({ markdown: "x" });
+      expect(turndownSteps()).toEqual({ running: false, waiting: 0 });
+    });
+
+    it("a call waiting for the step is settled at its deadline, never run, and the next live one is served", async () => {
+      // Both admitted (two slots), both parsed within this turn, both waiting for the step.
+      const expired = htmlToMarkdown("<p>late</p>", { budgetMs: 5 });
+      const live = htmlToMarkdown("<p>live</p>");
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+      expect(turndownSteps()).toEqual({ running: false, waiting: 2 });
+      const turndown = vi.spyOn(TurndownService.prototype, "turndown");
+      const t0 = performance.now();
+      while (performance.now() - t0 < 20); // block past the 5 ms budget before any grant
+      expect(await expired).toEqual({ error: expect.stringMatching(BUDGET_ERROR) });
+      expect(await live).toEqual({ markdown: "live" });
+      expect(turndown).toHaveBeenCalledTimes(1);
+      turndown.mockRestore();
+      expect(turndownSteps()).toEqual({ running: false, waiting: 0 });
+    });
+  });
+
+  it("the vendored Turndown throws ConversionLimitError past maxWork, before the work runs (patch g)", () => {
+    const td = makeTurndown();
+    td.maxWork = 1_000;
+    let thrown: unknown;
+    try {
+      td.turndown(parseRoot(`<p>${"x".repeat(2_000)}</p>`));
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(ConversionLimitError);
+    expect(thrown).toMatchObject({ kind: "work", limit: 1_000 });
+    const ok = makeTurndown();
+    ok.maxWork = 10_000;
+    expect(ok.turndown(parseRoot(`<p>${"x".repeat(990)}</p>`))).toBe("x".repeat(990));
+    expect(ok.work).toBeLessThanOrEqual(10_000);
   });
 
   it("numbers 60,000 <ol> items without a per-item scan (was: quadratic)", async () => {

@@ -175,3 +175,33 @@ describe("forEachBalancedTag", () => {
     expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });
+
+describe("decodeHtmlEntities -- by hand, round 14", () => {
+  it("matches the one-pass regex it replaced on the edge cases", () => {
+    const cases: [string, string][] = [
+      ["", ""],
+      ["no entities", "no entities"],
+      ["&&amp;&", "&&&"],
+      ["&ampx; &amp;amp; &AMP;", "&ampx; &amp; &AMP;"],
+      ["&#x; &#; &#x41 &#X41; &#x4g;", "&#x; &#; &#x41 A &#x4g;"],
+      ["&#0065;&#x0041;", "AA"],
+      [`&#${"9".repeat(30)};`, "�"],
+      ["&#xD800;&#x110000;&#0;", "���"],
+      ["a&nbsp;b&quot;c&apos;d", "a b\"c'd"],
+      ["&lt&lt;", "&lt<"],
+    ];
+    for (const [input, expected] of cases) expect(decodeHtmlEntities(input)).toBe(expected);
+  });
+
+  it("returns a string with no & as it is", () => {
+    const s = "x".repeat(1000);
+    expect(decodeHtmlEntities(s)).toBe(s);
+  });
+
+  it("decodes millions of entities in linear time", () => {
+    const t0 = performance.now();
+    expect(decodeHtmlEntities("&amp;".repeat(2_000_000))).toBe("&".repeat(2_000_000));
+    expect(decodeHtmlEntities("&#65;x".repeat(1_000_000))).toBe("Ax".repeat(1_000_000));
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});

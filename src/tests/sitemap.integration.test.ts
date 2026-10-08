@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ABSOLUTE_MAX_TOTAL_MS, createRequester, setHttpContext } from "../http.js";
 import { createFetchServer } from "../server.js";
-import { registerSitemapTools } from "../tools/sitemap.js";
+import { MAX_XML_PARSE_BYTES, registerSitemapTools } from "../tools/sitemap.js";
 
 setHttpContext({ version: "test" });
 
@@ -442,5 +442,98 @@ describe("fetch_sitemap refuses a sitemap truncated at max_bytes", () => {
 
     expect(isError).toBe(false);
     expect(parsed!.urlCount).toBe(200);
+  });
+});
+
+describe("fetch_sitemap's per-document XML parse limit", () => {
+  // The parse is synchronous and uninterruptible, so a document past the limit
+  // is refused before it reaches the parser, whatever max_bytes says.
+  async function callWithParseLimit(maxParseBytes: number, input: Record<string, unknown>) {
+    const mcp = new McpServer({ name: "parse-limit-test", version: "0.0.0" });
+    registerSitemapTools(mcp, createRequester({ allowPrivateHosts: true }), {
+      totalMs: ABSOLUTE_MAX_TOTAL_MS,
+      maxParseBytes,
+    });
+    const tool = (
+      mcp as unknown as {
+        _registeredTools: Record<
+          string,
+          {
+            handler: (
+              input: unknown,
+              extra: { signal: AbortSignal },
+            ) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+          }
+        >;
+      }
+    )._registeredTools.fetch_sitemap!;
+    const out = await tool.handler(input, { signal: new AbortController().signal });
+    const raw = out.content[0]!.text;
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      /* error text */
+    }
+    return { raw, parsed, isError: Boolean(out.isError) };
+  }
+
+  it("turns a child past the limit into a warning naming the limit, and keeps the rest", async () => {
+    handler = (_req, res, url) => {
+      res.setHeader("content-type", "application/xml");
+      if (url.pathname === "/index.xml") {
+        res.end(
+          `<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>${baseUrl}/small.xml</loc></sitemap><sitemap><loc>${baseUrl}/big.xml.gz</loc></sitemap></sitemapindex>`,
+        );
+      } else if (url.pathname === "/small.xml") {
+        res.end(`<urlset><url><loc>${baseUrl}/a</loc></url></urlset>`);
+      } else {
+        res.setHeader("content-type", "application/x-gzip");
+        res.end(gzipSync(Buffer.from(`<urlset>${" ".repeat(64 * 1024)}</urlset>`, "utf8")));
+      }
+    };
+    const { parsed, isError } = await callWithParseLimit(16 * 1024, {
+      url: `${baseUrl}/index.xml`,
+      allow_private_hosts: true,
+    });
+
+    expect(isError).toBe(false);
+    expect(parsed!.urlCount).toBe(1);
+    expect(parsed!.warnings).toEqual([
+      {
+        url: `${baseUrl}/big.xml.gz`,
+        error:
+          "parse failed: sitemap XML is larger than the 16384-byte parse limit per document; larger documents are refused",
+      },
+    ]);
+  });
+
+  it("refuses a plain top-level sitemap past the limit even with a larger max_bytes", async () => {
+    handler = (_req, res) => {
+      res.setHeader("content-type", "application/xml");
+      res.end(`<urlset>${" ".repeat(64 * 1024)}</urlset>`);
+    };
+    const { raw, isError } = await callWithParseLimit(16 * 1024, {
+      url: `${baseUrl}/big.xml`,
+      allow_private_hosts: true,
+      max_bytes: 1024 * 1024,
+    });
+    expect(isError).toBe(true);
+    expect(raw).toContain("16384-byte parse limit");
+  });
+
+  it("applies the 16 MiB default in createFetchServer, with max_bytes at the 100 MiB ceiling", async () => {
+    const bomb = gzipSync(Buffer.alloc(MAX_XML_PARSE_BYTES + 1024, 0x20));
+    handler = (_req, res) => {
+      res.setHeader("content-type", "application/x-gzip");
+      res.end(bomb);
+    };
+    const { raw, isError } = await callSitemap({
+      url: `${baseUrl}/huge.xml.gz`,
+      allow_private_hosts: true,
+      max_bytes: 100 * 1024 * 1024,
+    });
+    expect(isError).toBe(true);
+    expect(raw).toContain(`${MAX_XML_PARSE_BYTES}-byte parse limit`);
   });
 });

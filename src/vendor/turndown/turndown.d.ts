@@ -2,7 +2,7 @@
  * Types for the vendored, patched Turndown in ./turndown.js. Adapted from
  * @types/turndown 5.0 (MIT), with DOM types replaced by the minimal domino
  * shapes (tsconfig has no DOM lib) and the patch surface added: node-only
- * input, `deadline` / `visited`, `maxOutput` / `work`, `chunkSize`,
+ * input, `deadline` / `visited`, `maxOutput` / `maxWork` / `work`, `chunkSize`,
  * `Rule.ignoresContent`, ConversionDeadlineError and ConversionLimitError.
  */
 import type { DomElement, DomNode } from "@mixmark-io/domino";
@@ -28,6 +28,8 @@ declare class TurndownService {
   visited: number;
   /** PATCH (g): cap, in characters, on the output collected for any one parent; past it, ConversionLimitError. */
   maxOutput?: number;
+  /** PATCH (g): cap, in characters, on the replacement work charged in all; past it, ConversionLimitError (kind "work"). */
+  maxWork?: number;
   /** PATCH (g): characters of replacement work charged by the last turndown() call. */
   readonly work: number;
   /**
@@ -96,7 +98,8 @@ export default TurndownService;
 /** PATCH (e): thrown once `deadline` has passed. */
 export declare class ConversionDeadlineError extends Error {}
 
-/** PATCH (g): thrown once the output collected for one parent passes `maxOutput`. */
+/** PATCH (g): thrown once the output collected for one parent passes `maxOutput`, or the work charged passes `maxWork`. */
 export declare class ConversionLimitError extends Error {
   readonly limit: number;
+  readonly kind: "output" | "work";
 }

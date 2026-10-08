@@ -13,14 +13,17 @@
  * and a DOM budget (nodes, attributes and template content). A page longer
  * than MAX_MARKDOWN_INPUT is refused outright, and at most
  * MAX_CONCURRENT_CONVERSIONS conversions, holding at most MAX_INPUT_IN_FLIGHT
- * input characters between them, run at once; nesting deeper than
+ * input characters between them, run at once, and only one synchronous step
+ * (tree walk plus Turndown) runs per event-loop turn; nesting deeper than
  * MAX_MARKDOWN_DEPTH, and more than MAX_TAG_NAMES distinct tag names, are
  * refused before Turndown sees the tree;
  * and the vendored Turndown (src/vendor/turndown, eleven patches) converts it
- * with O(1) work per node, under the same deadline (checked at every node, as
+ * with O(1) work per node, under the same deadline, cut to MAX_TURNDOWN_MS
+ * from the start of this synchronous step (checked at every node, as
  * replacement work accumulates, and every 64 Ki characters of any one string
- * operation, however long the text node, attribute or content it works on) and
- * an output cap of OUTPUT_FACTOR x the page plus OUTPUT_SLACK characters. It
+ * operation, however long the text node, attribute or content it works on),
+ * an output cap of OUTPUT_FACTOR x the page plus OUTPUT_SLACK characters and a
+ * work cap of WORK_FACTOR x the page plus WORK_SLACK characters. It
  * skips the subtrees whose output would be discarded (blank and removed
  * elements) and keeps no per-level copy of nested whitespace, so the heap it
  * retains stays linear in the page.
@@ -59,6 +62,28 @@ export const MAX_TAG_NAME_CHARS = 16_384;
 export const OUTPUT_FACTOR = 4;
 export const OUTPUT_SLACK = 1024 * 1024;
 /**
+ * Work cap: Turndown's replacement work (characters escaped, trimmed,
+ * re-prefixed and joined, counted before it runs) may not pass WORK_FACTOR x
+ * the page length plus WORK_SLACK characters in all. Nested blockquotes or
+ * list items re-prefix every line of their content at each level, so 200
+ * levels around flat text multiply the work 1,000-30,000x without any one
+ * parent's output passing the output cap. The 20 real pages measured charged
+ * at most 8.4x their length (repeated to 4-6 MiB, the same).
+ */
+export const WORK_FACTOR = 64;
+export const WORK_SLACK = 16 * 1024 * 1024;
+/**
+ * Longest the Turndown phase may run, whatever the budget. It is synchronous
+ * (bounded by the deadline and the caps above, not by yielding), so it holds
+ * the event loop, and every other request and cancellation, for as long as it
+ * runs; with `timeout_ms` up to 120 s that was a 16-37 s stall. Measured on
+ * Node 22, the slowest real page (the 20 pages, and each repeated to 4-8 MiB)
+ * held the loop 1.2 s, parse slices and tree walk included; a third of this.
+ * The worst hostile shape found holds it ~2.2 s. Concurrent conversions take
+ * turns at this step (the step gate below), so the stall never adds up.
+ */
+export const MAX_TURNDOWN_MS = 4000;
+/**
  * DOM budget: MIN_NODE_BUDGET plus one node per NODE_BUDGET_CHARS input
  * characters, at most MAX_NODE_BUDGET. Each attribute counts as
  * 1/ATTRS_PER_NODE of a node, and nodes inside <template> content count too.
@@ -74,10 +99,12 @@ export const ATTRS_PER_NODE = 4;
 /**
  * Longest page (in UTF-16 code units) converted at all; longer is refused
  * before anything is built. Peak memory scales with the text as well as the
- * DOM: measured on Node 22, one 8 MiB conversion of the worst shapes found
- * (a <pre> inside 30 nested blockquotes, escape-heavy text, text-heavy
- * tables) peaks 150-470 MB of RSS, 56x the input at worst, and one of 100 MiB
- * took 1.5-3 GB. 8 MiB is above the 5 MiB default `max_bytes`, so a page
+ * DOM: measured on Node 22's default heap, one 8 MiB conversion of the worst
+ * shapes found (flat lines or paragraphs under 200 nested blockquotes, a
+ * <pre> under 30 nested blockquotes or 100 list items, text-heavy tables,
+ * escape-heavy text) raises peak RSS by 140-780 MB, most of it garbage V8 has
+ * not collected yet: every one completes under --max-old-space-size=256,
+ * peaking at 270-370 MB of RSS. One of 100 MiB took 1.5-3 GB. 8 MiB is above the 5 MiB default `max_bytes`, so a page
  * fetched with the defaults is never refused for size; the largest of the 20
  * real pages measured was 2.96 M characters.
  */
@@ -85,8 +112,10 @@ export const MAX_MARKDOWN_INPUT = 8 * 1024 * 1024;
 /**
  * Conversions that may hold a DOM at once, and the input characters they may
  * hold between them; a call is always admitted when none is running. At 1.5x
- * MAX_MARKDOWN_INPUT, two pages near the ceiling never convert together (a
- * pair of the worst 8 MiB shapes peaked at 710 MB of RSS), while pages of
+ * MAX_MARKDOWN_INPUT, two pages near the ceiling never convert together (an
+ * admitted pair of the worst shapes, 6 MiB each, raised peak RSS by 650-740
+ * MB on the default heap and completed under --max-old-space-size=256 at
+ * 300-390 MB of RSS), while pages of
  * ordinary size still run two at a time. A call past either limit waits in a
  * FIFO queue holding only its input string; the wait counts against its
  * budget and ends early on its signal or deadline. Sliced parses interleave,
@@ -338,23 +367,24 @@ function schedulePump(): void {
 }
 
 /**
- * Take a slot for a `chars`-character conversion, waiting in FIFO order.
- * Gives up, leaving the queue, at the deadline or on the signal. The caller
- * must call releaseSlot(chars) once for every "ok".
+ * Wait in `queue` until a pump settles this waiter, or leave it at the
+ * deadline or on the signal (then `kick` the pump: the head may have been what
+ * blocked the rest).
  */
-function acquireSlot(chars: number, deadline: number, signal?: AbortSignal): Promise<SlotOutcome> {
-  if (waiting.length === 0 && admits(chars)) {
-    activeConversions++;
-    charsInFlight += chars;
-    return Promise.resolve("ok");
-  }
+function enqueue(
+  queue: Waiter[],
+  chars: number,
+  deadline: number,
+  signal: AbortSignal | undefined,
+  kick: () => void,
+): Promise<SlotOutcome> {
   return new Promise((resolve) => {
     const leave = (outcome: "deadline" | "cancelled") => {
-      const i = waiting.indexOf(waiter);
+      const i = queue.indexOf(waiter);
       if (i === -1) return; // already settled
-      waiting.splice(i, 1);
+      queue.splice(i, 1);
       waiter.settle(outcome);
-      schedulePump(); // the head may have been what blocked the rest
+      kick();
     };
     const onAbort = () => leave("cancelled");
     const timer = setTimeout(() => leave("deadline"), Math.max(0, deadline - performance.now()));
@@ -369,8 +399,22 @@ function acquireSlot(chars: number, deadline: number, signal?: AbortSignal): Pro
       },
     };
     signal?.addEventListener("abort", onAbort, { once: true });
-    waiting.push(waiter);
+    queue.push(waiter);
   });
+}
+
+/**
+ * Take a slot for a `chars`-character conversion, waiting in FIFO order.
+ * Gives up, leaving the queue, at the deadline or on the signal. The caller
+ * must call releaseSlot(chars) once for every "ok".
+ */
+function acquireSlot(chars: number, deadline: number, signal?: AbortSignal): Promise<SlotOutcome> {
+  if (waiting.length === 0 && admits(chars)) {
+    activeConversions++;
+    charsInFlight += chars;
+    return Promise.resolve("ok");
+  }
+  return enqueue(waiting, chars, deadline, signal, schedulePump);
 }
 
 function releaseSlot(chars: number): void {
@@ -379,11 +423,64 @@ function releaseSlot(chars: number): void {
   schedulePump();
 }
 
+/*
+ * The synchronous step gate. Each admitted conversion ends in one synchronous
+ * step (tree-shape walk plus Turndown, up to MAX_TURNDOWN_MS). Two parses that
+ * finish in the same check phase, or in one microtask drain, used to run their
+ * steps back to back, so the loop stalled for the sum (two 6 MiB pages:
+ * 3.2-4.1 s; a 100 ms abort timer fired at 4.1 s). Steps run one at a time,
+ * each granted from its own setImmediate scheduled after the previous step
+ * ended, so timers, I/O and cancellations run between any two steps, and a
+ * parse that finished inside the caller's microtask yields before its step.
+ */
+const stepQueue: Waiter[] = [];
+let stepRunning = false;
+let stepPumpScheduled = false;
+
+/** Whether a synchronous step runs, and how many wait for one (for tests and diagnostics). */
+export function turndownSteps(): { running: boolean; waiting: number } {
+  return { running: stepRunning, waiting: stepQueue.length };
+}
+
+function scheduleStepPump(): void {
+  if (stepPumpScheduled || stepRunning || stepQueue.length === 0) return;
+  stepPumpScheduled = true;
+  setImmediate(stepPump);
+}
+
+/** Grants the step to the first live waiter; settles the expired and cancelled ones it passes. */
+function stepPump(): void {
+  stepPumpScheduled = false;
+  while (!stepRunning && stepQueue.length > 0) {
+    const head = stepQueue.shift()!;
+    if (head.signal?.aborted) head.settle("cancelled");
+    else if (performance.now() >= head.deadline) head.settle("deadline");
+    else {
+      stepRunning = true;
+      head.settle("ok");
+    }
+  }
+}
+
+/** Wait for this conversion's turn at the synchronous step. Call releaseStep() once for every "ok". */
+function acquireStep(deadline: number, signal?: AbortSignal): Promise<SlotOutcome> {
+  const turn = enqueue(stepQueue, 0, deadline, signal, scheduleStepPump);
+  scheduleStepPump();
+  return turn;
+}
+
+function releaseStep(): void {
+  stepRunning = false;
+  scheduleStepPump();
+}
+
 export interface HtmlToMarkdownOptions {
   /** Cancels the conversion (tools pass the MCP request's `extra.signal`). */
   signal?: AbortSignal;
   /** Whole-conversion budget in ms, counted from the call (default DEFAULT_TIMEOUT_MS). */
   budgetMs?: number;
+  /** Cap on the synchronous Turndown step, clamped to MAX_TURNDOWN_MS (the default); only tests lower it. */
+  turndownMs?: number;
 }
 
 /**
@@ -396,7 +493,7 @@ export interface HtmlToMarkdownOptions {
  */
 export async function htmlToMarkdown(
   html: string,
-  { signal, budgetMs = DEFAULT_TIMEOUT_MS }: HtmlToMarkdownOptions = {},
+  { signal, budgetMs = DEFAULT_TIMEOUT_MS, turndownMs = MAX_TURNDOWN_MS }: HtmlToMarkdownOptions = {},
 ): Promise<{ markdown: string } | { error: string }> {
   const budgetError = {
     error: `HTML-to-markdown conversion exceeded its ${budgetMs} ms budget; fetch_html_to_text handles this page in linear time`,
@@ -412,7 +509,7 @@ export async function htmlToMarkdown(
   if (slot === "cancelled") return { error: CANCELLED };
   if (slot === "deadline") return budgetError;
   try {
-    return await convert(html, deadline, signal, budgetError);
+    return await convert(html, deadline, Math.min(turndownMs, MAX_TURNDOWN_MS), signal, budgetError);
   } catch (err) {
     if (err instanceof ConversionDeadlineError) return budgetError;
     return { error: `HTML-to-markdown conversion failed: ${(err as Error)?.message ?? String(err)}` };
@@ -425,6 +522,7 @@ export async function htmlToMarkdown(
 async function convert(
   html: string,
   deadline: number,
+  turndownMs: number,
   signal: AbortSignal | undefined,
   budgetError: { error: string },
 ): Promise<{ markdown: string } | { error: string }> {
@@ -449,6 +547,28 @@ async function convert(
   const root = parsed.root;
   if (!root) return { error: "HTML-to-markdown conversion failed: the parsed page has no root element" };
 
+  const turn = await acquireStep(deadline, signal);
+  if (turn === "cancelled") return { error: CANCELLED };
+  if (turn === "deadline") return budgetError;
+  try {
+    // Granted on a later loop turn: re-check what may have changed meanwhile.
+    if (signal?.aborted) return { error: CANCELLED };
+    if (performance.now() >= deadline) return budgetError;
+    return step(root, html.length, deadline, turndownMs, signal, budgetError);
+  } finally {
+    releaseStep();
+  }
+}
+
+/** The synchronous step: the tree-shape refusals, then Turndown. Run only while holding the step gate. */
+function step(
+  root: DomElement,
+  length: number,
+  deadline: number,
+  turndownMs: number,
+  signal: AbortSignal | undefined,
+  budgetError: { error: string },
+): { markdown: string } | { error: string } {
   const shape = treeShape(root, deadline);
   if (shape === null) return budgetError;
   if (shape.depth > MAX_MARKDOWN_DEPTH) {
@@ -463,17 +583,32 @@ async function convert(
   }
   if (signal?.aborted) return { error: CANCELLED };
 
-  const maxOutput = OUTPUT_FACTOR * html.length + OUTPUT_SLACK;
+  const maxOutput = OUTPUT_FACTOR * length + OUTPUT_SLACK;
+  const maxWork = WORK_FACTOR * length + WORK_SLACK;
+  // The phase cap binds only when it falls before the budget's deadline.
+  const phaseDeadline = performance.now() + turndownMs;
+  const phaseCapped = phaseDeadline < deadline;
   const td = makeTurndown();
-  td.deadline = deadline;
+  td.deadline = phaseCapped ? phaseDeadline : deadline;
   td.visited = 0;
   td.maxOutput = maxOutput;
+  td.maxWork = maxWork;
   try {
     return { markdown: td.turndown(root) };
   } catch (err) {
     if (err instanceof ConversionLimitError) {
+      if (err.kind === "work") {
+        return {
+          error: `page's markdown takes more than ${maxWork} characters of conversion work (the limit for a ${length}-character page; nesting repeats the work at every level), too much to convert; fetch_html_to_text handles this page in linear time`,
+        };
+      }
       return {
-        error: `page's markdown grows past ${maxOutput} characters while converting (the limit for a ${html.length}-character page), too large to convert; fetch_html_to_text handles this page in linear time`,
+        error: `page's markdown grows past ${maxOutput} characters while converting (the limit for a ${length}-character page), too large to convert; fetch_html_to_text handles this page in linear time`,
+      };
+    }
+    if (err instanceof ConversionDeadlineError && phaseCapped) {
+      return {
+        error: `HTML-to-markdown conversion ran past its ${turndownMs} ms limit for the markdown step (whatever the budget: it holds the server while it runs); fetch_html_to_text handles this page in linear time`,
       };
     }
     throw err;

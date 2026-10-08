@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { parseFeedXml } from "../tools/feed.js";
+import type { Server } from "node:http";
+import { createServer as createHttpServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { setHttpContext } from "../http.js";
+import { createFetchServer } from "../server.js";
+import { MAX_FEED_PARSE_BYTES, MAX_FEED_PARSE_TAGS, parseFeedXml } from "../tools/feed.js";
 
 describe("parseFeedXml — RSS 2.0", () => {
   const rss = `<?xml version="1.0" encoding="UTF-8"?>
@@ -141,6 +146,20 @@ describe("parseFeedXml — Atom content types", () => {
   });
 });
 
+describe("parseFeedXml — tag limit", () => {
+  // Markup costs the parser per tag: 16 MiB of `<x/>` parsed in 7.6 s under the byte limit alone.
+  it("refuses a feed with more than MAX_FEED_PARSE_TAGS tags without parsing it", () => {
+    const xml = `<rss><channel>${"<x/>".repeat(MAX_FEED_PARSE_TAGS)}</channel></rss>`;
+    expect(xml.length).toBeLessThan(MAX_FEED_PARSE_BYTES);
+    expect(() => parseFeedXml(xml)).toThrow(`feed has more than ${MAX_FEED_PARSE_TAGS} tags`);
+  });
+
+  it("parses a feed at the limit", () => {
+    const xml = `<rss><channel><title>t</title>${"<x/>".repeat(MAX_FEED_PARSE_TAGS - 6)}</channel></rss>`;
+    expect(parseFeedXml(xml).title).toBe("t");
+  });
+});
+
 describe("parseFeedXml — edge cases", () => {
   it("returns kind=unknown for non-feed XML", () => {
     const parsed = parseFeedXml('<?xml version="1.0"?><root/>');
@@ -170,5 +189,109 @@ describe("parseFeedXml — edge cases", () => {
     expect(parsed.kind).toBe("atom");
     expect(parsed.link).toBe("https://solo.example");
     expect(parsed.entries[0]?.link).toBe("https://solo.example/e");
+  });
+});
+
+describe("parseFeedXml on hostile XML", () => {
+  it("refuses input past the parse limit without parsing it", () => {
+    expect(MAX_FEED_PARSE_BYTES).toBe(16 * 1024 * 1024);
+    expect(() => parseFeedXml(`<rss>${" ".repeat(100)}</rss>`, 64)).toThrow(
+      "feed is larger than the 64-byte parse limit; larger feeds are refused",
+    );
+  });
+
+  it("keeps the attributes the extractors read and drops the rest", () => {
+    const xml = `<rss><channel><item a1="x" a2="y"><guid isPermaLink="false">abc</guid><title data-x="1">T</title></item></channel></rss>`;
+    const parsed = parseFeedXml(xml);
+    expect(parsed.entries[0]).toEqual({ id: "abc", title: "T" });
+    const atom = parseFeedXml(
+      `<feed><entry><link rel="self" href="https://x/self" foo="1"/><link rel="alternate" href="https://x/a"/><category term="t" scheme="s"/><content type="html" xml:lang="en">c</content></entry></feed>`,
+    );
+    expect(atom.entries[0]).toMatchObject({
+      link: "https://x/a",
+      categories: ["t"],
+      content: "c",
+      contentType: "html",
+    });
+  });
+
+  it("does not expand entities that reference other entities (billion laughs)", () => {
+    let dtd = '<!DOCTYPE rss [<!ENTITY a0 "xxxxxxxxxx">';
+    for (let i = 1; i < 10; i++) dtd += `<!ENTITY a${i} "${`&a${i - 1};`.repeat(10)}">`;
+    const parsed = parseFeedXml(`${dtd}]><rss><channel><item><title>&a9;</title></item></channel></rss>`);
+    expect(parsed.entries[0]!.title!.length).toBeLessThan(100);
+  });
+
+  it("throws past 100,000 expanded entity characters rather than inflating", () => {
+    const xml = `<!DOCTYPE rss [<!ENTITY b "${"y".repeat(9000)}">]><rss><channel>${"<item><title>&b;</title></item>".repeat(20)}</channel></rss>`;
+    expect(() => parseFeedXml(xml)).toThrow(/Expanded content length limit/);
+  });
+
+  it("throws on nesting past 100 levels", () => {
+    expect(() => parseFeedXml(`<rss>${"<a>".repeat(200)}${"</a>".repeat(200)}</rss>`)).toThrow(/nested tags/i);
+  });
+});
+
+describe("fetch_feed tool limits", () => {
+  setHttpContext({ version: "test" });
+  let server: Server;
+  let baseUrl: string;
+  let body = "";
+
+  beforeAll(async () => {
+    server = createHttpServer((_req, res) => {
+      res.setHeader("content-type", "application/rss+xml");
+      res.end(body);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  async function callFeed(input: Record<string, unknown>): Promise<{ raw: string; isError: boolean }> {
+    const s = createFetchServer({ allowPrivateHosts: true });
+    const tool = (
+      s as unknown as {
+        _registeredTools: Record<
+          string,
+          {
+            handler: (
+              input: unknown,
+              extra: { signal: AbortSignal },
+            ) => Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+          }
+        >;
+      }
+    )._registeredTools.fetch_feed!;
+    const out = await tool.handler(
+      { url: `${baseUrl}/feed.xml`, allow_private_hosts: true, ...input },
+      { signal: new AbortController().signal },
+    );
+    return { raw: out.content[0]!.text, isError: Boolean(out.isError) };
+  }
+
+  it("says a feed cut off at max_bytes is too large, rather than reporting a parse error", async () => {
+    body = `<rss><channel>${"<item><title>x</title></item>".repeat(500)}</channel></rss>`;
+    const { raw, isError } = await callFeed({ max_bytes: 4096 });
+    expect(isError).toBe(true);
+    expect(raw).toContain("feed is larger than max_bytes (4096 bytes); raise max_bytes to read it");
+  });
+
+  it("refuses a feed past the 16 MiB parse limit even when max_bytes allows it", async () => {
+    body = `<rss><channel>${" ".repeat(MAX_FEED_PARSE_BYTES)}</channel></rss>`;
+    const { raw, isError } = await callFeed({ max_bytes: 20 * 1024 * 1024 });
+    body = "";
+    expect(isError).toBe(true);
+    expect(raw).toContain(`feed is larger than the ${MAX_FEED_PARSE_BYTES}-byte parse limit`);
+  });
+
+  it("still parses a feed that fits", async () => {
+    body = "<rss><channel><title>T</title><item><title>one</title></item></channel></rss>";
+    const { raw, isError } = await callFeed({});
+    expect(isError).toBe(false);
+    expect(JSON.parse(raw)).toMatchObject({ kind: "rss", title: "T", entryCount: 1 });
   });
 });

@@ -85,24 +85,139 @@ const NAMED_ENTITIES: Record<string, string> = {
   nbsp: " ",
 };
 
-const ENTITY_RE = /&(?:#[xX]([0-9a-fA-F]+)|#([0-9]+)|(amp|lt|gt|quot|apos|nbsp));/g;
+/** Pieces joined into one chunk at a time, so a million one-character pieces never sit in one array. */
+const PIECES_PER_CHUNK = 4096;
+
+/**
+ * Builds a string out of ranges of `src` and literal pieces, for output the
+ * size of a whole page. Adjacent ranges merge, so text copied through in
+ * order costs one slice (or `src` itself), and pieces are joined a few
+ * thousand at a time: `out += piece` per piece, or one array of every piece,
+ * kept 30-40 bytes per input character alive on a page of one-character text
+ * runs or dense entities.
+ */
+export class TextBuilder {
+  private parts: string[] = [];
+  private readonly chunks: string[] = [];
+  private from = -1;
+  private to = -1;
+
+  constructor(private readonly src: string) {}
+
+  /** Append `src.slice(from, to)`. */
+  range(from: number, to: number): void {
+    if (from >= to) return;
+    if (from === this.to) {
+      this.to = to;
+      return;
+    }
+    this.flushRange();
+    this.from = from;
+    this.to = to;
+  }
+
+  /** Append a piece that is not a range of `src`. */
+  literal(s: string): void {
+    this.flushRange();
+    this.push(s);
+  }
+
+  done(): string {
+    if (this.parts.length === 0 && this.chunks.length === 0) {
+      if (this.to <= this.from) return "";
+      return this.from === 0 && this.to === this.src.length ? this.src : this.src.slice(this.from, this.to);
+    }
+    this.flushRange();
+    if (this.parts.length > 0) this.chunks.push(this.parts.join(""));
+    this.parts = [];
+    return this.chunks.length === 1 ? this.chunks[0]! : this.chunks.join("");
+  }
+
+  private flushRange(): void {
+    if (this.to > this.from) this.push(this.src.slice(this.from, this.to));
+    this.from = -1;
+    this.to = -1;
+  }
+
+  private push(s: string): void {
+    this.parts.push(s);
+    if (this.parts.length === PIECES_PER_CHUNK) {
+      this.chunks.push(this.parts.join(""));
+      this.parts = [];
+    }
+  }
+}
+
+const NAMED_ENTITY_NAMES = Object.keys(NAMED_ENTITIES);
+
+function isDigit(c: number): boolean {
+  return c >= 48 && c <= 57;
+}
+
+function isHexDigit(c: number): boolean {
+  return isDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+}
 
 /**
  * Decode the narrow set of HTML entities we encounter in attribute values and
  * short runs of text. This is not a full entity decoder — it covers the named
  * entities that matter (&amp; &lt; &gt; &quot; &apos; &nbsp;) plus the
- * numeric forms &#N; and &#xN;.
+ * numeric forms &#N; and &#xN;, each with its `;`.
  *
  * One pass over the input, so the output of one entity is never read as the
  * start of another: `&amp;lt;` decodes to the text `&lt;`, not to `<`. Code
  * points the HTML spec refuses (NUL, surrogates, past U+10FFFF) decode to
  * U+FFFD instead of reaching `String.fromCodePoint`, which throws past U+10FFFF.
+ *
+ * By hand rather than `String.replace` with a callback: stripHtmlToText runs
+ * it over a whole page, and a page of `&amp;` built millions of match arrays
+ * and one-character strings (3.8 GB for 100 MiB). Text between entities is
+ * copied as ranges; a page with no `&` comes back as is.
  */
 export function decodeHtmlEntities(s: string): string {
-  return s.replace(ENTITY_RE, (_, hex: string | undefined, dec: string | undefined, name: string | undefined) => {
-    if (name !== undefined) return NAMED_ENTITIES[name]!;
-    return codePointToString(hex !== undefined ? Number.parseInt(hex, 16) : Number.parseInt(dec!, 10));
-  });
+  let amp = s.indexOf("&");
+  if (amp === -1) return s;
+  const out = new TextBuilder(s);
+  let copied = 0;
+  const n = s.length;
+  while (amp !== -1) {
+    let end = -1;
+    let decoded = "";
+    let j = amp + 1;
+    if (s.charCodeAt(j) === 35 /* # */) {
+      j++;
+      const x = s.charCodeAt(j);
+      let hex = false;
+      if ((x === 120 || x === 88) /* x X */ && isHexDigit(s.charCodeAt(j + 1))) {
+        hex = true;
+        j++;
+      }
+      const digits = j;
+      while (j < n && (hex ? isHexDigit(s.charCodeAt(j)) : isDigit(s.charCodeAt(j)))) j++;
+      if (j > digits && s.charCodeAt(j) === 59 /* ; */) {
+        end = j + 1;
+        decoded = codePointToString(Number.parseInt(s.slice(digits, j), hex ? 16 : 10));
+      }
+    } else {
+      for (const name of NAMED_ENTITY_NAMES) {
+        if (s.startsWith(name, j) && s.charCodeAt(j + name.length) === 59) {
+          end = j + name.length + 1;
+          decoded = NAMED_ENTITIES[name]!;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      amp = s.indexOf("&", amp + 1);
+      continue;
+    }
+    out.range(copied, amp);
+    out.literal(decoded);
+    copied = end;
+    amp = s.indexOf("&", end);
+  }
+  out.range(copied, n);
+  return out.done();
 }
 
 function codePointToString(n: number): string {

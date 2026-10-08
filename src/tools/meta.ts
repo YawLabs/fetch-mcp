@@ -24,21 +24,76 @@ export interface PageMeta {
   icons: Array<{ href: string; sizes?: string; rel: string }>;
   feeds: Array<{ href: string; title?: string; type?: string }>;
   jsonLd: unknown[];
+  /**
+   * Present only when a collection hit its cap: the names of those
+   * collections (`icons`, `feeds`, `og`, `twitter`, `article`, `jsonLd`).
+   */
+  truncated?: string[];
 }
 
-function collect(dict: Record<string, string>, allDict: Record<string, string[]>, key: string, value: string) {
-  if (!(key in dict)) dict[key] = value;
-  if (!allDict[key]) allDict[key] = [];
-  allDict[key].push(value);
-}
+/** Most entries kept in `icons`, `feeds`, `jsonLd` and each `*All` array. */
+export const MAX_META_LIST = 100;
+/** Most distinct keys kept in each of `og`, `twitter` and `article`. */
+export const MAX_META_KEYS = 1000;
+/** A JSON-LD block nested deeper than this is dropped, unparsed. */
+export const MAX_JSON_LD_DEPTH = 64;
 
-/** Reduce the "all" dict to only keys with more than one distinct entry. */
-function pruneSingles(all: Record<string, string[]>): Record<string, string[]> {
-  const out: Record<string, string[]> = {};
-  for (const [k, v] of Object.entries(all)) {
-    if (v.length > 1) out[k] = v;
+/**
+ * One `og:` / `twitter:` / `article:` family. A Map, not an object literal:
+ * a key such as `constructor` or `__proto__` read the prototype's member as
+ * an existing entry and threw on `.push`.
+ */
+class MetaFamily {
+  readonly values = new Map<string, string[]>();
+  truncated = false;
+
+  add(key: string, value: string): void {
+    let list = this.values.get(key);
+    if (list === undefined) {
+      if (this.values.size >= MAX_META_KEYS) {
+        this.truncated = true;
+        return;
+      }
+      list = [];
+      this.values.set(key, list);
+    }
+    if (list.length >= MAX_META_LIST) {
+      this.truncated = true;
+      return;
+    }
+    list.push(value);
   }
-  return out;
+
+  /** First observed value per key. `fromEntries` defines own properties, so `__proto__` stays a key. */
+  first(): Record<string, string> {
+    return Object.fromEntries([...this.values].map(([k, v]) => [k, v[0] as string]));
+  }
+
+  /** Only keys with more than one entry. */
+  repeated(): Record<string, string[]> {
+    return Object.fromEntries([...this.values].filter(([, v]) => v.length > 1));
+  }
+}
+
+/**
+ * Whether `raw` nests arrays/objects deeper than `limit`, in one linear pass
+ * that skips string contents. Malformed input just answers by its brackets;
+ * JSON.parse rejects it afterwards.
+ */
+export function jsonNestsDeeperThan(raw: string, limit: number): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    if (inString) {
+      if (c === 0x5c /* backslash */) i++;
+      else if (c === 0x22 /* " */) inString = false;
+    } else if (c === 0x22) inString = true;
+    else if (c === 0x5b /* [ */ || c === 0x7b /* { */) {
+      if (++depth > limit) return true;
+    } else if (c === 0x5d /* ] */ || c === 0x7d /* } */) depth--;
+  }
+  return false;
 }
 
 /** Offset of the first `</head>` the mask marks, or -1. */
@@ -68,12 +123,10 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
   const htmlTag = findTags(html, "html", mask).next();
   const language = htmlTag.done ? undefined : parseAttrs(htmlTag.value.attrsText).lang;
 
-  const og: Record<string, string> = {};
-  const twitter: Record<string, string> = {};
-  const article: Record<string, string> = {};
-  const ogAllRaw: Record<string, string[]> = {};
-  const twitterAllRaw: Record<string, string[]> = {};
-  const articleAllRaw: Record<string, string[]> = {};
+  const og = new MetaFamily();
+  const twitter = new MetaFamily();
+  const article = new MetaFamily();
+  const truncated = new Set<string>();
   let description: string | undefined;
   let robots: string | undefined;
 
@@ -85,9 +138,9 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
     if (!name || content === undefined) continue;
     if (name === "description") description = description ?? content;
     else if (name === "robots") robots = robots ?? content;
-    else if (name.startsWith("og:")) collect(og, ogAllRaw, name.slice(3), content);
-    else if (name.startsWith("twitter:")) collect(twitter, twitterAllRaw, name.slice(8), content);
-    else if (name.startsWith("article:")) collect(article, articleAllRaw, name.slice(8), content);
+    else if (name.startsWith("og:")) og.add(name.slice(3), content);
+    else if (name.startsWith("twitter:")) twitter.add(name.slice(8), content);
+    else if (name.startsWith("article:")) article.add(name.slice(8), content);
   }
 
   let canonical: string | undefined;
@@ -98,17 +151,25 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
     const rel = (attrs.rel ?? "").toLowerCase();
     const href = attrs.href;
     if (!href || !rel) continue;
-    const abs = resolveUrl(baseUrl, href);
-    if (rel === "canonical") canonical = canonical ?? abs;
+    // Resolve only what is kept: each resolved href carries the whole base
+    // URL, so resolving every link cost time and memory in links x URL length.
+    if (rel === "canonical" && canonical === undefined) canonical = resolveUrl(baseUrl, href);
     if (rel.includes("icon")) {
-      const icon: PageMeta["icons"][number] = { rel, href: abs };
-      if (attrs.sizes) icon.sizes = attrs.sizes;
-      icons.push(icon);
+      if (icons.length >= MAX_META_LIST) truncated.add("icons");
+      else {
+        const icon: PageMeta["icons"][number] = { rel, href: resolveUrl(baseUrl, href) };
+        if (attrs.sizes) icon.sizes = attrs.sizes;
+        icons.push(icon);
+      }
     }
     if (rel === "alternate") {
       const type = attrs.type ?? "";
       if (type.includes("rss") || type.includes("atom") || type.includes("xml") || type.includes("json")) {
-        const feed: PageMeta["feeds"][number] = { href: abs };
+        if (feeds.length >= MAX_META_LIST) {
+          truncated.add("feeds");
+          continue;
+        }
+        const feed: PageMeta["feeds"][number] = { href: resolveUrl(baseUrl, href) };
         if (attrs.title) feed.title = attrs.title;
         if (type) feed.type = type;
         feeds.push(feed);
@@ -129,6 +190,12 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
     if (close === -1) break;
     const raw = html.slice(tag.contentStart, close).trim();
     if (!raw) continue;
+    // Too many blocks, or one nested past the limit, is dropped before
+    // JSON.parse: the depth would only amplify the pretty-printed output.
+    if (jsonLd.length >= MAX_META_LIST || jsonNestsDeeperThan(raw, MAX_JSON_LD_DEPTH)) {
+      truncated.add("jsonLd");
+      continue;
+    }
     try {
       jsonLd.push(JSON.parse(raw));
     } catch {
@@ -136,23 +203,33 @@ export function parseHtmlMeta(html: string, baseUrl: string): PageMeta {
     }
   }
 
-  return {
+  for (const [name, family] of [
+    ["og", og],
+    ["twitter", twitter],
+    ["article", article],
+  ] as const) {
+    if (family.truncated) truncated.add(name);
+  }
+
+  const meta: PageMeta = {
     url: baseUrl,
     title,
     description,
     canonical,
     language,
     robots,
-    og,
-    twitter,
-    article,
-    ogAll: pruneSingles(ogAllRaw),
-    twitterAll: pruneSingles(twitterAllRaw),
-    articleAll: pruneSingles(articleAllRaw),
+    og: og.first(),
+    twitter: twitter.first(),
+    article: article.first(),
+    ogAll: og.repeated(),
+    twitterAll: twitter.repeated(),
+    articleAll: article.repeated(),
     icons,
     feeds,
     jsonLd,
   };
+  if (truncated.size > 0) meta.truncated = [...truncated];
+  return meta;
 }
 
 function resolveUrl(base: string, href: string): string {
@@ -166,7 +243,7 @@ function resolveUrl(base: string, href: string): string {
 export function registerMetaTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_meta",
-    "GET a URL and extract its head metadata: title, description, canonical, language, robots directive, Open Graph / Twitter Card / article: properties, icon links, RSS/Atom feed links, and any JSON-LD (schema.org) blocks. Keys that appear more than once (e.g. multiple og:image tags) are additionally returned via ogAll/twitterAll/articleAll arrays. Ideal for previewing a page before fully reading it.",
+    "GET a URL and extract its head metadata: title, description, canonical, language, robots directive, Open Graph / Twitter Card / article: properties, icon links, RSS/Atom feed links, and any JSON-LD (schema.org) blocks. Keys that appear more than once (e.g. multiple og:image tags) are additionally returned via ogAll/twitterAll/articleAll arrays. Lists are capped: at most 100 icons, feeds, JSON-LD blocks and values per *All key, and 1000 keys per og/twitter/article; a JSON-LD block nested deeper than 64 levels is dropped. When anything is cut, `truncated` names the collections affected. Ideal for previewing a page before fully reading it.",
     {
       url: z.string().url().describe("URL to extract metadata from"),
       timeout_ms: z.number().int().positive().max(60_000).optional(),

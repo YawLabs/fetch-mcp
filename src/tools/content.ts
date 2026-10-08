@@ -4,7 +4,7 @@ import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
 import { htmlToMarkdown } from "../markdown.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
-import { decodeHtmlEntities, findTagEnd, type TagMask } from "./html.js";
+import { decodeHtmlEntities, findTagEnd, type TagMask, TextBuilder } from "./html.js";
 
 /** Elements dropped with their content: raw text a browser does not render. */
 const DROPPED_ELEMENTS = new Set(["script", "style", "noscript", "iframe", "noembed", "noframes"]);
@@ -20,6 +20,9 @@ const TAG_NAME_RE = /[a-zA-Z][^\t\n\f\r />]*/y;
 const END_TAG_RE = new Map(
   [...DROPPED_ELEMENTS, ...TEXT_ELEMENTS].map((name) => [name, new RegExp(`</${name}(?=[\\t\\n\\f\\r />]|$)`, "gi")]),
 );
+
+/** Where a start tag may begin. */
+const TAG_START_RE = /<[a-zA-Z]/g;
 
 /** Comment ends: `-->`, or `--!>`, which a browser also accepts. */
 const COMMENT_END_RE = /--!?>/g;
@@ -146,6 +149,19 @@ interface ScanState {
   sync: number[];
   /** Text before this offset is not emitted: a raw-text extent hidden while the markup inside it is still read. */
   hideUntil: number;
+  /** Where the hidden raw-text extent that runs to `hideUntil` starts. */
+  hideFrom: number;
+  /** The offset of each open `<template>` outside an island, innermost last. */
+  templateAt: number[];
+  /**
+   * Just past the first `</template>` since the outermost template opened
+   * that the scan skipped, inside an island, because an element open there
+   * may hold it as raw text; -1 when none. Another reading closed a template
+   * there.
+   */
+  diverged: number;
+  /** The first start tag at or after `diverged` (-1 when none), once looked for. */
+  divergedStart: number | undefined;
   /** End tags before this offset close nothing: inside an island they may sit in CDATA, where SVG reads them as text. */
   cdataUntil: number;
   /** The last `</name` found per raw-text name and where its search began, so overlapping searches are not repeated. */
@@ -185,14 +201,42 @@ function popIsland(st: ScanState): void {
   if (RAW_IN_HTML.has(entry.name) || entry.name === "template") st.rawOpen--;
 }
 
-function openTemplate(st: ScanState): void {
+function openTemplate(st: ScanState, lt: number): void {
   st.template++;
+  st.templateAt.push(lt);
   st.selectOuter.push((st.select ? 1 : 0) | (st.selectMaybe ? 2 : 0));
   setSelect(st, false);
 }
 
-function closeTemplate(st: ScanState): void {
+/**
+ * Close the innermost template at the `</template>` at `lt`. Inside a hidden
+ * raw-text extent the scan reads as markup (`hideRawExtent`), the raw reading
+ * takes the `</template>` as text: when the template opened before that
+ * extent, that reading keeps it open past the extent, where the scan would
+ * show its content (`<template><svg><select></svg><style></template>x</style>y`
+ * hides `y`). The two cannot be reconciled, so the rest of the input is hidden.
+ */
+function closeTemplate(html: string, st: ScanState, lt: number): void {
+  const n = html.length;
   st.template--;
+  const openedAt = st.templateAt.pop() ?? 0;
+  if (lt < st.hideUntil && openedAt < st.hideFrom) st.hideUntil = n;
+  // A `</template>` an island element may have held as raw text (`diverged`)
+  // already closed this template in the other reading, which has read the
+  // markup since then outside it. With only end tags, text and comments in
+  // between, it is where the scan is now: no deeper in a template, in no
+  // island. A start tag in between may have opened anything there.
+  if (st.diverged !== -1 && openedAt < st.diverged) {
+    if (st.divergedStart === undefined) {
+      TAG_START_RE.lastIndex = st.diverged;
+      st.divergedStart = TAG_START_RE.exec(html)?.index ?? -1;
+    }
+    if (st.divergedStart !== -1 && st.divergedStart < lt) st.hideUntil = n;
+  }
+  if (st.template === 0) {
+    st.diverged = -1;
+    st.divergedStart = undefined;
+  }
   const saved = st.selectOuter.pop() ?? 0;
   st.select = (saved & 1) !== 0;
   st.selectMaybe = (saved & 2) !== 0;
@@ -236,23 +280,33 @@ function leaveIsland(st: ScanState): void {
  * across the HTML end tag of one -- it hides the rest of the input.
  */
 export function stripHtmlToText(html: string): string {
-  let out = "";
+  const out = new TextBuilder(html);
   const st = newScanState(undefined);
-  // `at` is where the text starts in the input, for `hideUntil`.
-  const emit = (text: string, at: number) => {
-    if (st.hidden !== 0 || st.template !== 0) return;
-    if (at < st.hideUntil) {
-      if (st.hideUntil - at >= text.length) return;
-      out += text.slice(st.hideUntil - at);
-      return;
-    }
-    out += text;
-  };
-  scan(html, st, emit);
-  return trimLineEnds(decodeHtmlEntities(out))
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const shown = (at: number) => st.hidden === 0 && st.template === 0 && at >= st.hideUntil;
+  scan(html, st, {
+    text(from, to) {
+      if (st.hidden !== 0 || st.template !== 0) return;
+      out.range(Math.max(from, st.hideUntil), to);
+    },
+    newline(at) {
+      if (shown(at)) out.literal("\n");
+    },
+  });
+  return tidyLines(decodeHtmlEntities(out.done())).trim();
 }
+
+/**
+ * Where the scan hands over text: `text` for a range of the input, `newline`
+ * for a line break that stands for markup at `at` (`<br>`, the end of a block).
+ * Ranges, not strings, so text the page carries through in order is copied
+ * once, at the end, and never piece by piece.
+ */
+interface Emitter {
+  text(from: number, to: number): void;
+  newline(at: number): void;
+}
+
+const NO_EMIT: Emitter = { text() {}, newline() {} };
 
 /**
  * The offsets of the tags `stripHtmlToText` reads as rendered markup, for a
@@ -266,7 +320,7 @@ export function stripHtmlToText(html: string): string {
  */
 export function visibleTagMask(html: string): TagMask {
   const st = newScanState(new Uint8Array(html.length));
-  scan(html, st, () => {});
+  scan(html, st, NO_EMIT);
   return st.tags!;
 }
 
@@ -282,6 +336,10 @@ function newScanState(tags: TagMask | undefined): ScanState {
     selectOuter: [],
     sync: [],
     hideUntil: 0,
+    hideFrom: 0,
+    templateAt: [],
+    diverged: -1,
+    divergedStart: undefined,
     cdataUntil: 0,
     rawClose: new Map(),
     cdataClose: undefined,
@@ -291,34 +349,59 @@ function newScanState(tags: TagMask | undefined): ScanState {
   };
 }
 
-function scan(html: string, st: ScanState, emit: (text: string, at: number) => void): void {
+function scan(html: string, st: ScanState, emit: Emitter): void {
   let i = 0;
   const n = html.length;
   while (i < n) {
     const lt = html.indexOf("<", i);
     if (lt === -1) {
-      emit(html.slice(i), i);
+      emit.text(i, n);
       break;
     }
-    emit(html.slice(i, lt), i);
+    emit.text(i, lt);
     i = skipMarkup(html, lt, st, emit);
   }
 }
 
 /**
- * Strip spaces and tabs from the end of every line. By hand: `/[ \t]+\n/g`
+ * Strip spaces and tabs from the end of every line and squeeze each run of
+ * blank lines to one; the caller trims the ends. By hand: `/[ \t]+\n/g`
  * retries at every blank of a long run with no newline after it, so a page of
- * blanks took quadratic time.
+ * blanks took quadratic time, and `split("\n")` held one string per line (a
+ * page of `<\n` is 50 million of them in 100 MiB). Lines are kept as ranges
+ * of `text`, so text with nothing to strip comes back as is.
  */
-function trimLineEnds(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => {
-      let end = line.length;
-      while (end > 0 && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
-      return end === line.length ? line : line.slice(0, end);
-    })
-    .join("\n");
+function tidyLines(text: string): string {
+  const out = new TextBuilder(text);
+  const n = text.length;
+  // Newlines since the last line with content, and where the first two are.
+  let breaks = 0;
+  let break1 = 0;
+  let break2 = 0;
+  let any = false;
+  let i = 0;
+  while (i <= n) {
+    let nl = text.indexOf("\n", i);
+    if (nl === -1) nl = n;
+    let end = nl;
+    while (end > i && (text.charCodeAt(end - 1) === 32 || text.charCodeAt(end - 1) === 9)) end--;
+    if (end > i) {
+      // Blank lines before the first content line would be trimmed anyway.
+      if (any && breaks > 0) {
+        out.range(break1, break1 + 1);
+        if (breaks > 1) out.range(break2, break2 + 1);
+      }
+      out.range(i, end);
+      any = true;
+      breaks = 0;
+    }
+    if (nl === n) break;
+    if (breaks === 0) break1 = nl;
+    else if (breaks === 1) break2 = nl;
+    breaks++;
+    i = nl + 1;
+  }
+  return out.done();
 }
 
 /**
@@ -346,7 +429,7 @@ function readingDiffers(st: ScanState, name: string): boolean {
  * reading starts there, which may open hidden content. The scan cannot follow
  * both from there, so it hides the rest of the input.
  */
-function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string, at: number) => void): number {
+function skipMarkup(html: string, lt: number, st: ScanState, emit: Emitter): number {
   const next = readMarkup(html, lt, st, emit);
   return crossesSyncPoint(st, lt, next) ? html.length : next;
 }
@@ -375,7 +458,7 @@ function addSyncPoint(st: ScanState, at: number): void {
   if (!st.sync.includes(at)) st.sync.push(at);
 }
 
-function readMarkup(html: string, lt: number, st: ScanState, emit: (text: string, at: number) => void): number {
+function readMarkup(html: string, lt: number, st: ScanState, emit: Emitter): number {
   const n = html.length;
   const next = html[lt + 1];
 
@@ -406,7 +489,7 @@ function readMarkup(html: string, lt: number, st: ScanState, emit: (text: string
       const gt = html.indexOf(">", lt + 2);
       return gt === -1 ? n : gt + 1;
     }
-    emit("<", lt);
+    emit.text(lt, lt + 1);
     return lt + 1;
   }
 
@@ -438,20 +521,27 @@ function readMarkup(html: string, lt: number, st: ScanState, emit: (text: string
         // island with it -- unless an element open in the island could be
         // raw text that holds the `</template>`, or is a template itself.
         leaveIsland(st);
-        closeTemplate(st);
+        closeTemplate(html, st, lt);
+      } else if (name === "template" && st.template > 0) {
+        // One of those is open. Read as SVG / MathML it holds markup, and the
+        // `</template>` closes the template here; read as HTML raw text it
+        // does not. The scan keeps the template open, hiding; the readings
+        // meet again only if nothing opens before the scan closes it too
+        // (`closeTemplate`).
+        if (st.diverged === -1) st.diverged = after;
       }
     } else if (name === "template" && st.template > 0) {
-      closeTemplate(st);
+      closeTemplate(html, st, lt);
     } else if (name === "select") {
       setSelect(st, false);
     }
-    if (BLOCK_ELEMENTS.has(name)) emit("\n", lt);
+    if (BLOCK_ELEMENTS.has(name)) emit.newline(lt);
     return after;
   }
 
   if (st.island.length > 0 && BREAKOUT_ELEMENTS.has(name)) st.foreign = false;
   if (name === "br") {
-    emit("\n", lt);
+    emit.newline(lt);
     return after;
   }
 
@@ -514,45 +604,39 @@ function readMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   if (name === "input" || name === "keygen" || name === "textarea") setSelect(st, false);
   // In a select, a classic parser ignores these and reads on as markup; a
   // customizable select, or a page whose select only maybe opened, reads
-  // their content as text. Read as markup it shows less, so the scan reads it
-  // so; the text reading resumes at the end tag, a sync point.
+  // their content as text. The scan reads the markup inside, where a
+  // `<template>` may open; the text reading resumes at the end tag, a sync
+  // point. In a template, or where the select only maybe opened, it also
+  // hides the raw extent: read as text it may hold a `</template>` that the
+  // markup reading takes as a close (`<template><svg><select></svg><title>
+  // </template>` is SVG's select, and the title is RCDATA to the end).
+  // Elsewhere no template is open for it to close, and the text it shows is
+  // text in either reading.
   if (st.select && (name === "title" || name === "xmp" || name === "plaintext")) {
-    const close = name === "plaintext" ? -1 : endTag(html, after, name, st);
-    if (close !== -1) addSyncPoint(st, close);
+    if (st.selectMaybe || st.template > 0) {
+      hideRawExtent(html, lt, after, name, st);
+    } else if (name !== "plaintext") {
+      const close = endTag(html, after, name, st);
+      if (close !== -1) addSyncPoint(st, close);
+    }
     return after;
   }
   // A browser ignores the self-closing flag on these, as on every non-void
   // HTML element: `<script src=x />` still hides everything to `</script>`.
   if (name === "template") {
-    openTemplate(st);
+    openTemplate(st, lt);
     return after;
   }
   if (name === "plaintext") {
-    emit(html.slice(after), after);
+    emit.text(after, n);
     return n;
   }
   if (st.select && DROPPED_ELEMENTS.has(name) && name !== "script") {
     // A classic parser ignores these inside a <select> and reads on as
     // markup, where a <template> may open; a customizable select, or a page
     // whose select only maybe opened, reads them as raw text. Hide the raw
-    // extent and read the markup inside it too; the raw reading resumes at
-    // the end tag, a sync point.
-    const close = endTag(html, after, name, st);
-    if (close === -1) {
-      st.hideUntil = n;
-      return after;
-    }
-    addSyncPoint(st, close);
-    // Measured once per end tag: many openers share one, and measuring an end
-    // tag with an unclosed quoted attribute reads to the end of the input.
-    // Nothing to measure once the hidden extent already runs to the end.
-    if (st.hideUntil >= n) return after;
-    let closeEnd = st.closeEnd.get(close);
-    if (closeEnd === undefined) {
-      closeEnd = endTagEnd(html, close, name);
-      st.closeEnd.set(close, closeEnd);
-    }
-    st.hideUntil = Math.max(st.hideUntil, closeEnd);
+    // extent and read the markup inside it too.
+    hideRawExtent(html, lt, after, name, st);
     return after;
   }
   if (DROPPED_ELEMENTS.has(name)) {
@@ -562,10 +646,11 @@ function readMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   if (TEXT_ELEMENTS.has(name)) {
     const close = endTag(html, after, name);
     if (close === -1) {
-      emit(html.slice(after), after);
+      emit.text(after, n);
       return n;
     }
-    emit(`${html.slice(after, close)}\n`, after);
+    emit.text(after, close);
+    emit.newline(close);
     return endTagEnd(html, close, name);
   }
   return after;
@@ -603,6 +688,34 @@ function endTag(html: string, from: number, name: string, st?: ScanState): numbe
   const at = m === null ? -1 : m.index;
   st?.rawClose.set(name, { from, at });
   return at;
+}
+
+/**
+ * Hide the raw-text extent of the `name` element at `lt`, whose content
+ * starts at `after` and which the scan reads as markup: to the end of its end
+ * tag, or to the end of the input when it has none (`<plaintext>` never
+ * does). The raw reading resumes at the end tag, a sync point.
+ */
+function hideRawExtent(html: string, lt: number, after: number, name: string, st: ScanState): void {
+  const n = html.length;
+  // A new extent, not one nested in (or overlapping) the one already hidden.
+  if (lt >= st.hideUntil) st.hideFrom = lt;
+  const close = name === "plaintext" ? -1 : endTag(html, after, name, st);
+  if (close === -1) {
+    st.hideUntil = n;
+    return;
+  }
+  addSyncPoint(st, close);
+  // Measured once per end tag: many openers share one, and measuring an end
+  // tag with an unclosed quoted attribute reads to the end of the input.
+  // Nothing to measure once the hidden extent already runs to the end.
+  if (st.hideUntil >= n) return;
+  let closeEnd = st.closeEnd.get(close);
+  if (closeEnd === undefined) {
+    closeEnd = endTagEnd(html, close, name);
+    st.closeEnd.set(close, closeEnd);
+  }
+  st.hideUntil = Math.max(st.hideUntil, closeEnd);
 }
 
 /**

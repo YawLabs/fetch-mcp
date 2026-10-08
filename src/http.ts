@@ -124,6 +124,49 @@ export function shouldDecodeAsText(contentType: string): boolean {
 }
 
 /**
+ * Bounds on the JSON auto-parse. The body is attacker-chosen and `JSON.parse`
+ * is one synchronous call: its cost follows the number of containers, not the
+ * byte count (8 MiB of `[[[...]]]` took 3.5 s and 605 MB; at 100 MiB it would
+ * OOM the stdio server). Normal JSON is far inside these: a 16 MiB array of
+ * small objects parses in ~0.2 s with ~0.5 M containers. Past any bound the
+ * body is not parsed and `json` stays undefined, so the display shows the raw
+ * text (already capped).
+ */
+export const MAX_JSON_AUTOPARSE_CHARS = 16 * 1024 * 1024;
+export const MAX_JSON_AUTOPARSE_DEPTH = 1_000;
+export const MAX_JSON_AUTOPARSE_CONTAINERS = 1_000_000;
+
+/**
+ * One linear pass over `text` deciding whether `JSON.parse` may run on it:
+ * false when it is longer than MAX_JSON_AUTOPARSE_CHARS, nests objects/arrays
+ * deeper than MAX_JSON_AUTOPARSE_DEPTH, or opens more than
+ * MAX_JSON_AUTOPARSE_CONTAINERS of them. Brackets inside JSON strings
+ * (including after backslash escapes) are skipped. It does not validate the
+ * JSON -- `JSON.parse` still decides that.
+ */
+export function jsonAutoParseAllowed(text: string): boolean {
+  if (text.length > MAX_JSON_AUTOPARSE_CHARS) return false;
+  let depth = 0;
+  let containers = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      if (c === 0x5c /* \ */) i++;
+      else if (c === 0x22 /* " */) inString = false;
+      continue;
+    }
+    if (c === 0x22) inString = true;
+    else if (c === 0x5b /* [ */ || c === 0x7b /* { */) {
+      if (++depth > MAX_JSON_AUTOPARSE_DEPTH || ++containers > MAX_JSON_AUTOPARSE_CONTAINERS) return false;
+    } else if (c === 0x5d /* ] */ || c === 0x7d /* } */) {
+      depth--;
+    }
+  }
+  return true;
+}
+
+/**
  * Pull the charset declaration out of a Content-Type header.
  * Returns "utf-8" when absent or unrecognized.
  */
@@ -474,7 +517,7 @@ async function sendHop(params: {
         bodyText = decodeBytes(buf, respContentType);
         const ctLower = respContentType.toLowerCase().split(";")[0]!.trim();
         const isJsonCt = ctLower === "application/json" || ctLower.endsWith("+json");
-        if (isJsonCt && bodyText.length > 0 && !truncated) {
+        if (isJsonCt && bodyText.length > 0 && !truncated && jsonAutoParseAllowed(bodyText)) {
           try {
             json = JSON.parse(bodyText);
           } catch {

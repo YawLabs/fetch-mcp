@@ -106,13 +106,63 @@ function pickGroup(parsed: RobotsParsed, userAgent: string): Group | null {
  * Google-style match: "/foo" matches anything starting with /foo.
  * `$` means end-of-path. `*` is a glob placeholder.
  * Empty pattern never matches (per RFC 9309 "Disallow:" is a no-op).
+ *
+ * Linear matcher, never a RegExp. The pattern is attacker-chosen (it comes
+ * from the fetched robots.txt): compiling it to `^a.*b.*c$` let one rule
+ * throw "regular expression too large" out of the tool, and twenty rules
+ * like `/*-*-*-*-*-*-*-*-*-*-X$` backtracked for seconds against one
+ * hyphenated slug. Semantics are exactly those of the RegExp it replaces
+ * (pinned by a differential test): `^` + literal segments joined by `.*`,
+ * plus `$` only when the pattern ends with `$` (a `$` elsewhere is
+ * literal). Like `.`, a `*` never spans a line terminator (\n, \r,
+ * U+2028, U+2029); no percent-encoding normalization is applied.
+ *
+ * Each literal segment is placed at its leftmost occurrence whose gap from
+ * the previous segment holds no line terminator. Leftmost is optimal: a
+ * later occurrence leaves less of the path and its gap contains the
+ * leftmost one's, so it can never succeed where the leftmost fails.
  */
-function robotsPathMatches(pattern: string, path: string): boolean {
+export function robotsPathMatches(pattern: string, path: string): boolean {
   if (!pattern) return false;
   const anchored = pattern.endsWith("$");
   const raw = anchored ? pattern.slice(0, -1) : pattern;
-  const re = new RegExp(`^${raw.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}${anchored ? "$" : ""}`);
-  return re.test(path);
+  const segments = raw.split("*");
+  const first = segments[0] as string;
+  if (segments.length === 1) return anchored ? path === first : path.startsWith(first);
+  if (!path.startsWith(first)) return false;
+  let pos = first.length;
+  const last = segments.length - 1;
+  // A `*` may cover [pos, limit): it stops at the next line terminator.
+  // `pos` only grows, so the cached limit stays right until `pos` passes it,
+  // which keeps the terminator scan linear over the whole match.
+  let limit = -1;
+  for (let k = 1; k <= last; k++) {
+    const seg = segments[k] as string;
+    if (pos > limit) limit = nextLineTerminator(path, pos);
+    if (k === last && anchored) {
+      const at = path.length - seg.length;
+      return at >= pos && at <= limit && path.endsWith(seg);
+    }
+    const at = path.indexOf(seg, pos);
+    if (at < 0 || at > limit) return false;
+    pos = at + seg.length;
+  }
+  return true;
+}
+
+/** The characters `.` excludes, which a `*` therefore cannot cover. */
+const LINE_TERMINATOR = /[\n\r\u2028\u2029]/g;
+
+/**
+ * Index of the first `.`-excluded line terminator at or after `from`, else
+ * `path.length`. A native scan: a charCode loop here ran once per rule over
+ * the rest of the path and made `/*.pdf$`-style rules ~4x slower than the old
+ * RegExp matcher on a robots.txt of 35,000 of them.
+ */
+function nextLineTerminator(path: string, from: number): number {
+  LINE_TERMINATOR.lastIndex = from;
+  const m = LINE_TERMINATOR.exec(path);
+  return m ? m.index : path.length;
 }
 
 export function isAllowed(parsed: RobotsParsed, userAgent: string, path: string): { allowed: boolean; rule?: string } {
