@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { decodeHtmlEntities, findBalancedTagContents, parseAttrs } from "../tools/html.js";
+import { visibleTagMask } from "../tools/content.js";
+import {
+  decodeHtmlEntities,
+  findBalancedTagContents,
+  findTags,
+  firstBalancedTagContent,
+  forEachBalancedTag,
+  parseAttrs,
+} from "../tools/html.js";
 
 describe("decodeHtmlEntities", () => {
   it("decodes the named entities it covers", () => {
@@ -78,6 +86,122 @@ describe("findBalancedTagContents", () => {
       findBalancedTagContents(`${"<article>".repeat(100_000)}${"</article>".repeat(100_000)}`, "article"),
     ).toHaveLength(1);
     expect(findBalancedTagContents(`${"<article>".repeat(100_000)}</article>`, "article")).toEqual([]);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+
+  it("matches whole tag names, and end tags with whitespace or attributes", () => {
+    expect(findBalancedTagContents("<article-list>x</article-list><article>a</article\n class=x>", "article")).toEqual([
+      "a",
+    ]);
+    // `</ article>` is a bogus comment in a browser, not an end tag.
+    expect(findBalancedTagContents("<article>a</ article>b</article>", "article")).toEqual(["a</ article>b"]);
+    // An end tag's attributes are not searched for openers.
+    expect(findBalancedTagContents(`<article>a</article x="<article>">b</article>`, "article")).toEqual(["a"]);
+  });
+
+  it("with a mask, skips tags in comments, raw text and templates", () => {
+    const html =
+      "<!-- <article>c --><script>'<article>s'</script><template><article>t</article></template>" +
+      "<textarea><article>x</textarea><article>real</article>";
+    expect(findBalancedTagContents(html, "article", visibleTagMask(html))).toEqual(["real"]);
+    expect([...findTags(html, "article", visibleTagMask(html))].map((t) => t.start)).toEqual([
+      html.lastIndexOf("<article>"),
+    ]);
+  });
+});
+
+describe("visibleTagMask -- tags a caller would read as raw text", () => {
+  const marked = (html: string, tag: string) =>
+    [...findTags(html, tag, visibleTagMask(html))].map((t) => html.slice(t.start, t.start + tag.length + 1));
+
+  it.each([
+    ["an SVG <title>", "<svg><title>Logo</title></svg>", "title"],
+    ["a MathML <title>", "<math><mi><title>T</title></mi></math>", "title"],
+    ["a <script> in an SVG", '<svg><script type="application/ld+json">{}</script></svg>', "script"],
+    ["a <style> in an SVG", "<svg><style>a{}</style></svg>", "style"],
+    ["a <title> in a <select>", "<select><title>T</title></select>", "title"],
+  ])("leaves out %s", (_, html, tag) => {
+    expect(marked(html, tag)).toEqual([]);
+  });
+
+  it("still marks a <title> and a <script> outside them", () => {
+    const html = "<svg><title>a</title></svg><title>b</title><select></select><script>c</script>";
+    expect(marked(html, "title")).toEqual(["<title"]);
+    expect([...findTags(html, "title", visibleTagMask(html))][0]!.start).toBe(html.lastIndexOf("<title>"));
+    expect(marked(html, "script")).toEqual(["<script"]);
+  });
+});
+
+describe("visibleTagMask -- after the readings of an island part", () => {
+  it.each([
+    ["a comment across an SVG title's end tag", "<svg><b><title><!--</title><article>--></title><article>"],
+    ["a select opened in an island", "<svg><p><select></svg><svg><script/><article>"],
+  ])("marks no tag past %s", (_, html) => {
+    expect([...findTags(html, "article", visibleTagMask(html))]).toEqual([]);
+  });
+});
+
+describe("forEachBalancedTag", () => {
+  it("reports each pair as it closes, with its depth, and never an unclosed opener", () => {
+    const html = "<a1><div>x<div/></div><div y=1>z</div><div>unclosed";
+    const seen: string[] = [];
+    forEachBalancedTag(html, "div", undefined, (start, contentStart, contentEnd, depth) => {
+      seen.push(`${html.slice(start, contentStart)}|${html.slice(contentStart, contentEnd)}|${depth}`);
+      return undefined;
+    });
+    expect(seen).toEqual(["<div/>||1", "<div>|x<div/>|0", "<div y=1>|z|0"]);
+  });
+
+  it("stops when the visitor returns true", () => {
+    let calls = 0;
+    forEachBalancedTag("<p>a</p><p>b</p>", "p", undefined, () => {
+      calls++;
+      return true;
+    });
+    expect(calls).toBe(1);
+    expect(firstBalancedTagContent("<p><p>a</p></p><p>b</p>", "p")).toBe("<p>a</p>");
+    expect(firstBalancedTagContent("<p>never closes", "p")).toBeUndefined();
+  });
+
+  it("holds no record per unclosed opener", () => {
+    const html = "<div>".repeat(1_000_000);
+    const t0 = performance.now();
+    let calls = 0;
+    forEachBalancedTag(html, "div", undefined, () => {
+      calls++;
+      return undefined;
+    });
+    expect(calls).toBe(0);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("decodeHtmlEntities -- by hand, round 14", () => {
+  it("matches the one-pass regex it replaced on the edge cases", () => {
+    const cases: [string, string][] = [
+      ["", ""],
+      ["no entities", "no entities"],
+      ["&&amp;&", "&&&"],
+      ["&ampx; &amp;amp; &AMP;", "&ampx; &amp; &AMP;"],
+      ["&#x; &#; &#x41 &#X41; &#x4g;", "&#x; &#; &#x41 A &#x4g;"],
+      ["&#0065;&#x0041;", "AA"],
+      [`&#${"9".repeat(30)};`, "�"],
+      ["&#xD800;&#x110000;&#0;", "���"],
+      ["a&nbsp;b&quot;c&apos;d", "a b\"c'd"],
+      ["&lt&lt;", "&lt<"],
+    ];
+    for (const [input, expected] of cases) expect(decodeHtmlEntities(input)).toBe(expected);
+  });
+
+  it("returns a string with no & as it is", () => {
+    const s = "x".repeat(1000);
+    expect(decodeHtmlEntities(s)).toBe(s);
+  });
+
+  it("decodes millions of entities in linear time", () => {
+    const t0 = performance.now();
+    expect(decodeHtmlEntities("&amp;".repeat(2_000_000))).toBe("&".repeat(2_000_000));
+    expect(decodeHtmlEntities("&#65;x".repeat(1_000_000))).toBe("Ax".repeat(1_000_000));
     expect(performance.now() - t0).toBeLessThan(5_000);
   });
 });

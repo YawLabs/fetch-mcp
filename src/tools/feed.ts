@@ -2,8 +2,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import type { HttpRequester } from "../http.js";
+import { ABSOLUTE_MAX_BYTES, CANCELLED, type HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
+import { assertXmlTagCount } from "./sitemap.js";
 
 export interface FeedEntry {
   title?: string;
@@ -96,9 +97,43 @@ function extractAtomAuthor(author: unknown): string | undefined {
   return undefined;
 }
 
-export function parseFeedXml(xml: string): ParsedFeed {
+/**
+ * The largest feed body handed to the XML parser, in UTF-16 units of the
+ * decoded text. fast-xml-parser runs synchronously on the whole string and
+ * cannot be interrupted: through 0.8.3 a 9 MiB RSS stalled the stdio server
+ * 2.2 s (282 MB), and `max_bytes` goes up to 100 MiB. Text-heavy shapes cost
+ * ~0.15-0.3 s per MiB; markup costs per tag, so 16 MiB of `<x/>` took 7.6 s
+ * until `MAX_FEED_PARSE_TAGS` also bounded it. Together they hold one parse
+ * to ~3 s (measured <=2.8 s). The default `max_bytes`
+ * (10 MiB) stays under it; a caller who raises `max_bytes` past it gets an
+ * error naming this limit for a larger feed.
+ */
+export const MAX_FEED_PARSE_BYTES = 16 * 1024 * 1024;
+
+/** The most `<` a feed may hold before it is parsed; 16 MiB of ordinary RSS items has ~200,000. */
+export const MAX_FEED_PARSE_TAGS = 1_000_000;
+
+/** Attributes the extractors below read; the parser drops every other one. */
+const FEED_ATTRIBUTES = new Set(["href", "rel", "type", "term", "label"]);
+
+function feedParseLimitMessage(limit: number): string {
+  return `feed is larger than the ${limit}-byte parse limit; larger feeds are refused`;
+}
+
+/**
+ * Parse an RSS 2.0 or Atom 1.0 document. Refuses input past `parseLimit`
+ * (default `MAX_FEED_PARSE_BYTES`). Only the attributes in `FEED_ATTRIBUTES`
+ * are kept: an element with many distinct attribute names is the parser's
+ * slowest shape (~1 s per MiB kept, ~0.25 s with the allow-list). fast-xml-
+ * parser's defaults bound the rest, and the tool reports the throw: DOCTYPE
+ * entities (count, size, 100,000 expanded characters in all, references
+ * between entities not expanded) and nesting (100 levels).
+ */
+export function parseFeedXml(xml: string, parseLimit: number = MAX_FEED_PARSE_BYTES): ParsedFeed {
+  if (xml.length > parseLimit) throw new Error(feedParseLimitMessage(parseLimit));
+  assertXmlTagCount(xml, MAX_FEED_PARSE_TAGS, "feed");
   const parser = new XMLParser({
-    ignoreAttributes: false,
+    ignoreAttributes: (name: string) => !FEED_ATTRIBUTES.has(name),
     trimValues: true,
     parseTagValue: false,
     processEntities: true,
@@ -183,19 +218,25 @@ export function registerFeedTools(server: McpServer, request: HttpRequester) {
       url: z.string().url(),
       limit: z.number().int().min(1).max(500).optional().describe("Max entries to return (default 50)"),
       timeout_ms: z.number().int().positive().max(60_000).optional(),
-      max_bytes: z.number().int().positive().optional().describe("Max bytes to read (default 10MiB)"),
+      max_bytes: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Max bytes to read (default 10MiB). A feed over 16 MiB is refused whatever max_bytes says."),
       max_redirects: z.number().int().min(0).max(20).optional(),
       allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
       user_agent: z.string().optional(),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ url, limit, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
+      const maxBytes = Math.min(max_bytes ?? 10 * 1024 * 1024, ABSOLUTE_MAX_BYTES);
       const res = await request({
         signal: extra.signal,
         method: "GET",
         url,
         timeoutMs: timeout_ms,
-        maxBytes: max_bytes ?? 10 * 1024 * 1024,
+        maxBytes,
         maxRedirects: max_redirects,
         allowPrivateHosts: allow_private_hosts,
         userAgent: user_agent,
@@ -203,7 +244,16 @@ export function registerFeedTools(server: McpServer, request: HttpRequester) {
       });
       if (res.error) return formatError(res.error);
       if (!res.ok) return formatError(`HTTP ${res.status} ${res.statusText}`);
+      // A body cut off at max_bytes is partial XML: say so rather than
+      // surfacing the parser's "tag is not closed" complaint.
+      if (res.truncated) {
+        return formatError(`feed is larger than max_bytes (${maxBytes} bytes); raise max_bytes to read it`);
+      }
       if (!res.bodyText) return formatError("empty body");
+      if (res.bodyText.length > MAX_FEED_PARSE_BYTES) return formatError(feedParseLimitMessage(MAX_FEED_PARSE_BYTES));
+      // The parse is synchronous and cannot be interrupted; do not start one
+      // for a request the client has already cancelled.
+      if (extra.signal.aborted) return formatError(CANCELLED);
       try {
         const feed = parseFeedXml(res.bodyText);
         const cap = limit ?? 50;

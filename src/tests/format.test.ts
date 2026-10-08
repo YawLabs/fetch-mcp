@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatHttpResponse } from "../format.js";
+import { formatHttpResponse, formatJson, stringifyForDisplay } from "../format.js";
 import type { HttpResponse } from "../http.js";
 
 // Minimal builder so each test only states the fields it cares about.
@@ -163,5 +163,125 @@ describe("formatHttpResponse -- truncation banner", () => {
   it("does not emit the truncation banner when res.truncated is falsy", () => {
     const out = formatHttpResponse(makeResponse({ truncated: false, bodyText: "whole" }));
     expect(out.content[0]!.text).not.toContain("[body truncated");
+  });
+});
+
+describe("stringifyForDisplay -- matches JSON.stringify(v, null, 2) and the old truncation", () => {
+  const reference = (v: unknown, max: number) => {
+    const s = JSON.stringify(v, null, 2);
+    if (s === undefined || s.length <= max) return s;
+    return `${s.slice(0, max)}\n\n[... truncated ${s.length - max} chars ...]`;
+  };
+
+  const date = new Date(0);
+  const samples: unknown[] = [
+    null,
+    0,
+    -0,
+    1.5e300,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    true,
+    'a"b\\c\n\u2028\ud800',
+    [],
+    {},
+    [[], {}, [[]]],
+    { a: undefined, b: () => 1, c: Symbol("s") },
+    [undefined, () => 1, Symbol("s"), null],
+    { x: { y: { z: [1, "two", { three: 3 }] } }, 'key with "quotes"': 1 },
+    { d: date, nested: { toJSON: (k: string) => `key=${k}` } },
+    [Object(1), Object("s"), Object(false)],
+    { toJSON: () => undefined },
+    // biome-ignore lint/suspicious/noSparseArray: holes serialize as null
+    [1, , 3],
+    { __proto__: null, k: 1 },
+    JSON.parse('{"__proto__":{"a":1},"constructor":2}'),
+  ];
+
+  it.each(samples.map((v, i) => [i, v]))("sample %i at every cap", (_, v) => {
+    const full = JSON.stringify(v, null, 2);
+    const caps =
+      full === undefined ? [50_000] : [0, 1, 2, 7, Math.floor(full.length / 2), full.length - 1, full.length, 50_000];
+    for (const max of caps) expect(stringifyForDisplay(v, max)).toBe(reference(v, max));
+  });
+
+  it("matches on a large mixed value", () => {
+    const v = Array.from({ length: 2000 }, (_, i) => ({ i, s: `v${i}`.repeat(i % 7), a: [i, [i, { i }]], e: {} }));
+    for (const max of [100, 12_345, 50_000, 10_000_000]) expect(stringifyForDisplay(v, max)).toBe(reference(v, max));
+  });
+
+  it("matches on nesting that JSON.stringify can still handle", () => {
+    let v: unknown = { leaf: [1, 2] };
+    for (let i = 0; i < 1500; i++) v = i % 2 ? [v, i] : { k: v };
+    for (const max of [500, 50_000, 5_000_000]) expect(stringifyForDisplay(v, max)).toBe(reference(v, max));
+  });
+
+  it("counts the cut characters past the cap without building them", () => {
+    // 3000 nested arrays: ~18M characters pretty-printed, from 6 KB of JSON.
+    const d = 3000;
+    const v = JSON.parse(`${"[".repeat(d)}${"]".repeat(d)}`);
+    // The innermost array is "[]"; each level k above it writes "[", a newline
+    // indented for k + 1, the child, a newline indented for k, and "]".
+    let total = 2; // innermost "[]"
+    for (let k = 0; k < d - 1; k++) total += 1 + (1 + 2 * (k + 1)) + (1 + 2 * k) + 1;
+    const out = stringifyForDisplay(v, 1000)!;
+    expect(out.endsWith(`\n\n[... truncated ${total - 1000} chars ...]`)).toBe(true);
+    expect(out.length).toBeLessThan(1100);
+  });
+
+  it("does not overflow the stack on 100,000 levels", () => {
+    const d = 100_000;
+    const v = JSON.parse(`${"[".repeat(d)}${"]".repeat(d)}`);
+    const out = stringifyForDisplay(v)!;
+    expect(out.startsWith("[\n  [\n    [")).toBe(true);
+    expect(out).toMatch(/\[\.\.\. truncated \d+ chars \.\.\.\]$/);
+  });
+
+  it("throws where JSON.stringify throws", () => {
+    const cyc: Record<string, unknown> = {};
+    cyc.self = cyc;
+    expect(() => stringifyForDisplay(cyc)).toThrow(TypeError);
+    expect(() => stringifyForDisplay({ n: 1n })).toThrow(TypeError);
+    // A shared, non-cyclic reference is fine.
+    const shared = { a: 1 };
+    expect(stringifyForDisplay([shared, shared])).toBe(JSON.stringify([shared, shared], null, 2));
+  });
+
+  it("returns undefined where JSON.stringify does", () => {
+    expect(stringifyForDisplay(undefined)).toBeUndefined();
+    expect(stringifyForDisplay(() => 1)).toBeUndefined();
+  });
+});
+
+describe("formatJson -- bounded and never throws", () => {
+  it("keeps strings as-is and truncates them at the display cap", () => {
+    expect(formatJson("hi").content[0]!.text).toBe("hi");
+    const t = formatJson("x".repeat(50_010)).content[0]!.text;
+    expect(t).toBe(`${"x".repeat(50_000)}\n\n[... truncated 10 chars ...]`);
+  });
+
+  it("returns formatError instead of throwing", () => {
+    const cyc: Record<string, unknown> = {};
+    cyc.self = cyc;
+    const out = formatJson(cyc);
+    expect(out.isError).toBe(true);
+    expect(out.content[0]!.text).toMatch(/^Error: could not format the result: /);
+    expect(formatJson(undefined).isError).toBe(true);
+    expect(formatJson({ n: 1n }).isError).toBe(true);
+  });
+
+  it("formats a 5,000-deep value that JSON.stringify cannot", () => {
+    const v = JSON.parse(`${"[".repeat(5000)}${"]".repeat(5000)}`);
+    const out = formatJson(v);
+    expect(out.isError).toBeUndefined();
+    expect(out.content[0]!.text.length).toBeLessThan(50_100);
+  });
+
+  it("bounds a deep parsed-JSON body in formatHttpResponse too", () => {
+    const d = 5000;
+    const out = formatHttpResponse(makeResponse({ json: JSON.parse(`${"[".repeat(d)}${"]".repeat(d)}`) }));
+    const text = out.content[0]!.text;
+    expect(text).toContain("--- Body (parsed JSON) ---");
+    expect(text.length).toBeLessThan(50_300);
   });
 });

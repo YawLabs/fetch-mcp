@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractLinks } from "../tools/links.js";
+import { collectLinks, extractLinks } from "../tools/links.js";
 
 describe("extractLinks", () => {
   it("resolves relative hrefs against the base URL", () => {
@@ -122,15 +122,24 @@ describe("extractLinks", () => {
     expect(links).toHaveLength(1);
     expect(links[0]?.href).toBe("https://site.com/a");
   });
+
+  it("skips javascript: in mixed case", () => {
+    expect(extractLinks(`<a href="JaVaScRiPt:alert(1)">x</a>`, "https://site.com/")).toEqual([]);
+  });
+
+  it("keeps http and https links", () => {
+    const links = extractLinks(`<a href="http://a.com/">a</a><a href="HTTPS://b.com/">b</a>`, "https://site.com/");
+    expect(links.map((l) => l.href)).toEqual(["http://a.com/", "https://b.com/"]);
+  });
 });
 
+// Every case here returned the link before the http(s) allow-list (#64).
 describe("extractLinks -- scheme allow-list (CodeQL #9)", () => {
   it.each([
     ["vbscript:", `<a href="vbscript:msgbox(1)">x</a>`],
     ["javascript: with an encoded tab", `<a href="java&#9;script:alert(1)">x</a>`],
     ["javascript: with a literal newline", `<a href="java\nscript:alert(1)">x</a>`],
     ["javascript: behind a control character", `<a href="\u0001javascript:alert(1)">x</a>`],
-    ["JavaScript: in mixed case", `<a href="JaVaScRiPt:alert(1)">x</a>`],
     ["ftp:", `<a href="ftp://files.example.com/a">x</a>`],
     ["blob:", `<a href="blob:https://site.com/uuid">x</a>`],
     ["sms:", `<a href="sms:+1234">x</a>`],
@@ -140,11 +149,6 @@ describe("extractLinks -- scheme allow-list (CodeQL #9)", () => {
 
   it("skips relative hrefs when <base href> points at a non-http scheme", () => {
     expect(extractLinks(`<base href="ftp://files.example.com/"><a href="a">x</a>`, "https://site.com/")).toEqual([]);
-  });
-
-  it("keeps http and https links", () => {
-    const links = extractLinks(`<a href="http://a.com/">a</a><a href="HTTPS://b.com/">b</a>`, "https://site.com/");
-    expect(links.map((l) => l.href)).toEqual(["http://a.com/", "https://b.com/"]);
   });
 });
 
@@ -293,4 +297,74 @@ describe("extractLinks -- hidden content", () => {
     expect(extractLinks(`${"<script><!--".repeat(50_000)}`, "https://site.com/")).toEqual([]);
     expect(performance.now() - t0).toBeLessThan(5_000);
   });
+});
+
+describe("collectLinks -- filter, dedupe and limit during the walk", () => {
+  const base = "https://site.com/";
+  const hrefs = (r: { links: { href: string }[] }) => r.links.map((l) => l.href);
+
+  it("applies filter before dedupe and limit, as fetch_links did after extraction", () => {
+    const html = `<a href="/a">1</a><a href="http://o.com/">2</a><a href="/a">3</a><a href="/b">4</a><a href="/c">5</a>`;
+    expect(hrefs(collectLinks(html, base))).toEqual([
+      "https://site.com/a",
+      "http://o.com/",
+      "https://site.com/a",
+      "https://site.com/b",
+      "https://site.com/c",
+    ]);
+    expect(collectLinks(html, base, { filter: "internal", dedupe: true, limit: 3 })).toEqual({
+      links: [
+        { href: "https://site.com/a", text: "1", type: "internal" },
+        { href: "https://site.com/b", text: "4", type: "internal" },
+        { href: "https://site.com/c", text: "5", type: "internal" },
+      ],
+      truncated: false,
+    });
+    expect(collectLinks(html, base, { filter: "external", dedupe: true, limit: 1 })).toEqual({
+      links: [{ href: "http://o.com/", text: "2", type: "external" }],
+      truncated: false,
+    });
+  });
+
+  it("sets truncated only when a link past the limit would have been kept", () => {
+    const html = `<a href="/a">1</a><a href="/b">2</a>`;
+    expect(collectLinks(html, base, { limit: 2 }).truncated).toBe(false);
+    expect(collectLinks(html, base, { limit: 1 })).toEqual({
+      links: [{ href: "https://site.com/a", text: "1", type: "internal" }],
+      truncated: true,
+    });
+    // Past the limit, a duplicate, a filtered-out link or a non-http one does not count.
+    const tail = `<a href="/a">dup</a><a href="http://o.com/">ext</a><a href="mailto:x@y.z">m</a><a>none</a>`;
+    expect(collectLinks(`${html}${tail}`, base, { dedupe: true, filter: "internal", limit: 2 }).truncated).toBe(false);
+    expect(collectLinks(`${html}${tail}<a href="/c">c</a>`, base, { dedupe: true, limit: 2 }).truncated).toBe(true);
+  });
+
+  it("ends the last kept link's text at the next anchor, kept or not, and honors a later <base>", () => {
+    const html = `<a href="x">X <a href="http://o.com/">O</a> <base href="https://b.com/d/">`;
+    // The <base> re-roots /x to b.com, so it is internal; o.com ends its text though it is filtered out.
+    expect(collectLinks(html, base, { filter: "internal" })).toEqual({
+      links: [{ href: "https://b.com/d/x", text: "X", type: "internal" }],
+      truncated: false,
+    });
+  });
+
+  it("stops at the first link past the limit, and keeps nothing per anchor it skips", () => {
+    // Before: every anchor of the page was built, then filtered and capped.
+    // 100 MiB of '<a>' took 83 s and 3.1 GB.
+    const distinct = Array.from({ length: 400_000 }, (_, i) => `<a href="/${i}">t</a>`).join("");
+    let t0 = performance.now();
+    const first = collectLinks(distinct, base, { dedupe: true, limit: 10 });
+    expect(first.links).toHaveLength(10);
+    expect(first.truncated).toBe(true);
+    expect(performance.now() - t0).toBeLessThan(2_000);
+
+    const before = Math.max(process.resourceUsage().maxRSS * 1024, process.memoryUsage.rss());
+    t0 = performance.now();
+    const bare = "<a>".repeat(8 * 1024 * 1024);
+    const dup = '<a href="/x">y'.repeat(1024 * 1024);
+    expect(collectLinks(bare, base, { dedupe: true, limit: 1000 })).toEqual({ links: [], truncated: false });
+    expect(collectLinks(dup, base, { dedupe: true, limit: 1000 }).links).toHaveLength(1);
+    expect(process.resourceUsage().maxRSS * 1024 - before).toBeLessThan(4 * (bare.length + dup.length));
+    expect(performance.now() - t0).toBeLessThan(15_000);
+  }, 60_000);
 });

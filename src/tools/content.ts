@@ -1,32 +1,10 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import TurndownService from "turndown";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
 import type { HttpRequester } from "../http.js";
+import { htmlToMarkdown } from "../markdown.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
-import { decodeHtmlEntities, findTagEnd } from "./html.js";
-
-export function makeTurndown(): TurndownService {
-  const td = new TurndownService({
-    headingStyle: "atx",
-    codeBlockStyle: "fenced",
-    bulletListMarker: "-",
-    emDelimiter: "_",
-    strongDelimiter: "**",
-  });
-  td.addRule("removeScriptStyle", {
-    filter: ["script", "style", "noscript", "iframe", "svg", "canvas"],
-    replacement: () => "",
-  });
-  td.addRule("removeNav", {
-    filter: (node) => {
-      const el = node as unknown as { tagName?: string };
-      return el.tagName === "NAV" || el.tagName === "FOOTER" || el.tagName === "ASIDE";
-    },
-    replacement: () => "",
-  });
-  return td;
-}
+import { decodeHtmlEntities, findTagEnd, type TagMask, TextBuilder } from "./html.js";
 
 /** Elements dropped with their content: raw text a browser does not render. */
 const DROPPED_ELEMENTS = new Set(["script", "style", "noscript", "iframe", "noembed", "noframes"]);
@@ -43,6 +21,9 @@ const END_TAG_RE = new Map(
   [...DROPPED_ELEMENTS, ...TEXT_ELEMENTS].map((name) => [name, new RegExp(`</${name}(?=[\\t\\n\\f\\r />]|$)`, "gi")]),
 );
 
+/** Where a start tag may begin. */
+const TAG_START_RE = /<[a-zA-Z]/g;
+
 /** Comment ends: `-->`, or `--!>`, which a browser also accepts. */
 const COMMENT_END_RE = /--!?>/g;
 
@@ -55,6 +36,58 @@ const RAW_IN_HTML = new Set([...DROPPED_ELEMENTS, ...TEXT_ELEMENTS, "plaintext"]
  * `<title>` is one too, but it is tracked as RCDATA first (RAW_IN_HTML).
  */
 const INTEGRATION_POINTS = new Set(["foreignobject", "desc", "mi", "mo", "mn", "ms", "mtext", "annotation-xml"]);
+/**
+ * Start tags that break out of SVG / MathML back into HTML. `<font>` breaks
+ * out only with a color, face or size attribute; it is listed whole, since
+ * this set only ever makes the scan less sure of the reading.
+ */
+const BREAKOUT_ELEMENTS = new Set([
+  "b",
+  "big",
+  "blockquote",
+  "body",
+  "br",
+  "center",
+  "code",
+  "dd",
+  "div",
+  "dl",
+  "dt",
+  "em",
+  "embed",
+  "font",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "head",
+  "hr",
+  "i",
+  "img",
+  "li",
+  "listing",
+  "menu",
+  "meta",
+  "nobr",
+  "ol",
+  "p",
+  "pre",
+  "ruby",
+  "s",
+  "small",
+  "span",
+  "strong",
+  "strike",
+  "sub",
+  "sup",
+  "table",
+  "tt",
+  "u",
+  "ul",
+  "var",
+]);
 
 interface IslandEntry {
   name: string;
@@ -62,8 +95,9 @@ interface IslandEntry {
   hidden: boolean;
   /**
    * Where its raw-text reading ends (the `</name` a browser reading it as
-   * HTML raw text stops at), or -1 when there is none to wait for. Its own
-   * end tag closes it only at or past this point.
+   * HTML raw text stops at, or the end of the input), or -1 for an element
+   * that is never raw text. Its own end tag closes it only at or past this
+   * point.
    */
   rawEnd: number;
 }
@@ -83,14 +117,74 @@ interface ScanState {
   rawOpen: number;
   /** How many `<template>`s are open outside an island; their content is never rendered. */
   template: number;
-  /** A `<select>` is open, where a classic parser ignores title / xmp / plaintext tags and reads on as markup. */
+  /**
+   * A `<select>` may be open in the current template level (or the
+   * document), where a classic parser ignores title / xmp / plaintext tags
+   * and reads on as markup. Every rule it drives reads both ways, so it is
+   * safe to over-approximate.
+   */
   select: boolean;
+  /**
+   * `select` was set by a `<select>` inside an island, which SVG / MathML may
+   * read as a plain foreign element: a later `<select>` may open one or close
+   * one, so it leaves `select` on instead of toggling it.
+   */
+  selectMaybe: boolean;
+  /**
+   * `select` and `selectMaybe` of each enclosing level (bit 1 and bit 2),
+   * saved when a `<template>` opens. A template's content is parsed in its
+   * own mode, where a `<style>` is raw text even inside a `<select>`: reading
+   * it as a select's markup let a `</template>` in that raw text close the
+   * template, and the hidden content after it was emitted.
+   */
+  selectOuter: number[];
+  /**
+   * Offsets where another reading of the page resumes tokenizing: the end tag
+   * of a raw-text element the scan reads as markup (in an island, or in a
+   * `<select>`). The scan and that reading agree on the tokens after such a
+   * point only if the scan also starts a token there; a comment, tag or
+   * bogus comment that runs across it desynchronizes them, and the scan
+   * hides the rest of the input (`skipMarkup`).
+   */
+  sync: number[];
   /** Text before this offset is not emitted: a raw-text extent hidden while the markup inside it is still read. */
   hideUntil: number;
+  /** Where the hidden raw-text extent that runs to `hideUntil` starts. */
+  hideFrom: number;
+  /** The offset of each open `<template>` outside an island, innermost last. */
+  templateAt: number[];
+  /**
+   * Just past the first `</template>` since the outermost template opened
+   * that the scan skipped, inside an island, because an element open there
+   * may hold it as raw text; -1 when none. Another reading closed a template
+   * there.
+   */
+  diverged: number;
+  /** The first start tag at or after `diverged` (-1 when none), once looked for. */
+  divergedStart: number | undefined;
   /** End tags before this offset close nothing: inside an island they may sit in CDATA, where SVG reads them as text. */
   cdataUntil: number;
   /** The last `</name` found per raw-text name and where its search began, so overlapping searches are not repeated. */
   rawClose: Map<string, { from: number; at: number }>;
+  /** The last `]]>` found and where its search began, for the same reason. */
+  cdataClose: { from: number; at: number } | undefined;
+  /**
+   * The end of every end tag measured for a `<select>`'s raw extent, by its
+   * offset. A map, not a single slot: openers of two names that alternate
+   * (`<style><iframe>` x k) each evicted the other's entry and re-measured
+   * the same end tag per opener, quadratic when its attribute quote is open.
+   */
+  closeEnd: Map<number, number>;
+  /**
+   * The island is certainly read by SVG / MathML rules: only its root is
+   * open, it opened in plain HTML (not in a `<select>` or a hidden extent),
+   * and no end tag or breakout start tag has been read since. Any end tag
+   * clears it, since one can close an HTML element around the island and
+   * leave it.
+   */
+  foreign: boolean;
+  /** Set by `visibleTagMask`: marks the offset of every tag read while nothing hides it. */
+  tags: TagMask | undefined;
 }
 
 function pushIsland(st: ScanState, name: string, hidden: boolean, rawEnd: number): void {
@@ -105,6 +199,52 @@ function popIsland(st: ScanState): void {
   st.islandOpen.set(entry.name, st.islandOpen.get(entry.name)! - 1);
   if (entry.hidden) st.hidden--;
   if (RAW_IN_HTML.has(entry.name) || entry.name === "template") st.rawOpen--;
+}
+
+function openTemplate(st: ScanState, lt: number): void {
+  st.template++;
+  st.templateAt.push(lt);
+  st.selectOuter.push((st.select ? 1 : 0) | (st.selectMaybe ? 2 : 0));
+  setSelect(st, false);
+}
+
+/**
+ * Close the innermost template at the `</template>` at `lt`. Inside a hidden
+ * raw-text extent the scan reads as markup (`hideRawExtent`), the raw reading
+ * takes the `</template>` as text: when the template opened before that
+ * extent, that reading keeps it open past the extent, where the scan would
+ * show its content (`<template><svg><select></svg><style></template>x</style>y`
+ * hides `y`). The two cannot be reconciled, so the rest of the input is hidden.
+ */
+function closeTemplate(html: string, st: ScanState, lt: number): void {
+  const n = html.length;
+  st.template--;
+  const openedAt = st.templateAt.pop() ?? 0;
+  if (lt < st.hideUntil && openedAt < st.hideFrom) st.hideUntil = n;
+  // A `</template>` an island element may have held as raw text (`diverged`)
+  // already closed this template in the other reading, which has read the
+  // markup since then outside it. With only end tags, text and comments in
+  // between, it is where the scan is now: no deeper in a template, in no
+  // island. A start tag in between may have opened anything there.
+  if (st.diverged !== -1 && openedAt < st.diverged) {
+    if (st.divergedStart === undefined) {
+      TAG_START_RE.lastIndex = st.diverged;
+      st.divergedStart = TAG_START_RE.exec(html)?.index ?? -1;
+    }
+    if (st.divergedStart !== -1 && st.divergedStart < lt) st.hideUntil = n;
+  }
+  if (st.template === 0) {
+    st.diverged = -1;
+    st.divergedStart = undefined;
+  }
+  const saved = st.selectOuter.pop() ?? 0;
+  st.select = (saved & 1) !== 0;
+  st.selectMaybe = (saved & 2) !== 0;
+}
+
+function setSelect(st: ScanState, on: boolean): void {
+  st.select = on;
+  st.selectMaybe = false;
 }
 
 function leaveIsland(st: ScanState): void {
@@ -130,73 +270,195 @@ function leaveIsland(st: ScanState): void {
  * scan cannot tell how a browser would build the tree -- malformed SVG or
  * MathML, mostly -- it hides rather than shows. It models the tokenizer, plus
  * the few tree-builder rules that decide what is hidden (`<template>`,
- * `<select>`, leaving an `<svg>` or `<math>`), not the whole tree builder. Inside an `<svg>` or `<math>` a browser reads markup by
- * SVG rules until something (an integration point, an HTML tag that breaks
- * out) sends it back to HTML; the scan does not decide which, so it tracks the
- * elements whose reading differs and closes each only where both readings
- * agree it has ended.
+ * `<select>`, leaving an `<svg>` or `<math>`), not the whole tree builder.
+ * Inside an `<svg>` or `<math>` a browser reads markup by SVG rules until
+ * something (an integration point, an HTML tag that breaks out) sends it back
+ * to HTML; the scan does not decide which, so it tracks the elements whose
+ * reading differs, hides every one of them (an SVG `<title>` tooltip too),
+ * and closes each only where both readings agree it has ended. Where the
+ * readings stop agreeing on where the markup is -- a comment or tag running
+ * across the HTML end tag of one -- it hides the rest of the input.
  */
 export function stripHtmlToText(html: string): string {
-  let out = "";
-  let i = 0;
-  const n = html.length;
-  const st: ScanState = {
+  const out = new TextBuilder(html);
+  const st = newScanState(undefined);
+  const shown = (at: number) => st.hidden === 0 && st.template === 0 && at >= st.hideUntil;
+  scan(html, st, {
+    text(from, to) {
+      if (st.hidden !== 0 || st.template !== 0) return;
+      out.range(Math.max(from, st.hideUntil), to);
+    },
+    newline(at) {
+      if (shown(at)) out.literal("\n");
+    },
+  });
+  return tidyLines(decodeHtmlEntities(out.done())).trim();
+}
+
+/**
+ * Where the scan hands over text: `text` for a range of the input, `newline`
+ * for a line break that stands for markup at `at` (`<br>`, the end of a block).
+ * Ranges, not strings, so text the page carries through in order is copied
+ * once, at the end, and never piece by piece.
+ */
+interface Emitter {
+  text(from: number, to: number): void;
+  newline(at: number): void;
+}
+
+const NO_EMIT: Emitter = { text() {}, newline() {} };
+
+/**
+ * The offsets of the tags `stripHtmlToText` reads as rendered markup, for a
+ * caller that slices the page by tag (fetch_reader's `<article>`, `<main>`):
+ * an `<article>` in a script, a comment, a template or other hidden text
+ * never starts or ends a slice. Same scan, same rules; a tag in an extent the
+ * scan cannot place is left unmarked, so it hides rather than shows here too.
+ * So is a `<title>`, `<script>` or other raw-text tag in an `<svg>` or
+ * `<math>`, and a `<title>` in a `<select>` (`readingDiffers`): a caller that
+ * reads one to its end tag would read markup as its text.
+ */
+export function visibleTagMask(html: string): TagMask {
+  const st = newScanState(new Uint8Array(html.length));
+  scan(html, st, NO_EMIT);
+  return st.tags!;
+}
+
+function newScanState(tags: TagMask | undefined): ScanState {
+  return {
     island: [],
     hidden: 0,
     islandOpen: new Map(),
     rawOpen: 0,
     template: 0,
     select: false,
+    selectMaybe: false,
+    selectOuter: [],
+    sync: [],
     hideUntil: 0,
+    hideFrom: 0,
+    templateAt: [],
+    diverged: -1,
+    divergedStart: undefined,
     cdataUntil: 0,
     rawClose: new Map(),
+    cdataClose: undefined,
+    closeEnd: new Map(),
+    foreign: false,
+    tags,
   };
-  // `at` is where the text starts in the input, for `hideUntil`.
-  const emit = (text: string, at: number) => {
-    if (st.hidden !== 0 || st.template !== 0) return;
-    if (at < st.hideUntil) {
-      if (st.hideUntil - at >= text.length) return;
-      out += text.slice(st.hideUntil - at);
-      return;
-    }
-    out += text;
-  };
+}
+
+function scan(html: string, st: ScanState, emit: Emitter): void {
+  let i = 0;
+  const n = html.length;
   while (i < n) {
     const lt = html.indexOf("<", i);
     if (lt === -1) {
-      emit(html.slice(i), i);
+      emit.text(i, n);
       break;
     }
-    emit(html.slice(i, lt), i);
+    emit.text(i, lt);
     i = skipMarkup(html, lt, st, emit);
   }
-  return trimLineEnds(decodeHtmlEntities(out))
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
 }
 
 /**
- * Strip spaces and tabs from the end of every line. By hand: `/[ \t]+\n/g`
+ * Strip spaces and tabs from the end of every line and squeeze each run of
+ * blank lines to one; the caller trims the ends. By hand: `/[ \t]+\n/g`
  * retries at every blank of a long run with no newline after it, so a page of
- * blanks took quadratic time.
+ * blanks took quadratic time, and `split("\n")` held one string per line (a
+ * page of `<\n` is 50 million of them in 100 MiB). Lines are kept as ranges
+ * of `text`, so text with nothing to strip comes back as is.
  */
-function trimLineEnds(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => {
-      let end = line.length;
-      while (end > 0 && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
-      return end === line.length ? line : line.slice(0, end);
-    })
-    .join("\n");
+function tidyLines(text: string): string {
+  const out = new TextBuilder(text);
+  const n = text.length;
+  // Newlines since the last line with content, and where the first two are.
+  let breaks = 0;
+  let break1 = 0;
+  let break2 = 0;
+  let any = false;
+  let i = 0;
+  while (i <= n) {
+    let nl = text.indexOf("\n", i);
+    if (nl === -1) nl = n;
+    let end = nl;
+    while (end > i && (text.charCodeAt(end - 1) === 32 || text.charCodeAt(end - 1) === 9)) end--;
+    if (end > i) {
+      // Blank lines before the first content line would be trimmed anyway.
+      if (any && breaks > 0) {
+        out.range(break1, break1 + 1);
+        if (breaks > 1) out.range(break2, break2 + 1);
+      }
+      out.range(i, end);
+      any = true;
+      breaks = 0;
+    }
+    if (nl === n) break;
+    if (breaks === 0) break1 = nl;
+    else if (breaks === 1) break2 = nl;
+    breaks++;
+    i = nl + 1;
+  }
+  return out.done();
+}
+
+/**
+ * A tag whose element a caller would read wrongly, so the mask leaves it out.
+ * A caller reads a marked `<title>` or `<script>` as HTML RCDATA or raw text
+ * to its end tag (`extractTitle`, fetch_meta's JSON-LD). In an `<svg>` or
+ * `<math>` it may be a foreign element whose content is markup -- comments,
+ * templates, scripts -- and an SVG `<title>` is never `document.title`. In a
+ * `<select>` a classic parser ignores `<title>`, `<xmp>` and `<plaintext>`.
+ */
+function readingDiffers(st: ScanState, name: string): boolean {
+  if (st.island.length > 0) return RAW_IN_HTML.has(name) || name === "template";
+  return st.select && (name === "title" || name === "xmp" || name === "plaintext");
 }
 
 /**
  * `html[lt]` is `<`. Consume the markup that starts there and return the index
  * just past it, handing any text it stands for (a newline for `<br>`) to
  * `emit`. A `<` that does not start markup is text, as in a browser.
+ *
+ * Where the scan reads markup that another reading of the page takes as raw
+ * text or CDATA, the two tokenizations meet again at that text's end (a
+ * `sync` point, or `cdataUntil`). Markup that runs across such a point --
+ * `<title><!--</title><script>-->` -- hides from the scan the tokens the other
+ * reading starts there, which may open hidden content. The scan cannot follow
+ * both from there, so it hides the rest of the input.
  */
-function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string, at: number) => void): number {
+function skipMarkup(html: string, lt: number, st: ScanState, emit: Emitter): number {
+  const next = readMarkup(html, lt, st, emit);
+  return crossesSyncPoint(st, lt, next) ? html.length : next;
+}
+
+/** Whether markup over `[lt, next)` runs across a point where another reading resumes. Drops the points passed. */
+function crossesSyncPoint(st: ScanState, lt: number, next: number): boolean {
+  let crosses = st.cdataUntil > lt && st.cdataUntil < next;
+  const sync = st.sync;
+  if (sync.length === 0) return crosses;
+  // At most one live point per raw-text name, so this stays short.
+  let kept = 0;
+  for (const at of sync) {
+    if (at <= lt) continue;
+    if (at < next) crosses = true;
+    sync[kept++] = at;
+  }
+  sync.length = kept;
+  return crosses;
+}
+
+/**
+ * Every live point is the next end tag of one raw-text name past the scan, so
+ * many openers share each one; storing it once keeps the list short.
+ */
+function addSyncPoint(st: ScanState, at: number): void {
+  if (!st.sync.includes(at)) st.sync.push(at);
+}
+
+function readMarkup(html: string, lt: number, st: ScanState, emit: Emitter): number {
   const n = html.length;
   const next = html[lt + 1];
 
@@ -206,9 +468,11 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   // up to `]]>` is text. Inside an island a browser may read it either way, so
   // the scan takes what each reading hides: the bogus comment, the start tags
   // after it (they may open hidden content), but no end tag before the `]]>`
-  // (in CDATA it closes nothing).
+  // (in CDATA it closes nothing). Where the island is certainly read as SVG /
+  // MathML it is CDATA, and the scan skips it whole.
   if (st.island.length > 0 && html.startsWith("<![CDATA[", lt)) {
-    const close = html.indexOf("]]>", lt + 9);
+    const close = cdataEnd(html, lt + 9, st);
+    if (st.foreign && st.island.length === 1) return close === -1 ? n : close + 3;
     st.cdataUntil = Math.max(st.cdataUntil, close === -1 ? n : close + 3);
   }
   if (next === "!" || next === "?") {
@@ -225,7 +489,7 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
       const gt = html.indexOf(">", lt + 2);
       return gt === -1 ? n : gt + 1;
     }
-    emit("<", lt);
+    emit.text(lt, lt + 1);
     return lt + 1;
   }
 
@@ -234,10 +498,21 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   // A tag cut off by the end of the input is dropped with everything after it.
   if (end === null) return n;
   const after = end.pos + 1;
+  if (
+    st.tags !== undefined &&
+    st.hidden === 0 &&
+    st.template === 0 &&
+    lt >= st.hideUntil &&
+    lt >= st.cdataUntil &&
+    !readingDiffers(st, name)
+  ) {
+    st.tags[lt] = 1;
+  }
 
   if (closing) {
     if (lt < st.cdataUntil) return after;
     if (st.island.length > 0) {
+      st.foreign = false;
       const top = st.island[st.island.length - 1]!;
       if (name === top.name && lt >= top.rawEnd) {
         popIsland(st);
@@ -246,19 +521,27 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
         // island with it -- unless an element open in the island could be
         // raw text that holds the `</template>`, or is a template itself.
         leaveIsland(st);
-        st.template--;
+        closeTemplate(html, st, lt);
+      } else if (name === "template" && st.template > 0) {
+        // One of those is open. Read as SVG / MathML it holds markup, and the
+        // `</template>` closes the template here; read as HTML raw text it
+        // does not. The scan keeps the template open, hiding; the readings
+        // meet again only if nothing opens before the scan closes it too
+        // (`closeTemplate`).
+        if (st.diverged === -1) st.diverged = after;
       }
     } else if (name === "template" && st.template > 0) {
-      st.template--;
+      closeTemplate(html, st, lt);
     } else if (name === "select") {
-      st.select = false;
+      setSelect(st, false);
     }
-    if (BLOCK_ELEMENTS.has(name)) emit("\n", lt);
+    if (BLOCK_ELEMENTS.has(name)) emit.newline(lt);
     return after;
   }
 
+  if (st.island.length > 0 && BREAKOUT_ELEMENTS.has(name)) st.foreign = false;
   if (name === "br") {
-    emit("\n", lt);
+    emit.newline(lt);
     return after;
   }
 
@@ -268,18 +551,34 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   // raw text in HTML opens even when self-closed (HTML ignores the slash on
   // it) and stays open until its raw-text reading has ended too.
   if (st.island.length > 0) {
-    if (RAW_IN_HTML.has(name)) {
-      // The raw-text end is searched once per region: an element of the same
-      // name already open covers this one.
-      let rawEnd = -1;
-      if (!st.islandOpen.get(name)) {
-        const close =
-          name === "script" ? scriptEndTag(html, after) : name === "plaintext" ? -1 : endTag(html, after, name, st);
-        rawEnd = close === -1 ? n : close;
+    // Past a breakout or in an integration point this opens a real select,
+    // whose rules apply after the island too; SVG may read it as a plain
+    // element, so `select` is only maybe on.
+    if (name === "select") {
+      st.select = true;
+      st.selectMaybe = true;
+    } else if (RAW_IN_HTML.has(name)) {
+      // Where the island is certainly read as SVG / MathML (only its root
+      // open), this is a foreign element with no raw-text reading: empty when
+      // self-closed, else closed by its own end tag. It is still hidden.
+      if (st.foreign && st.island.length === 1) {
+        if (!end.selfClosing) pushIsland(st, name, true, -1);
+        return after;
       }
-      // Raw-text elements stay hidden in SVG too, where `<script>` and
-      // `<style>` are markup whose text is still not rendered.
-      pushIsland(st, name, DROPPED_ELEMENTS.has(name), rawEnd);
+      // Anywhere less sure, HTML may ignore the slash and read raw text to its
+      // end tag, or to the end of the input when there is none. One of the
+      // same name already open: the two raw-text readings overlap and end at
+      // different end tags. Rare enough to give up on.
+      if (st.islandOpen.get(name)) return n;
+      const close =
+        name === "script" ? scriptEndTag(html, after) : name === "plaintext" ? -1 : endTag(html, after, name, st);
+      const rawEnd = close === -1 ? n : close;
+      // Hidden whichever way it is read, `<title>` and `<textarea>` too: read
+      // as markup, a comment or a quoted attribute in it can swallow its HTML
+      // end tag and the tags after it, so nothing in it is ever shown. Where
+      // the HTML reading resumes is a sync point.
+      pushIsland(st, name, true, rawEnd);
+      addSyncPoint(st, rawEnd);
     } else if (name === "template") {
       pushIsland(st, name, true, -1);
     } else if (!end.selfClosing && (ISLAND_ROOTS.has(name) || INTEGRATION_POINTS.has(name))) {
@@ -289,33 +588,55 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   }
 
   if (ISLAND_ROOTS.has(name)) {
-    if (!end.selfClosing) pushIsland(st, name, false, -1);
+    if (!end.selfClosing) {
+      pushIsland(st, name, false, -1);
+      st.foreign = !st.select && lt >= st.hideUntil;
+    }
     return after;
   }
   // A classic parser closes an open <select> at these, and ignores title,
-  // xmp and plaintext inside one, reading on as markup.
+  // xmp and plaintext inside one, reading on as markup. A `<select>` after
+  // one that only maybe opened may open one or close one: it stays on.
   if (name === "select") {
-    st.select = !st.select;
+    if (!st.selectMaybe) st.select = !st.select;
     return after;
   }
-  if (name === "input" || name === "keygen" || name === "textarea") st.select = false;
-  if (st.select && (name === "title" || name === "xmp" || name === "plaintext")) return after;
+  if (name === "input" || name === "keygen" || name === "textarea") setSelect(st, false);
+  // In a select, a classic parser ignores these and reads on as markup; a
+  // customizable select, or a page whose select only maybe opened, reads
+  // their content as text. The scan reads the markup inside, where a
+  // `<template>` may open; the text reading resumes at the end tag, a sync
+  // point. In a template, or where the select only maybe opened, it also
+  // hides the raw extent: read as text it may hold a `</template>` that the
+  // markup reading takes as a close (`<template><svg><select></svg><title>
+  // </template>` is SVG's select, and the title is RCDATA to the end).
+  // Elsewhere no template is open for it to close, and the text it shows is
+  // text in either reading.
+  if (st.select && (name === "title" || name === "xmp" || name === "plaintext")) {
+    if (st.selectMaybe || st.template > 0) {
+      hideRawExtent(html, lt, after, name, st);
+    } else if (name !== "plaintext") {
+      const close = endTag(html, after, name, st);
+      if (close !== -1) addSyncPoint(st, close);
+    }
+    return after;
+  }
   // A browser ignores the self-closing flag on these, as on every non-void
   // HTML element: `<script src=x />` still hides everything to `</script>`.
   if (name === "template") {
-    st.template++;
+    openTemplate(st, lt);
     return after;
   }
   if (name === "plaintext") {
-    emit(html.slice(after), after);
+    emit.text(after, n);
     return n;
   }
   if (st.select && DROPPED_ELEMENTS.has(name) && name !== "script") {
     // A classic parser ignores these inside a <select> and reads on as
-    // markup, where a <template> may open; a customizable select reads them
-    // as raw text. Hide the raw extent and read the markup inside it too.
-    const close = endTag(html, after, name, st);
-    st.hideUntil = Math.max(st.hideUntil, close === -1 ? n : endTagEnd(html, close, name));
+    // markup, where a <template> may open; a customizable select, or a page
+    // whose select only maybe opened, reads them as raw text. Hide the raw
+    // extent and read the markup inside it too.
+    hideRawExtent(html, lt, after, name, st);
     return after;
   }
   if (DROPPED_ELEMENTS.has(name)) {
@@ -325,10 +646,11 @@ function skipMarkup(html: string, lt: number, st: ScanState, emit: (text: string
   if (TEXT_ELEMENTS.has(name)) {
     const close = endTag(html, after, name);
     if (close === -1) {
-      emit(html.slice(after), after);
+      emit.text(after, n);
       return n;
     }
-    emit(`${html.slice(after, close)}\n`, after);
+    emit.text(after, close);
+    emit.newline(close);
     return endTagEnd(html, close, name);
   }
   return after;
@@ -369,13 +691,54 @@ function endTag(html: string, from: number, name: string, st?: ScanState): numbe
 }
 
 /**
+ * Hide the raw-text extent of the `name` element at `lt`, whose content
+ * starts at `after` and which the scan reads as markup: to the end of its end
+ * tag, or to the end of the input when it has none (`<plaintext>` never
+ * does). The raw reading resumes at the end tag, a sync point.
+ */
+function hideRawExtent(html: string, lt: number, after: number, name: string, st: ScanState): void {
+  const n = html.length;
+  // A new extent, not one nested in (or overlapping) the one already hidden.
+  if (lt >= st.hideUntil) st.hideFrom = lt;
+  const close = name === "plaintext" ? -1 : endTag(html, after, name, st);
+  if (close === -1) {
+    st.hideUntil = n;
+    return;
+  }
+  addSyncPoint(st, close);
+  // Measured once per end tag: many openers share one, and measuring an end
+  // tag with an unclosed quoted attribute reads to the end of the input.
+  // Nothing to measure once the hidden extent already runs to the end.
+  if (st.hideUntil >= n) return;
+  let closeEnd = st.closeEnd.get(close);
+  if (closeEnd === undefined) {
+    closeEnd = endTagEnd(html, close, name);
+    st.closeEnd.set(close, closeEnd);
+  }
+  st.hideUntil = Math.max(st.hideUntil, closeEnd);
+}
+
+/**
+ * Index of the first `]]>` at or after `from`, or -1. Memoized like `endTag`:
+ * every `<![CDATA[` in an island searches, and one with no `]]>` after it
+ * read to the end of the input each time, so a page of them was quadratic.
+ */
+function cdataEnd(html: string, from: number, st: ScanState): number {
+  const memo = st.cdataClose;
+  if (memo !== undefined && memo.from <= from && (memo.at === -1 || memo.at >= from)) return memo.at;
+  const at = html.indexOf("]]>", from);
+  st.cdataClose = { from, at };
+  return at;
+}
+
+/**
  * Index of the `</script` that ends a script whose content starts at `from`,
  * or -1. Script content has escape states a plain search misses: inside
  * `<!-- ... -->`, a `<script` opens a nested ("double-escaped") region whose
  * own `</script>` does not end the element, as legacy
  * `document.write("<!--<script>...</script>")` code relies on.
  */
-function scriptEndTag(html: string, from: number): number {
+export function scriptEndTag(html: string, from: number): number {
   let state: "data" | "escaped" | "double" = "data";
   let i = from;
   for (;;) {
@@ -440,26 +803,31 @@ function endTagEnd(html: string, close: number, name: string): number {
   return end === null ? html.length : end.pos + 1;
 }
 
+const TIMEOUT_MS_DESCRIPTION =
+  "Timeout in ms for the request, covering DNS, every redirect hop and the body (default 10000)";
+const timeoutMsSchema = z.number().int().positive().max(120_000).optional();
+
 const commonPageSchema = {
   url: z.string().url().describe("URL to fetch"),
-  timeout_ms: z
-    .number()
-    .int()
-    .positive()
-    .max(120_000)
-    .optional()
-    .describe("Timeout in ms for the request, covering DNS, every redirect hop and the body (default 10000)"),
+  timeout_ms: timeoutMsSchema.describe(TIMEOUT_MS_DESCRIPTION),
   max_bytes: z.number().int().positive().optional().describe("Max response size in bytes (default 5MiB)"),
   max_redirects: z.number().int().min(0).max(20).optional().describe("Max redirect hops (default 5)"),
   allow_private_hosts: z.boolean().optional().describe(ALLOW_PRIVATE_HOSTS_DESCRIPTION),
   user_agent: z.string().optional().describe("User-Agent override"),
 };
 
+const markdownPageSchema = {
+  ...commonPageSchema,
+  timeout_ms: timeoutMsSchema.describe(
+    `${TIMEOUT_MS_DESCRIPTION}; the HTML-to-markdown step gets its own budget of the same length`,
+  ),
+};
+
 export function registerContentTools(server: McpServer, request: HttpRequester) {
   server.tool(
     "fetch_html_to_markdown",
     "GET a URL, decode the HTML, and convert to clean markdown (headings, lists, links, code fences). Scripts, styles, iframes, nav, footer, and aside elements are stripped. Intended for feeding web pages into an LLM cheaply -- markdown is usually 3-8x smaller than raw HTML. Follows redirects, respects size/timeout limits, and blocks private-host requests by default.",
-    commonPageSchema,
+    markdownPageSchema,
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     async ({ url, timeout_ms, max_bytes, max_redirects, allow_private_hosts, user_agent }, extra) => {
       const res = await request({
@@ -476,12 +844,10 @@ export function registerContentTools(server: McpServer, request: HttpRequester) 
       if (res.error) return formatError(res.error);
       if (!res.ok) return formatError(`HTTP ${res.status} ${res.statusText}`);
       if (!res.bodyText) return formatError("response body was empty");
-      try {
-        const markdown = makeTurndown().turndown(res.bodyText);
-        return formatJson(markdown.trim());
-      } catch (err) {
-        return formatError(`HTML-to-markdown conversion failed: ${(err as Error).message}`);
-      }
+      // The fetch has spent its time by now, so the conversion gets a budget of its own.
+      const converted = await htmlToMarkdown(res.bodyText, { signal: extra.signal, budgetMs: timeout_ms });
+      if ("error" in converted) return formatError(converted.error);
+      return formatJson(converted.markdown.trim());
     },
   );
 

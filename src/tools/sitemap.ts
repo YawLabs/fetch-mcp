@@ -3,7 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 import { formatError, formatJson } from "../format.js";
-import { ABSOLUTE_MAX_BYTES, ABSOLUTE_MAX_TOTAL_MS, type HttpRequester } from "../http.js";
+import { ABSOLUTE_MAX_BYTES, ABSOLUTE_MAX_TOTAL_MS, CANCELLED, type HttpRequester } from "../http.js";
 import { ALLOW_PRIVATE_HOSTS_DESCRIPTION } from "../policy.js";
 
 export interface SitemapUrl {
@@ -21,6 +21,46 @@ export interface ParsedSitemap {
 const DEFAULT_MAX_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_SITEMAPS = 50;
 const MAX_SITEMAPS_CEILING = 1000;
+
+/**
+ * The largest decoded sitemap document handed to the XML parser. fast-xml-parser
+ * runs synchronously on the whole string and cannot be interrupted: through
+ * 0.8.3 a 19 MiB urlset stalled the stdio server 4.65 s (512 MB), and at the
+ * 100 MiB `max_bytes` ceiling one parse would stall ~20-25 s, uncancellable.
+ * Text-heavy shapes (numeric character references, image-extension urlsets)
+ * cost ~0.15-0.3 s per MiB; markup costs per tag (~1.5-1.8 us each), so 16 MiB of
+ * `<a/>` took 6-7.5 s until `MAX_XML_PARSE_TAGS` below also bounded it.
+ * Together they hold one parse to ~3 s (measured <=2.8 s). A protocol-sized sitemap (50,000 URLs with lastmod /
+ * changefreq / priority, ~10.6 MiB) fits; a larger single document -- e.g.
+ * 50,000 URLs each carrying two image:image entries, ~21 MiB -- is refused with
+ * an error naming this limit, and raising `max_bytes` does not lift it. Plain
+ * and gzipped payloads alike: the gunzip stops at the smaller of this and the
+ * `max_bytes` cap.
+ */
+export const MAX_XML_PARSE_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The most `<` (tags, comments, CDATA, declarations) a sitemap document may
+ * hold before it is parsed. A 50,000-URL urlset with lastmod / changefreq /
+ * priority has ~500,000.
+ */
+export const MAX_XML_PARSE_TAGS = 1_500_000;
+
+/**
+ * Throws when `xml` holds more than `maxTags` `<` characters. One native
+ * `indexOf` walk, a few ms at 16 MiB; run before the synchronous parse,
+ * whose cost on markup-dense input follows the tag count, not the length.
+ */
+export function assertXmlTagCount(xml: string, maxTags: number, what: string): void {
+  let n = 0;
+  for (let i = xml.indexOf("<"); i >= 0; i = xml.indexOf("<", i + 1)) {
+    if (++n > maxTags) throw new Error(`${what} has more than ${maxTags} tags; larger documents are refused`);
+  }
+}
+
+function parseLimitMessage(limit: number): string {
+  return `sitemap XML is larger than the ${limit}-byte parse limit per document; larger documents are refused`;
+}
 
 /**
  * The per-sitemap byte budget: the caller's `max_bytes` (default 20 MiB),
@@ -50,17 +90,33 @@ export function sitemapByteCap(maxBytes: number | undefined): number {
  * because oam inflates each written slice into a single output chunk, so the
  * slice size bounds how far past the cap one chunk can land (~1 MiB) before
  * the stream is destroyed. Node emits 16 KiB chunks either way.
+ *
+ * `parseLimit` (default `MAX_XML_PARSE_BYTES`) refuses a document the parser
+ * would stall on, plain or gzipped; the gunzip stops at whichever cap is
+ * smaller, and the error names that cap. `signal` stops the gunzip between
+ * slices.
  */
-export async function decodeSitemapPayload(buf: Buffer, maxOutputLength?: number): Promise<string> {
+export async function decodeSitemapPayload(
+  buf: Buffer,
+  maxOutputLength?: number,
+  options: { signal?: AbortSignal; parseLimit?: number } = {},
+): Promise<string> {
+  const parseLimit = options.parseLimit ?? MAX_XML_PARSE_BYTES;
+  const byteCap = maxOutputLength ?? Number.POSITIVE_INFINITY;
   if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
-    return (await gunzipCapped(buf, maxOutputLength ?? Number.POSITIVE_INFINITY)).toString("utf8");
+    const overCap =
+      parseLimit < byteCap
+        ? parseLimitMessage(parseLimit)
+        : `gzipped sitemap decompresses past ${byteCap} bytes (the max_bytes cap); raise max_bytes to read it`;
+    return (await gunzipCapped(buf, Math.min(byteCap, parseLimit), overCap, options.signal)).toString("utf8");
   }
+  if (buf.length > parseLimit) throw new Error(parseLimitMessage(parseLimit));
   return buf.toString("utf8");
 }
 
 const GUNZIP_SLICE_BYTES = 1024;
 
-async function gunzipCapped(buf: Buffer, cap: number): Promise<Buffer> {
+async function gunzipCapped(buf: Buffer, cap: number, overCap: string, signal?: AbortSignal): Promise<Buffer> {
   const gunzip = createGunzip();
   const chunks: Buffer[] = [];
   let total = 0;
@@ -68,9 +124,7 @@ async function gunzipCapped(buf: Buffer, cap: number): Promise<Buffer> {
     gunzip.on("data", (chunk: Buffer) => {
       total += chunk.length;
       if (total > cap) {
-        gunzip.destroy(
-          new Error(`gzipped sitemap decompresses past ${cap} bytes (the max_bytes cap); raise max_bytes to read it`),
-        );
+        gunzip.destroy(new Error(overCap));
         return;
       }
       chunks.push(chunk);
@@ -83,6 +137,10 @@ async function gunzipCapped(buf: Buffer, cap: number): Promise<Buffer> {
   finished.catch(() => {});
 
   for (let offset = 0; offset < buf.length && !gunzip.destroyed; offset += GUNZIP_SLICE_BYTES) {
+    if (signal?.aborted) {
+      gunzip.destroy(new Error(CANCELLED));
+      break;
+    }
     gunzip.write(buf.subarray(offset, offset + GUNZIP_SLICE_BYTES));
     // Let the inflater run and the byte count catch up before the next slice.
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -92,9 +150,24 @@ async function gunzipCapped(buf: Buffer, cap: number): Promise<Buffer> {
   return Buffer.concat(chunks, total);
 }
 
-export function parseSitemapXml(xml: string): ParsedSitemap {
+/**
+ * Parse one sitemap document. Refuses input past `parseLimit` UTF-16 units
+ * (default `MAX_XML_PARSE_BYTES`; a string decoded from N UTF-8 bytes is at
+ * most N units, so a payload `decodeSitemapPayload()` accepted always passes).
+ *
+ * Attributes are ignored: nothing below reads one, and an element with many
+ * distinct attribute names is the parser's slowest shape (~1 s per MiB kept,
+ * ~0.01 s ignored). It also keeps `<loc foo="x">url</loc>` a string rather
+ * than an object. fast-xml-parser's defaults bound the rest, and the caller
+ * reports the throw: DOCTYPE entities (count, size, 100,000 expanded
+ * characters in all, references between entities not expanded) and nesting
+ * (100 levels).
+ */
+export function parseSitemapXml(xml: string, parseLimit: number = MAX_XML_PARSE_BYTES): ParsedSitemap {
+  if (xml.length > parseLimit) throw new Error(parseLimitMessage(parseLimit));
+  assertXmlTagCount(xml, MAX_XML_PARSE_TAGS, "sitemap");
   const parser = new XMLParser({
-    ignoreAttributes: false,
+    ignoreAttributes: true,
     trimValues: true,
     parseTagValue: false,
     isArray: (name) => name === "url" || name === "sitemap",
@@ -139,6 +212,8 @@ export interface SitemapLimits {
    * than module state so a test can shorten it without touching other servers.
    */
   totalMs: number;
+  /** Per-document XML parse limit; defaults to `MAX_XML_PARSE_BYTES`. Injected for tests. */
+  maxParseBytes?: number;
 }
 
 export function registerSitemapTools(
@@ -148,7 +223,7 @@ export function registerSitemapTools(
 ) {
   server.tool(
     "fetch_sitemap",
-    "Fetch a sitemap.xml (or sitemap-index) and return the contained URLs with their lastmod / changefreq / priority. Follows sitemap-index chaining up to max_depth levels. Gzipped .xml.gz payloads are auto-decompressed. Partial failures (one child sitemap 500s while others work) are returned under 'warnings' without aborting the whole request. SSRF-protected by default.",
+    "Fetch a sitemap.xml (or sitemap-index) and return the contained URLs with their lastmod / changefreq / priority. Follows sitemap-index chaining up to max_depth levels. Gzipped .xml.gz payloads are auto-decompressed. A single sitemap document over 16 MiB once decoded is refused (a 50,000-URL sitemap is ~11 MiB). Partial failures (one child sitemap 500s while others work) are returned under 'warnings' without aborting the whole request. SSRF-protected by default.",
     {
       url: z.string().url().describe("Sitemap URL (sitemap.xml, sitemap.xml.gz, or a sitemap index)"),
       max_depth: z
@@ -190,6 +265,7 @@ export function registerSitemapTools(
       const cap = max_urls ?? 5000;
       const sitemapCap = max_sitemaps ?? DEFAULT_MAX_SITEMAPS;
       const byteCap = sitemapByteCap(max_bytes);
+      const parseLimit = limits.maxParseBytes ?? MAX_XML_PARSE_BYTES;
       let fetched = 0;
       const seen = new Set<string>();
       const allUrls: SitemapUrl[] = [];
@@ -241,8 +317,14 @@ export function registerSitemapTools(
         if (!res.bodyBase64) return { ok: false, error: "empty body" };
         const buf = Buffer.from(res.bodyBase64, "base64");
         try {
-          const xml = await decodeSitemapPayload(buf, byteCap);
-          return { ok: true, parsed: parseSitemapXml(xml) };
+          const xml = await decodeSitemapPayload(buf, byteCap, { signal: budget.signal, parseLimit });
+          // The parse is synchronous and cannot be interrupted, so check the
+          // budget and the cancellation right before it: a spent budget is
+          // overrun by at most the one parse already running (~3 s at the
+          // parse limit), never by another document's. The loop reports a
+          // spent budget as the budget message, not as CANCELLED.
+          if (budget.signal.aborted) return { ok: false, error: CANCELLED };
+          return { ok: true, parsed: parseSitemapXml(xml, parseLimit) };
         } catch (err) {
           return { ok: false, error: `parse failed: ${(err as Error).message}` };
         }

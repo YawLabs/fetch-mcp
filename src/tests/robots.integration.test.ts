@@ -167,4 +167,19 @@ describe("fetch_robots integration", () => {
     expect(isError).toBe(true);
     expect(raw).toContain("HTTP 500");
   });
+  it("survives hostile wildcard rules without throwing or stalling", async () => {
+    // Through 0.8.3 these compiled to RegExps: the first threw "regular
+    // expression too large" out of the callback, the second backtracked ~12 s.
+    const slug =
+      "how-to-make-the-best-of-a-long-weekend-in-the-city-with-your-kids-and-friends-on-a-budget-in-2026-guide";
+    const wide = Array.from({ length: 20 }, (_, i) => `Disallow: /${"*-".repeat(10)}X${i}$`).join("\n");
+    serveRobots(200, `User-agent: *\nDisallow: ${"*a".repeat(100_000)}\n${wide}\n`);
+    const t0 = performance.now();
+    const { raw, isError } = await callRobots({ url: `${baseUrl}/blog/${slug}`, allow_private_hosts: true });
+    expect(isError).toBe(false);
+    // The 200 KB rawRobotsText is cut for display, so the text is not whole
+    // JSON; the verdict keys come before it.
+    expect(raw).toMatch(/"allowed": true,\s+"matchedRule": null/);
+    expect(performance.now() - t0).toBeLessThan(2_000);
+  });
 });
