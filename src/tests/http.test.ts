@@ -9,6 +9,7 @@ import {
   parseRetryAfter,
   setHttpContext,
   shouldDecodeAsText,
+  transportErrorMessage,
 } from "../http.js";
 
 setHttpContext({ version: "test" });
@@ -675,5 +676,46 @@ describe("createServer sanity", () => {
     const s = createServer();
     expect(s).toBeDefined();
     s.close();
+  });
+});
+
+describe("httpRequest -- transport failures", () => {
+  it("names the coded cause of a refused connect, without the address", async () => {
+    // A port that was just bound and closed: nothing listens, so connect is refused.
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const res = await httpRequest({
+      method: "GET",
+      url: `http://127.0.0.1:${port}/`,
+      allowPrivateHosts: true,
+      retries: 0,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(0);
+    expect(res.error).toMatch(/^fetch failed \(ECONNREFUSED/);
+    // The dialled address never reaches the model (Launch-critical #19).
+    expect(res.error).not.toContain("127.0.0.1");
+    expect(res.error).not.toContain(String(port));
+  });
+
+  it("strips IPv4 and IPv6 addresses from the cause message", () => {
+    const wrap = (code: string, message: string) => new TypeError("fetch failed", { cause: { code, message } });
+    expect(transportErrorMessage(wrap("ECONNREFUSED", "connect ECONNREFUSED 10.20.30.40:443"))).toBe(
+      "fetch failed (ECONNREFUSED: connect ECONNREFUSED)",
+    );
+    expect(transportErrorMessage(wrap("ETIMEDOUT", "connect ETIMEDOUT [2001:db8::1]:443"))).toBe(
+      "fetch failed (ETIMEDOUT: connect ETIMEDOUT)",
+    );
+    expect(transportErrorMessage(wrap("ECONNRESET", "read ECONNRESET ::ffff:10.0.0.1"))).not.toMatch(/10\.0\.0\.1/);
+    expect(transportErrorMessage(wrap("UND_ERR_SOCKET", "other side closed"))).toBe(
+      "fetch failed (UND_ERR_SOCKET: other side closed)",
+    );
+  });
+
+  it("leaves an error without a cause unchanged", () => {
+    expect(transportErrorMessage(new Error("request timed out after 50ms"))).toBe("request timed out after 50ms");
   });
 });

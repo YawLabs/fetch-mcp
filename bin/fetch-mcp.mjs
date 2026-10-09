@@ -198,7 +198,10 @@ function pathKey(p) {
  * usually has oam/target/release on PATH, and cargo replaces that binary
  * underneath running processes. Both forms are checked on Windows: the
  * installer defaults to %LOCALAPPDATA%\oam\bin there, but oam's docs name
- * ~/.oam/bin first and OAM_INSTALL_DIR can pick either.
+ * ~/.oam/bin first and OAM_INSTALL_DIR can pick either. OAM_INSTALL_DIR is
+ * oam's installer target (docs/cli-reference.md: the bin directory itself), so
+ * when it is set it is searched FIRST: an oam installed to a custom directory
+ * and not on PATH was never found before.
  *
  * Windows: `.exe` ONLY -- deliberately narrower than PATHEXT. Node refuses to
  * run a .cmd/.bat through execFile/spawn without `shell: true` (EINVAL, and for
@@ -212,6 +215,7 @@ function discoverOamPaths() {
   if (isWin) {
     installed.unshift(join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "oam", "bin", exe));
   }
+  if (process.env.OAM_INSTALL_DIR) installed.unshift(join(process.env.OAM_INSTALL_DIR, exe));
   const onPath = (process.env.PATH ?? "")
     .split(delimiter)
     .filter(Boolean)
@@ -399,7 +403,12 @@ function parseRuntimeSetting(value) {
  * not after it. `oam run --permission file.js` is rejected outright, which is a
  * good failure but only because it is loud -- ordering here is load-bearing.
  *
- * Net grants prefix-match `host` for fetch and `host:port` for sockets.
+ * Net grants (oam >= 0.18.0, the floor): an entry without a port admits that
+ * host on every port, and `host:port` admits that port only -- for fetch,
+ * http/https.request, WebSocket and net/tls sockets alike. The bare
+ * `--allow-net` below is a policy choice, not a workaround: the URLs are the
+ * caller's to choose.
+ *
  * A denied environment variable is ABSENT from process.env rather than throwing,
  * so the env list below is derived from what the bundle actually reads; trimming
  * it produces silent misbehaviour, not a clear denial.
@@ -513,20 +522,29 @@ function hostOamCandidate() {
 /**
  * Choose the oam to spawn: a usable OAM_BIN, else the newest usable binary
  * among the host's own oam (first, so it wins ties) and discovery. Returns the
- * choice (or null) plus stderr notes: `overrideNote` about an unusable
- * OAM_BIN, and `skipped` describing what was found and rejected when nothing
- * was usable.
+ * choice (or null) plus what stderr needs:
+ *   overrideNote     why OAM_BIN was passed over, or null
+ *   skipped          why each discovered binary was passed over, when none was chosen
+ *   passedOver       the `version` of every existing binary rejected (OAM_BIN
+ *                    included), so a failure can name the right remedy
+ *   overrideMissing  OAM_BIN was set to a path that does not exist
  */
 function chooseOam() {
   const override = process.env.OAM_BIN;
   let overrideNote = null;
+  let overrideMissing = false;
+  const passedOver = [];
   if (override) {
     if (!existsSync(override)) {
       overrideNote = `OAM_BIN=${override} does not exist`;
+      overrideMissing = true;
     } else {
       const version = oamVersion(override);
-      if (atLeast(version, OAM_MIN)) return { chosen: { path: override, version }, overrideNote, skipped: [] };
+      if (atLeast(version, OAM_MIN)) {
+        return { chosen: { path: override, version }, overrideNote, skipped: [], passedOver, overrideMissing };
+      }
       overrideNote = unusableReason(override, version, `OAM_BIN=${override}`);
+      passedOver.push(version);
     }
   }
   const host = hostOamCandidate();
@@ -539,7 +557,78 @@ function chooseOam() {
   ];
   const chosen = pickNewest(candidates);
   const skipped = chosen ? [] : candidates.map((c) => unusableReason(c.path, c.version));
-  return { chosen, overrideNote, skipped };
+  if (!chosen) passedOver.push(...candidates.map((c) => c.version));
+  return { chosen, overrideNote, skipped, passedOver, overrideMissing };
+}
+
+/**
+ * What would get a usable oam, one clause per cause that was actually seen --
+ * never "install oam" to someone whose oam is merely old, or broken:
+ *   passedOver       versions of the binaries rejected (null = could not be run)
+ *   overrideMissing  OAM_BIN named a path that does not exist
+ *   shim             an oam .cmd/.bat was found on PATH (its own note says what to do)
+ *   launchFailed     a usable oam was chosen but would not start
+ * Clauses are lower-case and unpunctuated; callers join them into a sentence.
+ *
+ * oam publishes darwin arm64/x64, windows arm64/x64 and linux x64 builds and no
+ * other (oam README), so on any other Linux "install oam" is an impossible
+ * remedy and is replaced by the one that works there.
+ *
+ * Pure on purpose, like runtimePlan: `platform` and `arch` are passed in.
+ */
+function remedyClauses({ passedOver, overrideMissing, shim, launchFailed, platform, arch }) {
+  const min = OAM_MIN.join(".");
+  const clauses = [];
+  if (passedOver.some((v) => v !== null)) clauses.push(`run \`oam self-update\` to get oam ${min} or newer`);
+  if (launchFailed || passedOver.some((v) => v === null)) {
+    clauses.push("check that the oam found is an executable oam binary for this platform");
+  }
+  if (overrideMissing) clauses.push("point OAM_BIN at an existing oam binary, or unset it");
+  if (clauses.length === 0 && !shim) {
+    clauses.push(
+      platform === "linux" && arch !== "x64"
+        ? `set OAM_BIN=/path/to/oam if you built oam yourself (oam publishes no build for linux-${arch})`
+        : `install oam ${min} or newer from https://oamjs.org, or set OAM_BIN=/path/to/oam`,
+    );
+  }
+  return clauses;
+}
+
+/** What chooseOam saw, kept for the sandbox note; see noteSandboxNotApplied. */
+let oamFindings = { passedOver: [], overrideMissing: false, shim: null, launchFailed: false };
+
+/**
+ * NODE_OPTIONS tokens a Node child must not inherit from an oam host.
+ *
+ * Since oam 0.18.0, a process started under `--permission` passes its
+ * `--permission` / `--allow-*` flags on to every child through NODE_OPTIONS,
+ * for any program, as Node does. So an oam that was itself started that way
+ * leaves them in the environment this launcher sees, and a Node handoff
+ * inherits them. Node 22 refuses to start on oam's grant flags there
+ * (`--allow-net is not allowed in NODE_OPTIONS`, exit 9 -- measured on
+ * 22.22.2), and the ones it does know would apply Node's permission model, not
+ * oam's.
+ * Node cannot apply oam's sandbox either way, so the handoff drops them and
+ * says so (handOffToNode). An oam child keeps them: that is the inheritance
+ * oam intends.
+ *
+ * Returns `{ env, dropped }`: a copy of `env` without those tokens (and without
+ * NODE_OPTIONS at all when nothing else is left), and the tokens removed.
+ * Tokens are split on whitespace outside double quotes, as Node splits them.
+ * Pure on purpose, like runtimePlan.
+ */
+function nodeChildEnv(env) {
+  const value = env.NODE_OPTIONS;
+  if (!value) return { env, dropped: [] };
+  const tokens = value.match(/(?:[^\s"]+|"[^"]*")+/g) ?? [];
+  const isGrant = (t) => /^"?--(?:permission|allow-[\w-]+)(?:[="\s]|$)/.test(t);
+  const dropped = tokens.filter(isGrant);
+  if (dropped.length === 0) return { env, dropped };
+  const kept = tokens.filter((t) => !isGrant(t));
+  const next = { ...env };
+  if (kept.length > 0) next.NODE_OPTIONS = kept.join(" ");
+  else delete next.NODE_OPTIONS;
+  return { env: next, dropped };
 }
 
 /** Run the server in THIS process. The zero-overhead fallback. */
@@ -574,9 +663,10 @@ const startFailed = (e) => {
  *
  * `onLaunchFailed(err)` runs when the child could not be started at all; it is
  * never called once the child is running, which would double-start the server
- * on the same stdio.
+ * on the same stdio. `env` is the child's environment: process.env, except
+ * for a Node handoff from oam (see nodeChildEnv).
  */
-async function launchChild(cmd, args, onLaunchFailed) {
+async function launchChild(cmd, args, onLaunchFailed, env = process.env) {
   // Every handoff from an oam host pipes; see ALREADY RUNNING ON OAM. That is a
   // host below the floor, one at the floor spawning a fresh oam for the
   // sandbox, or any oam under FETCH_MCP_RUNTIME=node.
@@ -589,7 +679,7 @@ async function launchChild(cmd, args, onLaunchFailed) {
       // server's shutdown path. Piping preserves both as well: bytes are copied
       // unchanged, and stdin's end propagates to the child.
       stdio: piped ? ["pipe", "pipe", "pipe"] : "inherit",
-      env: process.env,
+      env,
       windowsHide: true,
     });
   } catch (err) {
@@ -725,10 +815,25 @@ async function handOffToNode(reason, sandboxWhy) {
   }
   if (reason) await errSync(`fetch-mcp: ${reason}; running on ${node} instead.\n`);
   await noteSandboxNotApplied(sandboxWhy);
-  await launchChild(node, [SERVER_ENTRY, ...process.argv.slice(2)], async (err) => {
-    await errSync(`fetch-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
-    process.exit(1);
-  });
+  // Only an oam host reaches this function, and its NODE_OPTIONS may carry the
+  // permission flags oam passes to children -- Node would refuse to start on
+  // them. Dropping them is a sandbox change, so it is never silent.
+  const { env, dropped } = nodeChildEnv(process.env);
+  if (dropped.length > 0) {
+    await errSync(
+      `fetch-mcp: dropped ${dropped.join(" ")} from NODE_OPTIONS for the Node handoff; ` +
+        "Node cannot apply oam's permission flags, so the server runs WITHOUT them.\n",
+    );
+  }
+  await launchChild(
+    node,
+    [SERVER_ENTRY, ...process.argv.slice(2)],
+    async (err) => {
+      await errSync(`fetch-mcp: failed to launch Node at ${node} (${err?.message ?? err})\n`);
+      process.exit(1);
+    },
+    env,
+  );
 }
 
 /** What a fallback serves on, for stderr. */
@@ -761,11 +866,14 @@ function fallbackSuffix(hostOam) {
  */
 async function noteSandboxNotApplied(why) {
   if (sandbox.length === 0) return;
+  const clauses = remedyClauses({ ...oamFindings, platform: process.platform, arch: process.arch });
+  // A shim alone yields no clause (its own note says what to do); keep the
+  // sentence whole anyway.
+  const how = clauses.length > 0 ? clauses.join("; or ") : "point OAM_BIN at a native oam binary";
   const remedy =
     mode === "node"
       ? "Remove FETCH_MCP_RUNTIME=node to let the launcher use oam.\n"
-      : `To apply it, install or update oam (${OAM_MIN.join(".")} or newer) from https://oamjs.org or set ` +
-        "OAM_BIN=/path/to/oam; set FETCH_MCP_RUNTIME=oam to make this fatal instead.\n";
+      : `To apply it, ${how}; set FETCH_MCP_RUNTIME=oam to make this fatal instead.\n`;
   await errSync(
     `fetch-mcp: ${sandboxAsSet} was not applied -- ${why}, so the server runs WITHOUT --permission.\n${remedy}`,
   );
@@ -850,7 +958,8 @@ if (plan === "in-process") {
     SANDBOX_MOOT_ON_NODE,
   );
 } else {
-  const { chosen, overrideNote, skipped } = chooseOam();
+  const { chosen, overrideNote, skipped, passedOver, overrideMissing } = chooseOam();
+  oamFindings = { passedOver, overrideMissing, shim: null, launchFailed: false };
 
   if (chosen) {
     if (overrideNote) {
@@ -860,6 +969,7 @@ if (plan === "in-process") {
     // oam's own flags from the script's argv, so `fetch-mcp --version` and any
     // host-supplied flags survive the hop unchanged.
     await launchChild(chosen.path, [...sandbox, "run", SERVER_ENTRY, "--", ...process.argv.slice(2)], async (err) => {
+      oamFindings = { ...oamFindings, launchFailed: true };
       if (mode === "oam") {
         await errSync(`fetch-mcp: failed to launch oam at ${chosen.path} (${err?.message ?? err})\n`);
         process.exit(1);
@@ -871,6 +981,7 @@ if (plan === "in-process") {
     });
   } else {
     const shim = findOamShim();
+    oamFindings = { ...oamFindings, shim };
     const notes = [
       ...(overrideNote ? [overrideNote] : []),
       ...skipped,
@@ -887,13 +998,20 @@ if (plan === "in-process") {
       // send them straight back.
       const nodeOption =
         sandbox.length > 0
-          ? `or drop ${sandboxAsSet} and use FETCH_MCP_RUNTIME=node (Node cannot apply the sandbox)`
-          : "or use FETCH_MCP_RUNTIME=node";
+          ? `Or drop ${sandboxAsSet} and use FETCH_MCP_RUNTIME=node (Node cannot apply the sandbox).\n`
+          : "Or use FETCH_MCP_RUNTIME=node to run on Node.\n";
+      // One line per cause actually seen (remedyClauses): `oam self-update` for
+      // an old oam, a binary check for one that would not run, the install URL
+      // only when no oam was found at all.
+      const remedies = remedyClauses({ ...oamFindings, platform: process.platform, arch: process.arch })
+        .map((clause) => `${clause[0].toUpperCase()}${clause.slice(1)}.\n`)
+        .join("");
       await errSync(
         `fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam (${OAM_MIN.join(".")} or newer) was found` +
           `${sandbox.length > 0 ? `, and ${sandboxAsSet} needs one` : ""}.\n` +
           notes.map((note) => `  ${note}\n`).join("") +
-          `Install or update from https://oamjs.org, set OAM_BIN=/path/to/oam, ${nodeOption}.\n`,
+          remedies +
+          nodeOption,
       );
       process.exit(1);
     }

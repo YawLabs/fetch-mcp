@@ -257,6 +257,19 @@ if [ "$IS_CI" != "true" ]; then
   info "npm: logged in as $WHOAMI"
 fi
 
+# --- oam floor preflight (ported from aws-mcp) ----------------------------
+# The policy is that the launcher's OAM_MIN is the latest oam release and the
+# server is verified on that one release. oam ships often enough that this goes
+# stale between releases on its own, so ask before publishing rather than
+# discovering it in a bug report. The DRIFT half (does the whole repo agree on
+# the floor?) needs no network and runs in the test suite (step 2) too.
+# Exits non-zero when the floor is behind; FETCH_MCP_ALLOW_STALE_OAM=1 is the
+# deliberate way past it. No network is not a failure -- the check says so.
+if [ -f scripts/check-oam-floor.mjs ]; then
+  echo ""
+  node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set FETCH_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+fi
+
 CURRENT_VERSION=$(node -p "require('./package.json').version")
 RESUMING=false
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
@@ -298,6 +311,31 @@ step 2 "Build + test"
 npm run build || fail "Build failed"
 npm test || fail "Tests failed"
 info "Build + tests passed"
+
+# The real-oam lane (src/tests/oam.integration.test.ts): the built server under
+# a real oam, through the launcher, sandboxed. oam is the launcher's preferred
+# runtime and the Node-only suite above cannot see its fetch, zlib, AbortSignal
+# or permission behaviour. Run it whenever an oam at or above OAM_MIN can be
+# found (FETCH_MCP_TEST_OAM, else discovery); WARN, loudly, when none can.
+if TEST_OAM=$(node scripts/find-test-oam.mjs); then
+  info "Real-oam lane on $TEST_OAM"
+  FETCH_MCP_TEST_OAM="$TEST_OAM" npx vitest run src/tests/oam.integration.test.ts || fail "Real-oam lane failed on $TEST_OAM"
+  info "Real-oam lane passed"
+else
+  warn "Real-oam lane NOT run -- no usable oam found (see above). Install oam or set FETCH_MCP_TEST_OAM=/path/to/oam to run it."
+fi
+
+# MCP compliance: the suite Yaw MCP grades every server with (@yawlabs/mcp-compliance,
+# pinned in devDependencies to Yaw MCP's version line). Below A, or a failed
+# required test, blocks the release; a run that produced no grade WARNS -- it
+# must never read as a pass.
+COMPLIANCE_RC=0
+node scripts/check-compliance.mjs || COMPLIANCE_RC=$?
+case "$COMPLIANCE_RC" in
+  0) info "MCP compliance: grade A" ;;
+  1) fail "MCP compliance below grade A -- see above" ;;
+  *) warn "MCP compliance NOT graded (exit $COMPLIANCE_RC) -- see above. The release is proceeding ungraded." ;;
+esac
 
 step 3 "Bump version to $VERSION"
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
