@@ -84,12 +84,16 @@ export function sitemapByteCap(maxBytes: number | undefined): number {
  * input, so without a cap a 200 KB response inflates to ~200 MB (a gzip bomb
  * past max_bytes) and takes the server down.
  *
- * The cap is counted by hand on a streaming gunzip rather than passed as
- * zlib's `maxOutputLength`: oam (the launcher's preferred runtime) accepts
- * that option and ignores it. The compressed input is fed in 1 KiB slices
- * because oam inflates each written slice into a single output chunk, so the
- * slice size bounds how far past the cap one chunk can land (~1 MiB) before
- * the stream is destroyed. Node emits 16 KiB chunks either way.
+ * The cap is counted by hand because the gunzip is a STREAM, and streaming
+ * zlib has no `maxOutputLength` cap on Node or on oam: only the one-shot
+ * functions (`gunzip`, `gunzipSync`, ...) enforce that option, on both
+ * runtimes since oam 0.17.0 (before it, oam ignored it there too). Streaming
+ * is what lets `signal` and the cap land between slices instead of after the
+ * whole payload has inflated. The compressed input is fed in 1 KiB slices
+ * because oam inflates each written slice into a single output chunk
+ * (re-measured on oam 0.18.0), so the slice size bounds how far past the cap
+ * one chunk can land (~1 MiB) before the stream is destroyed. Node emits
+ * 16 KiB chunks either way.
  *
  * `parseLimit` (default `MAX_XML_PARSE_BYTES`) refuses a document the parser
  * would stall on, plain or gzipped; the gunzip stops at whichever cap is

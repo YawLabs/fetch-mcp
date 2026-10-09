@@ -195,16 +195,15 @@ describe("release prompt block", () => {
    *   - non-interactive: prints the "Non-interactive shell" info, then `step 1`
    * Earlier the `else` was bound to the OUTER `if` and only `step 1` ran in
    * both cases; the info message was dead code. This test pins both branches
-   * by sourcing the literal prompt block (lines 272-292) and feeding it a
+   * by sourcing the literal prompt block (its outer if through fi) and feeding it a
    * controlled stdin. The `step` and `info` functions are stubbed so we
    * observe what the block emitted without running the rest of release.sh.
    */
   let promptBlock: string;
   beforeEach(() => {
-    const lines = source.split("\n");
-    // Lines are 0-indexed in the array; release.sh is 1-indexed in editors.
-    // Extract lines 272..292 inclusive (the outer if through its closing fi).
-    promptBlock = lines.slice(271, 292).join("\n");
+    // The outer if through its closing fi, anchored on text: fixed line
+    // numbers silently sliced the wrong lines once anything above them moved.
+    promptBlock = extractBlock('if [ "$IS_CI" != "true" ] && [ "$RESUMING" != "true" ]; then', "fi");
   });
 
   function runPromptBlock(

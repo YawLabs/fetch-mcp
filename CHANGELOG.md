@@ -4,6 +4,20 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Changed
+- **A request that fails below HTTP now says why.** `http_*` and every fetch tool returned a bare `fetch failed` for a refused connection, a connect timeout, a reset mid-body or a TLS failure alike. The error now carries the cause's code and message, e.g. `fetch failed (ECONNREFUSED: connect ECONNREFUSED)` or `terminated (UND_ERR_SOCKET: other side closed)`, with every IP address and port cut out of it, so a refusal still never names the address a hostname resolved to. oam reports the same coded causes as Node since 0.18.0.
+- **The launcher's "no usable oam" advice names the fix for what it found.** Under `FETCH_MCP_RUNTIME=oam`, and in the note printed when `FETCH_MCP_SANDBOX=1` could not be applied, it said "install or update oam from https://oamjs.org" in every case. It now says `oam self-update` when it found an oam that is too old, asks you to check the binary when one would not run or start, points at `OAM_BIN` when that path does not exist, and sends you to the install page only when no oam was found. On a Linux machine oam publishes no build for (arm64), it no longer offers an install that does not exist. The `FETCH_MCP_RUNTIME=node` advice is now its own line: `Or use FETCH_MCP_RUNTIME=node to run on Node.`
+- **The launcher finds an oam installed to `OAM_INSTALL_DIR`.** oam's installer puts the binary there when it is set; the launcher now searches it first, before `~/.oam/bin`, `%LOCALAPPDATA%\oam\bin` and `PATH`. Before, an oam installed to a custom directory and not on `PATH` was never found.
+
+### Fixed
+- **A Node handoff from an oam host started under `--permission` no longer dies at startup.** Since 0.18.0, oam passes its `--permission` / `--allow-*` flags to every child through `NODE_OPTIONS`; Node 22 refuses to start on `--allow-net` there (exit 9), so the handoff (from an oam below the floor, or under `FETCH_MCP_RUNTIME=node`) served nothing. The launcher now drops those flags from the Node child's `NODE_OPTIONS`, keeps the rest, and says on stderr that the server runs without them. An oam child keeps them.
+
+### Internal
+- `release.sh` checks before step 1 that `OAM_MIN` is the latest oam release and that every floor claim in the repo agrees with it (`scripts/check-oam-floor.mjs`, ported from aws-mcp; the offline half also runs in the test suite). `FETCH_MCP_ALLOW_STALE_OAM=1` releases on an older floor deliberately.
+- `release.sh` step 2 runs the real-oam lane (`src/tests/oam.integration.test.ts`) on the newest oam at or above the floor it can find, and warns when there is none; the lane now fails instead of skipping when `FETCH_MCP_TEST_OAM` names a path that does not exist.
+- `release.sh` step 2 grades the built launcher with `@yawlabs/mcp-compliance` (a devDependency, `^0.20.4`, the line Yaw MCP grades with) and blocks the release below grade A; a run that produces no grade warns.
+- Corrected comments: a port-scoped `--allow-net` entry admits fetch to that port on oam 0.18.0 (the launcher's bare grant is a policy choice), and streaming zlib has no `maxOutputLength` cap on Node or oam, which is why the sitemap gzip cap is counted by hand.
+
 ## [0.8.4] — 2026-10-07
 
 ### Security

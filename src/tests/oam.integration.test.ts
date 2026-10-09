@@ -11,13 +11,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 // The server under a REAL oam, through the launcher, with the sandbox on.
 //
 // The rest of the suite runs on Node, and oam is the launcher's preferred
-// runtime: a Node-only suite passed while oam silently ignored zlib's
-// `maxOutputLength` (the gzip-bomb cap did nothing there) -- found by hand in
-// 0.7.1's review, not by a test. This lane exists for that class of bug.
+// runtime: a Node-only suite passed while oam (before 0.17.0) silently ignored
+// zlib's `maxOutputLength` (the gzip-bomb cap did nothing there) -- found by
+// hand in 0.7.1's review, not by a test. This lane exists for that class of bug.
 //
 // Opt-in: set FETCH_MCP_TEST_OAM to an oam binary at or above the launcher's
 // OAM_MIN, e.g. FETCH_MCP_TEST_OAM=~/yaw/oam_js_runtime/oam/target/release/oam.
-// Without it, or without a build, the lane is skipped.
+// Without it, or without a build, the lane is skipped. release.sh sets it
+// after the build when it finds a usable oam, and warns when it finds none.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..");
@@ -130,6 +131,16 @@ async function startOnOam(extraEnv: Record<string, string> = {}): Promise<Sessio
   };
 }
 
+// Asked for but not runnable is a failure, not a skip: release.sh runs this
+// lane as a gate, and a path the runtime cannot see (a Git Bash `/c/...` path
+// handed to Windows Node) used to skip it with exit 0.
+describe.runIf(Boolean(OAM) && !available)("FETCH_MCP_TEST_OAM is set", () => {
+  it("names an oam binary that exists, with a build in dist/", () => {
+    expect(existsSync(OAM as string), `FETCH_MCP_TEST_OAM=${OAM} does not exist`).toBe(true);
+    expect(existsSync(DIST_BIN), "dist/index.js is missing -- run npm run build").toBe(true);
+  });
+});
+
 describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () => {
   it(
     "serves under --permission and refuses allow_private_hosts without the operator opt-in",
@@ -160,7 +171,8 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
         const reached = await s.call("http_get", { url: `${base}/internal`, allow_private_hosts: true });
         expect(reached.text).toContain("INTERNAL-ONLY");
 
-        // (2) The streaming gzip cap -- oam ignores zlib's maxOutputLength.
+        // (2) The hand-counted gzip cap -- streaming zlib has no maxOutputLength
+        // cap on either runtime, and oam inflates a whole 1 KiB slice per chunk.
         const bomb = gzipSync(
           Buffer.from(
             `<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${" ".repeat(64 * 1024 * 1024)}</urlset>`,

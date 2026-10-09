@@ -546,7 +546,7 @@ async function sendHop(params: {
       },
     };
   } catch (err) {
-    return { kind: "error", response: failure(url, (err as Error).message, redirects, start) };
+    return { kind: "error", response: failure(url, transportErrorMessage(err), redirects, start) };
   } finally {
     clearTimeout(timer);
     opts.signal?.removeEventListener("abort", onCallerAbort);
@@ -659,6 +659,42 @@ export async function httpRequest(
     }
   }
   return lastResponse ?? failure(opts.url, "all retries exhausted", [], start);
+}
+
+// An IPv4 address (optionally :port), or an IPv6 one (optionally bracketed,
+// optionally :port): at least two colons between hex groups, so an error code
+// like `UND_ERR_SOCKET:` never matches.
+const ADDRESS_RE =
+  /\[?(?<![\w:.])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%[\w.]+)?\]?(?::\d+)?|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/gi;
+
+/**
+ * The model-facing text for a request that failed below HTTP. undici rejects
+ * with a bare `fetch failed` (or `terminated` for a body read cut short) and
+ * puts what actually happened on `err.cause`: a code (`ECONNREFUSED`,
+ * `UND_ERR_CONNECT_TIMEOUT`, `UND_ERR_SOCKET`, `ERR_SSL_*`, ...) and a message.
+ * Node has always carried it, and oam does too since 0.18.0. Without it the
+ * model cannot tell a refused connect from a reset or a TLS failure.
+ *
+ * The cause message names the address undici dialled -- for a hostname that
+ * is the pinned, resolved IP, which `resolveAndPin()` deliberately keeps out
+ * of every message (Launch-critical #19) -- so every address is cut out of it.
+ * Exported for tests.
+ */
+export function transportErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const cause = err instanceof Error ? (err.cause as { code?: unknown; message?: unknown } | undefined) : undefined;
+  if (!cause || typeof cause !== "object") return message;
+  const code = typeof cause.code === "string" ? cause.code : "";
+  const causeText =
+    typeof cause.message === "string"
+      ? cause.message
+          .replace(ADDRESS_RE, "")
+          .replace(/\s{2,}/g, " ")
+          .replace(/[\s:,-]+$/, "")
+          .trim()
+      : "";
+  const detail = [code, causeText && causeText !== code ? causeText : ""].filter(Boolean).join(": ");
+  return detail ? `${message} (${detail})` : message;
 }
 
 function failure(url: string, error: string, redirects: string[], start: number): HttpResponse {

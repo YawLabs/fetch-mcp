@@ -507,7 +507,7 @@ const IN_CHILD = /LAUNCHER_ARGV1=.*fetch-mcp\.mjs/;
 const SANDBOX_DROPPED =
   /^fetch-mcp: FETCH_MCP_SANDBOX=\S+ was not applied -- .*so the server runs WITHOUT --permission\.$/m;
 const SANDBOX_REMEDY =
-  /^To apply it, install or update oam \(0\.18\.0 or newer\) from https:\/\/oamjs\.org or set OAM_BIN=\/path\/to\/oam; set FETCH_MCP_RUNTIME=oam to make this fatal instead\.$/m;
+  /^To apply it, point OAM_BIN at an existing oam binary, or unset it; set FETCH_MCP_RUNTIME=oam to make this fatal instead\.$/m;
 
 /**
  * An environment with no oam anywhere: HOME and LOCALAPPDATA point at an
@@ -856,7 +856,7 @@ describe("launcher with no usable oam", () => {
       // The advice must not loop back: plain "use FETCH_MCP_RUNTIME=node"
       // would drop the sandbox the user just asked for without saying so.
       expect(run.stderr).toMatch(
-        /or drop FETCH_MCP_SANDBOX=\S+ and use FETCH_MCP_RUNTIME=node \(Node cannot apply the sandbox\)\./,
+        /^Or drop FETCH_MCP_SANDBOX=\S+ and use FETCH_MCP_RUNTIME=node \(Node cannot apply the sandbox\)\.$/m,
       );
       // Fatal is fatal: nothing may claim the server runs without the sandbox.
       expect(run.stderr).not.toMatch(/runs WITHOUT --permission/);
@@ -872,7 +872,7 @@ describe("launcher with no usable oam", () => {
       expect(run.stderr).toMatch(
         /^fetch-mcp: FETCH_MCP_RUNTIME=oam but no usable oam \(0\.18\.0 or newer\) was found\.$/m,
       );
-      expect(run.stderr).toMatch(/, or use FETCH_MCP_RUNTIME=node\.$/m);
+      expect(run.stderr).toMatch(/^Or use FETCH_MCP_RUNTIME=node to run on Node\.$/m);
       expect(run.stderr).not.toMatch(/SANDBOX/);
     },
     TIMEOUT_MS,
@@ -995,7 +995,7 @@ describe("launcher with no usable oam", () => {
         /FETCH_MCP_RUNTIME=oam but no usable oam \(0\.18\.0 or newer\) was found, and FETCH_MCP_SANDBOX=1 needs one\./,
       );
       expect(run.stderr).toMatch(
-        /or drop FETCH_MCP_SANDBOX=1 and use FETCH_MCP_RUNTIME=node \(Node cannot apply the sandbox\)\./,
+        /^Or drop FETCH_MCP_SANDBOX=1 and use FETCH_MCP_RUNTIME=node \(Node cannot apply the sandbox\)\.$/m,
       );
       expect(run.stderr).not.toMatch(/runs WITHOUT --permission/);
     },
@@ -1033,7 +1033,7 @@ describe("launcher with no usable oam", () => {
       );
       expect(fatalLine, `loop-aware text must not appear in the fatal: ${fatalLine}`).not.toMatch(/Node cannot apply/);
       // The remedy below the fatal: plain RUNTIME=node, no sandbox clause.
-      expect(run.stderr).toMatch(/, or use FETCH_MCP_RUNTIME=node\.$/m);
+      expect(run.stderr).toMatch(/^Or use FETCH_MCP_RUNTIME=node to run on Node\.$/m);
     },
     TIMEOUT_MS,
   );
@@ -1185,6 +1185,159 @@ describe("launcher on a Node host below the floor", () => {
       expect(run.code, JSON.stringify(run)).toBe(0);
       expect(run.stdout.trim()).toBe(PACKAGE_VERSION);
       expect(run.stderr).not.toMatch(/older than 22\.19\.0/);
+    },
+    TIMEOUT_MS,
+  );
+});
+
+type RemedyClauses = (ctx: {
+  passedOver: (number[] | null)[];
+  overrideMissing: boolean;
+  shim: string | null;
+  launchFailed: boolean;
+  platform: string;
+  arch: string;
+}) => string[];
+
+describe("launcher remedyClauses()", () => {
+  const remedyClauses = new Function(
+    `${extract([OAM_MIN_DECL, /function remedyClauses\(\{[^)]*\}\) \{[\s\S]*?\n\}/])}\nreturn remedyClauses;`,
+  )() as RemedyClauses;
+  const base = {
+    passedOver: [],
+    overrideMissing: false,
+    shim: null,
+    launchFailed: false,
+    platform: "win32",
+    arch: "x64",
+  };
+
+  it("sends an outdated oam to `oam self-update`, never to the install page", () => {
+    const clauses = remedyClauses({ ...base, passedOver: [[0, 17, 1]] });
+    expect(clauses).toEqual(["run `oam self-update` to get oam 0.18.0 or newer"]);
+  });
+
+  it("sends an oam that would not run, or would not start, to a binary check", () => {
+    for (const ctx of [{ passedOver: [null] }, { launchFailed: true }]) {
+      const clauses = remedyClauses({ ...base, ...ctx });
+      expect(clauses, JSON.stringify(ctx)).toEqual([
+        "check that the oam found is an executable oam binary for this platform",
+      ]);
+    }
+  });
+
+  it("names a missing OAM_BIN, and only when nothing was found offers the install page", () => {
+    expect(remedyClauses({ ...base, overrideMissing: true })).toEqual([
+      "point OAM_BIN at an existing oam binary, or unset it",
+    ]);
+    expect(remedyClauses(base)).toEqual([
+      "install oam 0.18.0 or newer from https://oamjs.org, or set OAM_BIN=/path/to/oam",
+    ]);
+    // A .cmd/.bat shim is a real install; its own note says what to do.
+    expect(remedyClauses({ ...base, shim: "C:\\bin\\oam.cmd" })).toEqual([]);
+  });
+
+  it("never offers an install on a Linux that oam publishes no build for", () => {
+    const [clause] = remedyClauses({ ...base, platform: "linux", arch: "arm64" });
+    expect(clause).toMatch(/oam publishes no build for linux-arm64/);
+    expect(clause).not.toMatch(/oamjs\.org/);
+    expect(remedyClauses({ ...base, platform: "linux", arch: "x64" })[0]).toMatch(/oamjs\.org/);
+  });
+});
+
+type NodeChildEnv = (env: Record<string, string | undefined>) => {
+  env: Record<string, string | undefined>;
+  dropped: string[];
+};
+
+describe("launcher nodeChildEnv()", () => {
+  const nodeChildEnv = new Function(
+    `${extract([/function nodeChildEnv\(env\) \{[\s\S]*?\n\}/])}\nreturn nodeChildEnv;`,
+  )() as NodeChildEnv;
+
+  it("drops the permission flags oam passes to children, and keeps everything else", () => {
+    const { env, dropped } = nodeChildEnv({
+      PATH: "p",
+      NODE_OPTIONS: '--max-old-space-size=512 --permission --allow-net --allow-fs-read="/a b" --no-warnings',
+    });
+    expect(dropped).toEqual(["--permission", "--allow-net", '--allow-fs-read="/a b"']);
+    expect(env.NODE_OPTIONS).toBe("--max-old-space-size=512 --no-warnings");
+    expect(env.PATH).toBe("p");
+  });
+
+  it("removes NODE_OPTIONS when nothing else is left, and never touches the caller's env", () => {
+    const original = { NODE_OPTIONS: "--permission --allow-env=FETCH_MCP_ALLOW_PRIVATE_HOSTS" };
+    const { env, dropped } = nodeChildEnv(original);
+    expect(dropped).toHaveLength(2);
+    expect("NODE_OPTIONS" in env).toBe(false);
+    expect(original.NODE_OPTIONS).toBe("--permission --allow-env=FETCH_MCP_ALLOW_PRIVATE_HOSTS");
+  });
+
+  it("returns the env unchanged when there is nothing to drop", () => {
+    for (const input of [{}, { NODE_OPTIONS: "--no-warnings --allowed-thing" }]) {
+      const { env, dropped } = nodeChildEnv(input);
+      expect(env).toBe(input);
+      expect(dropped).toEqual([]);
+    }
+  });
+});
+
+describe("launcher discovery honours OAM_INSTALL_DIR", () => {
+  const discover = (env: Record<string, string>, present: string[]) =>
+    new Function(
+      "existsSync",
+      "process",
+      "homedir",
+      "join",
+      "delimiter",
+      "isWin",
+      "exe",
+      "pathKey",
+      `${extract([/function discoverOamPaths\(\) \{[\s\S]*?\n\}/])}\nreturn discoverOamPaths();`,
+    )(
+      (p: string) => present.includes(p),
+      { env },
+      () => "/home/u",
+      (...parts: string[]) => parts.join("/"),
+      ":",
+      false,
+      "oam",
+      (p: string) => p,
+    ) as string[];
+
+  it("searches OAM_INSTALL_DIR before the default install locations and PATH", () => {
+    const found = discover({ OAM_INSTALL_DIR: "/opt/oam", PATH: "/usr/bin" }, [
+      "/usr/bin/oam",
+      "/home/u/.oam/bin/oam",
+      "/opt/oam/oam",
+    ]);
+    expect(found).toEqual(["/opt/oam/oam", "/home/u/.oam/bin/oam", "/usr/bin/oam"]);
+  });
+
+  it("is a no-op when OAM_INSTALL_DIR is unset", () => {
+    expect(discover({ PATH: "/usr/bin" }, ["/usr/bin/oam", "/opt/oam/oam"])).toEqual(["/usr/bin/oam"]);
+  });
+});
+
+describe("launcher Node handoff from an oam host started under --permission", () => {
+  it.skipIf(!buildAvailable)(
+    "drops oam's inherited permission flags from NODE_OPTIONS, says so, and the Node child serves",
+    async () => {
+      // oam >= 0.18.0 appends its --permission / --allow-* flags to a child's
+      // NODE_OPTIONS. Node exits 9 on `--allow-net` there, so without the strip
+      // the handoff would serve nothing. Set from the preload, because the
+      // launcher's own Node would refuse the same NODE_OPTIONS at startup.
+      const run = await runLauncher(
+        "0.18.0",
+        isolated({ FETCH_MCP_RUNTIME: "node" }),
+        'process.env.NODE_OPTIONS = "--permission --allow-net --allow-env=FETCH_MCP_ALLOW_PRIVATE_HOSTS --no-warnings";',
+      );
+      expect(run.code, JSON.stringify(run)).toBe(0);
+      expect(run.stdout.trim()).toBe(PACKAGE_VERSION);
+      expect(run.stderr).toMatch(IN_CHILD);
+      expect(run.stderr).toMatch(
+        /^fetch-mcp: dropped --permission --allow-net --allow-env=FETCH_MCP_ALLOW_PRIVATE_HOSTS from NODE_OPTIONS for the Node handoff; /m,
+      );
     },
     TIMEOUT_MS,
   );
