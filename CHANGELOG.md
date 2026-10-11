@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-10-11
+
 ### Changed
 - **A request that fails below HTTP now says why.** `http_*` and every fetch tool returned a bare `fetch failed` for a refused connection, a connect timeout, a reset mid-body or a TLS failure alike. The error now carries the cause's code and message, e.g. `fetch failed (ECONNREFUSED: connect ECONNREFUSED)` or `terminated (UND_ERR_SOCKET: other side closed)`, with every IP address and port cut out of it, so a refusal still never names the address a hostname resolved to. oam reports the same coded causes as Node since 0.18.0.
 - **The launcher's "no usable oam" advice names the fix for what it found.** Under `FETCH_MCP_RUNTIME=oam`, and in the note printed when `FETCH_MCP_SANDBOX=1` could not be applied, it said "install or update oam from https://oamjs.org" in every case. It now says `oam self-update` when it found an oam that is too old, asks you to check the binary when one would not run or start, points at `OAM_BIN` when that path does not exist, and sends you to the install page only when no oam was found. On a Linux machine oam publishes no build for (arm64), it no longer offers an install that does not exist. The `FETCH_MCP_RUNTIME=node` advice is now its own line: `Or use FETCH_MCP_RUNTIME=node to run on Node.`
