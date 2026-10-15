@@ -11,8 +11,9 @@
 //
 // Nothing in this repo's release chain runs in CI -- there is no
 // .github/workflows directory at all. The binary BUILD is local too: each
-// platform runs build-binary.mjs + stage-release-asset.mjs by hand and uploads
-// its asset + `.sha256` sidecar to the GitHub release; this manifest BUMP runs
+// platform builds its binary into bin/<platform>-<arch>/, runs
+// stage-release-asset.mjs by hand and uploads its asset + `.sha256` sidecar to
+// the GitHub release; this manifest BUMP runs
 // last, because step 1 below downloads those sidecars.
 //
 //   node scripts/update-manifests.mjs --version 0.60.6 \
