@@ -1,8 +1,9 @@
 import { createRequire } from "node:module";
 import { startServer } from "./server.js";
 
-// Inlined by the single-binary build (build-binary.mjs --define); undefined
-// in the normal ESM/tsup build.
+// Nothing in this repo defines __VERSION__ today: tsup.config.ts has no
+// `define`, so it is always undefined and the package.json read below runs.
+// Kept as a hook for a bundler that inlines the version at build time.
 declare const __VERSION__: string;
 
 // Surface package version on `--version` / `version` so the post-publish

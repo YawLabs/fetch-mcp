@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// Stage the host-built SEA binary as a named release asset + sha256 sidecar.
+// Stage the host-built binary as a named release asset + sha256 sidecar.
 //
-// build-binary.mjs emits bin/<platform>-<arch>/yaw-mcp(.exe) (host-native --
-// Node SEA cannot cross-compile, so each CI matrix leg builds its own). This
-// renames that to the public asset name the Scoop/Homebrew manifests point at
-// (yaw-mcp-<platform>-<arch>[.exe]) and writes a `<asset>.sha256` sidecar in
-// sha256sum format (`<hex>  <asset>`) that Scoop's autoupdate `hash.url` reads.
+// Expects the binary at bin/<platform>-<arch>/fetch-mcp(.exe) (host-native --
+// each platform builds its own). This renames that to the public asset name
+// the Scoop/Homebrew manifests point at (fetch-mcp-<platform>-<arch>[.exe])
+// and writes a `<asset>.sha256` sidecar in sha256sum format (`<hex>  <asset>`)
+// that Scoop's autoupdate `hash.url` reads.
 //
-// Pure stdlib; writes only to dist-release/. Run after build-binary.mjs:
+// Pure stdlib; writes only to dist-release/. Run after the binary is built:
 //   node scripts/stage-release-asset.mjs
 
 import { createHash } from 'node:crypto';

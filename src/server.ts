@@ -12,10 +12,11 @@ import { registerReaderTools } from "./tools/reader.js";
 import { registerRobotsTools } from "./tools/robots.js";
 import { registerSitemapTools } from "./tools/sitemap.js";
 
-// Inlined by the single-binary build (build-binary.mjs --define); the bare
-// createRequire(import.meta.url) at module load would crash the binary
-// (import.meta.url is empty in the CJS bundle). Falls back to package.json for
-// the normal ESM/tsup build.
+// Nothing in this repo defines __VERSION__ today: tsup.config.ts has no
+// `define`, so it is always undefined and the version is read from
+// package.json at module load. Kept as a hook for a bundler that inlines the
+// version at build time, where import.meta.url may be empty and the
+// createRequire read would fail.
 declare const __VERSION__: string;
 const version =
   typeof __VERSION__ !== "undefined" ? __VERSION__ : createRequire(import.meta.url)("../package.json").version;
