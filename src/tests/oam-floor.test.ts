@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,6 +53,31 @@ describe("the oam floor is consistent across this repo", () => {
       const r = runChecker(REPO_ROOT);
       expect(r.code, `check-oam-floor reported drift in this repo:\n${r.out}`).toBe(0);
       expect(r.out).toMatch(/no drift/);
+    },
+    TIMEOUT_MS,
+  );
+});
+
+describe("check-oam-floor runs from a linked checkout", () => {
+  // Node realpaths the main module's URL but not argv[1], so a raw compare of
+  // the two skipped main() through a junction or symlink: no output, exit 0 --
+  // a drifted repo passed in silence.
+  it(
+    "still runs the check when invoked through a junctioned scripts/ directory",
+    () => {
+      const root = fixture({ claude: "The launcher prefers an oam at or above `OAM_MIN` (0.17.1).\n" });
+      const linkParent = mkdtempSync(join(tmpdir(), "fetch-mcp-floor-link-"));
+      dirs.push(linkParent);
+      const link = join(linkParent, "scripts");
+      // "junction" needs no privilege on Windows and is ignored elsewhere.
+      symlinkSync(join(REPO_ROOT, "scripts"), link, "junction");
+      const r = spawnSync(process.execPath, [join(link, "check-oam-floor.mjs"), "--offline", "--root", root], {
+        encoding: "utf8",
+        timeout: 60_000,
+      });
+      const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+      expect(out, "the check must run, not exit 0 in silence").toMatch(/oam floor \(OAM_MIN/);
+      expect(r.status, out).toBe(1);
     },
     TIMEOUT_MS,
   );

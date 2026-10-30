@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { gzipSync } from "node:zlib";
+import { gzipSync, zstdCompressSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 // The server under a REAL oam, through the launcher, with the sandbox on.
@@ -203,7 +203,7 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
         // (4) notifications/cancelled: the cancelled call gets no answer and the
         // server keeps serving. NOT asserted: that the fixture sees the slow
         // connection close. On Node it closes the moment the cancel lands, and
-        // so it does on oam 0.18.0 (measured: within ~50ms of the cancel). On
+        // so it does on oam 0.18.0 and later (measured: within ~50ms of the cancel). On
         // oam 0.16.3 and 0.17.0 an aborted fetch left its socket open (to the
         // response or process exit) -- an oam divergence that fetch-mcp could
         // not fix from here, and the launcher no longer serves on either.
@@ -226,6 +226,65 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
         expect(next.ms).toBeLessThan(3000);
         await new Promise((r) => setTimeout(r, 500));
         expect(slowAnswered).toBe(false);
+      } finally {
+        s.close();
+      }
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "survives a zstd-encoded response and keeps serving",
+    async () => {
+      // On Node, undici 8 decodes `content-encoding: zstd` with
+      // zlib.createZstdDecompress, and a Node without it crashed the server
+      // (NODE_MIN in the launcher). Under oam, `undici` resolves to oam's own
+      // built-in client, not the npm package, so that crash cannot happen
+      // there -- but the body is not decoded either: measured on oam 0.19.0
+      // and 0.19.1, it arrives as the raw zstd frame. NOT asserted, so the lane
+      // does not pin an oam divergence; asserted is that the call answers and
+      // the server keeps serving.
+      const s = await startOnOam({ FETCH_MCP_ALLOW_PRIVATE_HOSTS: "1" });
+      try {
+        const packed = zstdCompressSync(Buffer.from(`zstd-body ${"z".repeat(4096)}`));
+        handler = (req, res) => {
+          if (req.url === "/zstd") {
+            res.setHeader("content-type", "text/plain");
+            res.setHeader("content-encoding", "zstd");
+            res.end(packed);
+          } else res.end("still here");
+        };
+        const out = await s.call("http_get", { url: `${base}/zstd`, allow_private_hosts: true });
+        expect(out.isError, out.text).toBe(false);
+        expect(out.text).toMatch(/^HTTP\/1\.1 200/);
+        const next = await s.call("http_get", { url: `${base}/next`, allow_private_hosts: true });
+        expect(next.text).toContain("still here");
+      } finally {
+        s.close();
+      }
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "resolves a hostname through dns.lookup and refuses one that lands on loopback",
+    async () => {
+      // The SSRF pin (resolveAndPin in src/http.ts) runs only without the
+      // per-call opt-in, and it is the one path that depends on oam's
+      // dns.lookup, which oam 0.18.1 moved onto the system resolver.
+      // `localhost.` passes the hostname check (it is not "localhost"), so only
+      // the resolved address can refuse it.
+      const s = await startOnOam();
+      try {
+        handler = (_req, res) => res.end("SHOULD-NOT-ARRIVE");
+        const port = new URL(base).port;
+        const pinned = await s.call("http_get", { url: `http://localhost.:${port}/` });
+        expect(pinned.isError).toBe(true);
+        expect(pinned.text).toContain("resolves to a private, loopback, link-local or otherwise reserved address");
+        expect(pinned.text).not.toContain("SHOULD-NOT-ARRIVE");
+        const missing = await s.call("http_get", { url: "http://nope.invalid/" });
+        expect(missing.isError).toBe(true);
+        expect(missing.text).toContain('DNS lookup failed for "nope.invalid"');
       } finally {
         s.close();
       }

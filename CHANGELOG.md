@@ -4,6 +4,13 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Changed
+- **The oam floor moves from 0.18.0 to 0.19.1, the latest oam release, so the `fetch-mcp` launcher no longer runs the server on oam 0.18.x or 0.19.0.** Verified on the installed 0.19.1 binary through the launcher with `OAM_BIN` pointing at it and `FETCH_MCP_SANDBOX=1 FETCH_MCP_RUNTIME=oam`: a full MCP handshake listing all 15 tools, an `http_get` against a loopback fixture answering as it does on Node, an `http_get` to `localhost.` refused by the DNS pin, and no `WITHOUT --permission` line. The real-oam lane (`FETCH_MCP_TEST_OAM`) passes on it. With only oam 0.19.0 found, `FETCH_MCP_RUNTIME=oam` now exits with `is oam 0.19.0, older than 0.19.1`, and the default `auto` falls back to Node. Run `oam self-update`.
+
+### Internal
+- The real-oam lane gains two cases: a `content-encoding: zstd` reply (the server answers and keeps serving; under oam, `undici` resolves to oam's built-in client, which hands the zstd frame through undecoded on 0.19.0 and 0.19.1, a divergence the lane documents but does not assert), and the SSRF DNS pin on oam's `dns.lookup` (a `localhost.` hostname refused by its resolved address, an unresolvable host reported as a DNS failure).
+- `scripts/check-oam-floor.mjs` realpaths both `process.argv[1]` and its own module path before deciding it is the main module. Run through a junctioned or symlinked checkout, it skipped the check and exited 0 with no output.
+
 ## [0.8.5] — 2026-10-11
 
 ### Changed
