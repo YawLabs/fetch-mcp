@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-10-30
+
 ### Changed
 - **The oam floor moves from 0.18.0 to 0.19.1, the latest oam release, so the `fetch-mcp` launcher no longer runs the server on oam 0.18.x or 0.19.0.** Verified on the installed 0.19.1 binary through the launcher with `OAM_BIN` pointing at it and `FETCH_MCP_SANDBOX=1 FETCH_MCP_RUNTIME=oam`: a full MCP handshake listing all 15 tools, an `http_get` against a loopback fixture answering as it does on Node, an `http_get` to `localhost.` refused by the DNS pin, and no `WITHOUT --permission` line. The real-oam lane (`FETCH_MCP_TEST_OAM`) passes on it. With only oam 0.19.0 found, `FETCH_MCP_RUNTIME=oam` now exits with `is oam 0.19.0, older than 0.19.1`, and the default `auto` falls back to Node. Run `oam self-update`.
 
