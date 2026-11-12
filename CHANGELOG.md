@@ -4,6 +4,9 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Security
+- **Dependency floors raised past published advisories: `undici` to `^8.12.2` and `zod` to `^4.6.6`.** undici 8.12.2 fixes a TLS certificate-validation bypass when tls options passed to an `Agent` were dropped (GHSA-2m5v-pch6-74hx), a DoS through TLS 1.2 certificate-changing renegotiation (GHSA-qrxm-fqhp-jwvm), an unhandled exception in the decompress interceptor (GHSA-55wc-3pg8-jfw6), unbounded WebSocket PONG buffering (GHSA-9fm3-97px-rjf6) and an SRI bypass (GHSA-f72v-6w45-q472). zod 4.6.6 fixes memory exhaustion while validating oversized constrained collections (GHSA-mrhx-c7xc-m3w5). The lockfile also picks up patched transitive dependencies of `@modelcontextprotocol/sdk` (`hono` 4.13.18, `body-parser` 2.4.0, `fast-uri` 3.1.9, `ip-address` 10.7.6) and of `vitest` (`vite` 8.3.8, dev only). `npm audit` reports 0 vulnerabilities.
+
 ## [0.8.6] — 2026-10-30
 
 ### Changed

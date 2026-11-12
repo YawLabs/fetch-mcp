@@ -86,15 +86,15 @@ async function callTool(server: ReturnType<typeof createFetchServer>, name: stri
 describe("createFetchServer -- the gate at the tool boundary", () => {
   // One http_* tool and one content tool: both reach the network through
   // httpRequest, where the gate lives, so every tool gets it.
-  it.each([
-    "http_get",
-    "fetch_html_to_text",
-  ])("%s refuses allow_private_hosts: true by default (no operator opt-in)", async (tool) => {
-    const out = await callTool(createFetchServer(), tool, { url: fixtureUrl, allow_private_hosts: true });
-    expect(out.isError).toBe(true);
-    expect(out.content[0]!.text).toContain(PRIVATE_HOSTS_DISABLED);
-    expect(out.content[0]!.text).not.toContain("INTERNAL-ONLY");
-  });
+  it.each(["http_get", "fetch_html_to_text"])(
+    "%s refuses allow_private_hosts: true by default (no operator opt-in)",
+    async (tool) => {
+      const out = await callTool(createFetchServer(), tool, { url: fixtureUrl, allow_private_hosts: true });
+      expect(out.isError).toBe(true);
+      expect(out.content[0]!.text).toContain(PRIVATE_HOSTS_DISABLED);
+      expect(out.content[0]!.text).not.toContain("INTERNAL-ONLY");
+    },
+  );
 
   it("honours allow_private_hosts: true when the operator opted in", async () => {
     const out = await callTool(createFetchServer({ allowPrivateHosts: true }), "http_get", {

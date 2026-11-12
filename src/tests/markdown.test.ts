@@ -391,25 +391,28 @@ describe("htmlToMarkdown -- concurrency limit", () => {
     // From the poll phase the next phase is check, before timers: only the
     // handoff's own deadline check stops the grant there.
     ["an I/O callback", (run: () => void) => new Promise<void>((done) => readFile(__filename, () => done(run())))],
-  ])("never grants a slot to a queued call whose deadline passed while the loop was blocked, released from %s (fifth review: 16 queued calls ran up to 3.6 s past budget)", async (_, startIn) => {
-    // The holders convert entirely in microtasks, so their slots come free
-    // before any timer can fire; the queued calls' 5 ms budgets are long gone.
-    let holders: Promise<unknown>[] = [];
-    let queued: Promise<unknown>[] = [];
-    const parses = vi.spyOn(domino, "createIncrementalHTMLParser");
-    await startIn(() => {
-      holders = Array.from({ length: MAX_CONCURRENT_CONVERSIONS }, () => htmlToMarkdown("<p>h</p>"));
-      queued = Array.from({ length: 16 }, () => htmlToMarkdown("<p>late</p>", { budgetMs: 5 }));
-      const t0 = performance.now();
-      while (performance.now() - t0 < 30); // block the loop past every queued deadline
-    });
-    for (const r of await Promise.all(holders)) expect(r).toEqual({ markdown: "h" });
-    for (const r of await Promise.all(queued)) expect(r).toEqual({ error: expect.stringMatching(BUDGET_ERROR) });
-    // Only the holders parsed: an expired call is settled, never run.
-    expect(parses).toHaveBeenCalledTimes(MAX_CONCURRENT_CONVERSIONS);
-    parses.mockRestore();
-    expect(conversionSlots()).toEqual({ active: 0, waiting: 0, chars: 0 });
-  });
+  ])(
+    "never grants a slot to a queued call whose deadline passed while the loop was blocked, released from %s (fifth review: 16 queued calls ran up to 3.6 s past budget)",
+    async (_, startIn) => {
+      // The holders convert entirely in microtasks, so their slots come free
+      // before any timer can fire; the queued calls' 5 ms budgets are long gone.
+      let holders: Promise<unknown>[] = [];
+      let queued: Promise<unknown>[] = [];
+      const parses = vi.spyOn(domino, "createIncrementalHTMLParser");
+      await startIn(() => {
+        holders = Array.from({ length: MAX_CONCURRENT_CONVERSIONS }, () => htmlToMarkdown("<p>h</p>"));
+        queued = Array.from({ length: 16 }, () => htmlToMarkdown("<p>late</p>", { budgetMs: 5 }));
+        const t0 = performance.now();
+        while (performance.now() - t0 < 30); // block the loop past every queued deadline
+      });
+      for (const r of await Promise.all(holders)) expect(r).toEqual({ markdown: "h" });
+      for (const r of await Promise.all(queued)) expect(r).toEqual({ error: expect.stringMatching(BUDGET_ERROR) });
+      // Only the holders parsed: an expired call is settled, never run.
+      expect(parses).toHaveBeenCalledTimes(MAX_CONCURRENT_CONVERSIONS);
+      parses.mockRestore();
+      expect(conversionSlots()).toEqual({ active: 0, waiting: 0, chars: 0 });
+    },
+  );
 
   it("hands a freed slot over on a later event-loop turn, and skips a queued call cancelled meanwhile", async () => {
     const holders = Array.from({ length: MAX_CONCURRENT_CONVERSIONS }, () => htmlToMarkdown("<p>h</p>"));
@@ -565,17 +568,18 @@ describe("htmlToMarkdown -- Turndown phase bounds", () => {
   // Sixth review: the Turndown step is synchronous, so a budget of up to
   // 120 s let one page hold the event loop -- every other call, every
   // cancellation -- for as long as it ran. Times are the previous version's.
-  it.each([
-    1, 3,
-  ])(`refuses 200 nested <blockquote>s around %i MiB of lines at the work cap, well inside MAX_TURNDOWN_MS, on a 120 s budget (was: a 16.6 s stall at 1 MiB, 37 s at 3 MiB)`, async (mib) => {
-    const html = blockquoteLines(mib * 1024 * 1024);
-    const { result, ms, maxGapMs } = await timed(html, 120_000);
-    expect(ms).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
-    expect(maxGapMs).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
-    expect("error" in result && result.error).toMatch(WORK_ERROR);
-    expect("error" in result && result.error).toContain(`${WORK_FACTOR * html.length + WORK_SLACK} characters`);
-    expect("error" in result && result.error).toContain("fetch_html_to_text");
-  });
+  it.each([1, 3])(
+    `refuses 200 nested <blockquote>s around %i MiB of lines at the work cap, well inside MAX_TURNDOWN_MS, on a 120 s budget (was: a 16.6 s stall at 1 MiB, 37 s at 3 MiB)`,
+    async (mib) => {
+      const html = blockquoteLines(mib * 1024 * 1024);
+      const { result, ms, maxGapMs } = await timed(html, 120_000);
+      expect(ms).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+      expect(maxGapMs).toBeLessThan(MAX_TURNDOWN_MS + 1_000);
+      expect("error" in result && result.error).toMatch(WORK_ERROR);
+      expect("error" in result && result.error).toContain(`${WORK_FACTOR * html.length + WORK_SLACK} characters`);
+      expect("error" in result && result.error).toContain("fetch_html_to_text");
+    },
+  );
 
   it("a queued call's deadline and cancellation land within MAX_TURNDOWN_MS of the Turndown step ahead of it (was: a 2 s budget returned at 32 s, a cancel at 3 s at 41 s)", async () => {
     const page = blockquoteLines(3 * 1024 * 1024);
