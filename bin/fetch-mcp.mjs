@@ -112,7 +112,7 @@
  * sandboxed oam served it.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.19.5 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over for a
  * newer oam, or for Node. Below 0.9.0 `child_process.execFile` ran its
  * arguments through a SHELL, `exec` accepted `timeout` and ignored it,
@@ -149,7 +149,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** The latest oam release, and the oldest one used. See MINIMUM OAM VERSION above. */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 19, 5];
 
 /**
  * MINIMUM NODE VERSION. The server's HTTP client is undici 8, whose own floor is
@@ -161,9 +161,9 @@ const OAM_MIN = [0, 19, 1];
  * before it commits (and before any "runs WITHOUT --permission" note, which
  * must never sit above an exit that served nothing). oam is not subject to it:
  * it ships its own runtime, and under oam `undici` resolves to oam's built-in
- * client rather than the npm package (measured on 0.19.0 and 0.19.1: a zstd
- * reply arrives undecoded, and the server keeps serving). Keep in step with
- * package.json `engines.node`.
+ * client rather than the npm package, which decodes a zstd reply as Node does
+ * (measured on 0.19.5; 0.19.0 and 0.19.1 passed it through undecoded). Keep in
+ * step with package.json `engines.node`.
  */
 const NODE_MIN = [22, 19, 0];
 
@@ -406,7 +406,7 @@ function parseRuntimeSetting(value) {
  * not after it. `oam run --permission file.js` is rejected outright, which is a
  * good failure but only because it is loud -- ordering here is load-bearing.
  *
- * Net grants (oam >= 0.19.1, the floor): an entry without a port admits that
+ * Net grants (oam >= 0.19.5, the floor): an entry without a port admits that
  * host on every port, and `host:port` admits that port only -- for fetch,
  * http/https.request, WebSocket and net/tls sockets alike. The bare
  * `--allow-net` below is a policy choice, not a workaround: the URLs are the
@@ -901,7 +901,7 @@ async function refuseOldNodeInProcess(hostOam) {
  */
 async function fallBack(hostOam, why) {
   // "fresh" is the word that makes this line make sense on a host that IS an
-  // oam at the floor: it just said "using this oam 0.19.1 process", and only a
+  // oam at the floor: it just said "using this oam 0.19.5 process", and only a
   // freshly spawned oam can apply a process-level flag.
   const sandboxWhy = `a fresh oam (${OAM_MIN.join(".")} or newer) is needed to apply it and none could be spawned`;
   if (fallbackInProcess(hostOam)) {

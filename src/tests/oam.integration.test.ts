@@ -240,10 +240,10 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
       // zlib.createZstdDecompress, and a Node without it crashed the server
       // (NODE_MIN in the launcher). Under oam, `undici` resolves to oam's own
       // built-in client, not the npm package, so that crash cannot happen
-      // there -- but the body is not decoded either: measured on oam 0.19.0
-      // and 0.19.1, it arrives as the raw zstd frame. NOT asserted, so the lane
-      // does not pin an oam divergence; asserted is that the call answers and
-      // the server keeps serving.
+      // there. oam 0.19.0 and 0.19.1 passed the body through as the raw zstd
+      // frame; since 0.19.5, the launcher's floor, it is decoded as on Node,
+      // and the lane asserts that, the answer, and that the server keeps
+      // serving.
       const s = await startOnOam({ FETCH_MCP_ALLOW_PRIVATE_HOSTS: "1" });
       try {
         const packed = zstdCompressSync(Buffer.from(`zstd-body ${"z".repeat(4096)}`));
@@ -257,6 +257,7 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
         const out = await s.call("http_get", { url: `${base}/zstd`, allow_private_hosts: true });
         expect(out.isError, out.text).toBe(false);
         expect(out.text).toMatch(/^HTTP\/1\.1 200/);
+        expect(out.text).toContain("zstd-body zzzz");
         const next = await s.call("http_get", { url: `${base}/next`, allow_private_hosts: true });
         expect(next.text).toContain("still here");
       } finally {
