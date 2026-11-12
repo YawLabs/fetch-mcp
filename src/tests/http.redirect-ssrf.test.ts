@@ -213,19 +213,18 @@ describe("redirect SSRF -- a redirect to a non-http(s) scheme or localhost is re
     expect(seen).toEqual(["http://1.2.3.4/"]);
   });
 
-  it.each([
-    "http://localhost/",
-    "http://localhost:3000/admin",
-    "http://foo.localhost/",
-  ])("public literal -> 302 -> %s is refused by name, before any DNS lookup", async (target) => {
-    const seen = mockRedirectChain({ "http://1.2.3.4/": target });
-    const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/" });
+  it.each(["http://localhost/", "http://localhost:3000/admin", "http://foo.localhost/"])(
+    "public literal -> 302 -> %s is refused by name, before any DNS lookup",
+    async (target) => {
+      const seen = mockRedirectChain({ "http://1.2.3.4/": target });
+      const res = await httpRequest({ method: "GET", url: "http://1.2.3.4/" });
 
-    expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/resolves to loopback/);
-    expect(seen).toEqual(["http://1.2.3.4/"]);
-    expect(lookupMock).not.toHaveBeenCalled();
-  });
+      expect(res.ok).toBe(false);
+      expect(res.error).toMatch(/resolves to loopback/);
+      expect(seen).toEqual(["http://1.2.3.4/"]);
+      expect(lookupMock).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("redirect SSRF -- legitimate redirects still follow (the fix does not over-block)", () => {
