@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-11-11
+
 ### Changed
 - **The oam floor moves from 0.19.1 to 0.19.5, the latest oam release, so the `fetch-mcp` launcher no longer runs the server on oam 0.19.1-0.19.4.** Verified on oam 0.19.5 with the real-oam lane (`FETCH_MCP_TEST_OAM`). On 0.19.5, a `content-encoding: zstd` reply is now decoded as it is on Node; 0.19.0 and 0.19.1 handed the raw frame through. The lane now asserts the decoded body. Run `oam self-update`.
 
