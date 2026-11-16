@@ -5,6 +5,7 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 ## [Unreleased]
 
 ### Internal
+- The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs` (`npm run check:yaw-mcp-floor`, and `src/tests/yaw-mcp-floor.test.ts` on every `npm test`) fails on drift between `YAW_MCP_MIN` 1.1.13, the README's "Yaw MCP 1.1.13 or newer" and the `@yawlabs/mcp-compliance` devDependency (`^0.20.4`, the range Yaw MCP 1.1.13 pins), and warns without failing when a newer @yawlabs/mcp is published. Release tooling and docs only.
 - `src/tests/markdown.test.ts` no longer fails on a busy machine. The tests whose work has to finish inside a limit (the "quickly" bounds, the node-budget, output-cap and work-cap refusals, the `MAX_TURNDOWN_MS` step tests) now run on the test thread's CPU clock, through a plain function installed over `performance.now()` that re-reads the thread's CPU time at most once every 0.5 ms (a `vi.spyOn` wrapper roughly doubled the CPU time and was dropped); `performance.now()` is what both `htmlToMarkdown()` and the tests' stopwatches read: under CPU load the wall clock ran a budget or the 4 s step cap out before the refusal under test, failing 1-5 tests a run and one `release.sh` run. No limit changed and `src/` is untouched. Those tests get a 60 s wall-clock timeout, and the cancellation test aborts from the third timer tick instead of after 100 ms.
 
 ## [0.8.8] — 2026-11-15

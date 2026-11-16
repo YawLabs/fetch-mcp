@@ -33,6 +33,7 @@
     "lint:fix": "node scripts/lint.mjs check --write src/",
     "typecheck": "tsc --noEmit",
     "test:ci": "npm run build && npm test",
+    "check:yaw-mcp-floor": "node scripts/check-yaw-mcp-floor.mjs",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js"
   },
