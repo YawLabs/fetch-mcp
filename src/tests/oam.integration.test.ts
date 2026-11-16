@@ -241,7 +241,7 @@ describe.skipIf(!available)("on a real oam, sandboxed (FETCH_MCP_TEST_OAM)", () 
       // (NODE_MIN in the launcher). Under oam, `undici` resolves to oam's own
       // built-in client, not the npm package, so that crash cannot happen
       // there. oam 0.19.0 and 0.19.1 passed the body through as the raw zstd
-      // frame; since 0.19.5, the launcher's floor, it is decoded as on Node,
+      // frame; since 0.19.5 it is decoded as on Node (so too on 0.20.2, the floor),
       // and the lane asserts that, the answer, and that the server keeps
       // serving.
       const s = await startOnOam({ FETCH_MCP_ALLOW_PRIVATE_HOSTS: "1" });
