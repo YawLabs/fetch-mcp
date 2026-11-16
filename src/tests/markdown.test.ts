@@ -99,19 +99,38 @@ async function timed(html: string, budgetMs: number) {
  * budget stops them stay on the wall clock, where that takes the same time
  * however busy the machine is. The CPU clock moves in scheduler ticks
  * (15.6 ms on Windows).
+ *
+ * The clock itself has to be cheap: the conversion reads it at every node. As
+ * a vi.spyOn() mock that asked the OS for the CPU time on every read, it about
+ * doubled the CPU time of the node-heavy pages (the spy also records every
+ * call), and 150,000 blank elements then needed 0.8-1.5 s of a 1 s budget. So
+ * it is a plain function installed over performance.now(), and it asks the OS
+ * again only once the real clock has moved CPU_SAMPLE_MS: a thread's CPU time
+ * never advances faster than real time, so a reused reading is at most that stale.
  */
+const CPU_SAMPLE_MS = 0.5;
 function useCpuClock(): void {
   // Node 22.19, the floor, may predate threadCpuUsage(); the process's CPU time is the next best.
   const usage = (process.threadCpuUsage ?? process.cpuUsage).bind(process);
+  const wallNow = performance.now.bind(performance);
+  let sampledAt = Number.NEGATIVE_INFINITY;
+  let cpuMs = 0;
   const cpuNow = () => {
-    const { user, system } = usage();
-    return (user + system) / 1_000;
+    const wall = wallNow();
+    if (wall - sampledAt >= CPU_SAMPLE_MS) {
+      const { user, system } = usage();
+      cpuMs = (user + system) / 1_000;
+      sampledAt = wall;
+    }
+    return cpuMs;
   };
-  let clock: { mockRestore(): void } | undefined;
+  // An own property shadows Performance.prototype.now; deleting it restores the real clock.
   beforeEach(() => {
-    clock = vi.spyOn(performance, "now").mockImplementation(cpuNow);
+    Object.defineProperty(performance, "now", { value: cpuNow, configurable: true, writable: true });
   });
-  afterEach(() => clock?.mockRestore());
+  afterEach(() => {
+    Reflect.deleteProperty(performance, "now");
+  });
 }
 
 /**
@@ -583,8 +602,12 @@ describe("htmlToMarkdown -- Turndown phase bounds", CPU_CLOCKED, () => {
   // re-read textContent per node (O(depth x nodes)), checked the deadline only
   // every 256th node, and let blockquote/list nesting rewrite the whole content
   // at every level. Times in these comments are that version's, on Node 22.
-  it("converts 150,000 blank elements under 250 <div>s in O(1) per node (was: 3.7 s, a 3.5 s stall, on a 1 s budget)", async () => {
-    const html = `${"<div>".repeat(250)}${"<i></i>".repeat(149_796)}`;
+  it("converts 60,000 blank elements under 250 <div>s in O(1) per node (was: 3.7 s, a 3.5 s stall, for 150,000 on a 1 s budget)", async () => {
+    // 60,000, not the review's 150,000: those take 0.5-0.85 s of this thread's
+    // CPU time, too close to the 1 s budget to tell a slow run from a
+    // regression. 60,000 take 0.27-0.41 s (5-7 us a node); at the old 25 us a
+    // node (3.7 s for 150,000) they would take 1.5 s and still not fit.
+    const html = `${"<div>".repeat(250)}${"<i></i>".repeat(60_000)}`;
     const { result, ms, maxGapMs } = await timed(html, 1_000);
     expect(ms).toBeLessThan(1_000 + 1_000);
     expect(maxGapMs).toBeLessThan(1_000 + 1_000);
@@ -669,12 +692,15 @@ describe("htmlToMarkdown -- Turndown phase bounds", CPU_CLOCKED, () => {
 
   // Seventh review: two admitted conversions whose parses finished together
   // ran their synchronous steps back to back, so the stall was the sum (two
-  // of these pages: 3.2-4.4 s, vs 1.5-2.2 s alone; a 100 ms abort timer fired
-  // at 4.1 s, after the call it was meant to cancel had converted).
+  // 6 MiB pages of this shape: 3.2-4.4 s, vs 1.5-2.2 s alone; a 100 ms abort
+  // timer fired at 4.1 s, after the call it was meant to cancel had converted).
+  // The pages here are 4 MiB: a 6 MiB step takes 1.7-2.0 s of this thread's
+  // CPU time, half of MAX_TURNDOWN_MS, and a step stopped at that cap ends in
+  // another error. A 4 MiB step takes 1.1-1.4 s and meets the same output cap.
   describe("one synchronous step per event-loop turn", () => {
-    const sixMiB = 6 * 1024 * 1024;
+    const fourMiB = 4 * 1024 * 1024;
     const preHead = `${"<blockquote>".repeat(20)}<pre>`;
-    const prePage = preHead + "aaa\n".repeat(Math.floor((sixMiB - preHead.length) / 4));
+    const prePage = preHead + "aaa\n".repeat(Math.floor((fourMiB - preHead.length) / 4));
 
     /** Runs the calls together, recording the longest timer gap and how many timer ticks fell between settles. */
     async function together(calls: Array<() => Promise<{ markdown: string } | { error: string }>>) {
@@ -698,7 +724,7 @@ describe("htmlToMarkdown -- Turndown phase bounds", CPU_CLOCKED, () => {
       }
     }
 
-    it("runs two coincident 6 MiB steps on separate turns: the stall is one step's, not the sum", async () => {
+    it("runs two coincident 4 MiB steps on separate turns: the stall is one step's, not the sum", async () => {
       expect(2 * prePage.length).toBeLessThanOrEqual(MAX_INPUT_IN_FLIGHT); // both admitted at once
       const { settled, maxGapMs } = await together([
         () => htmlToMarkdown(prePage, { budgetMs: 120_000 }),
