@@ -4,6 +4,8 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-11-15
+
 ### Changed
 - **The oam floor moves from 0.19.5 to 0.20.2, the latest oam release, so the `fetch-mcp` launcher no longer runs the server on oam 0.19.5-0.20.1.** Verified on oam 0.20.2: a full MCP handshake listing all 15 tools through the launcher with `FETCH_MCP_RUNTIME=oam` (with and without `FETCH_MCP_SANDBOX=1`) and with the launcher itself hosted by `oam run`, plus the real-oam lane (`FETCH_MCP_TEST_OAM`), which still gets a `content-encoding: zstd` reply decoded as on Node. A port-scoped `--allow-net=host:port` grant was re-measured on 0.20.2 as admitting that port only. Run `oam self-update`.
 - `@modelcontextprotocol/sdk` moves to `^1.32.2`, the range Yaw MCP 1.1.13 pins; `@yawlabs/mcp-compliance` was already on its `^0.20.4` line.
