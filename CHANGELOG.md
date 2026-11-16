@@ -4,6 +4,9 @@ All notable changes to `@yawlabs/fetch-mcp` are documented here. This project us
 
 ## [Unreleased]
 
+### Internal
+- `src/tests/markdown.test.ts` no longer fails on a busy machine. The tests whose work has to finish inside a limit (the "quickly" bounds, the node-budget, output-cap and work-cap refusals, the `MAX_TURNDOWN_MS` step tests) now run on the test thread's CPU clock, by spying on `performance.now()`, which both `htmlToMarkdown()` and the tests' stopwatches read: under CPU load the wall clock ran a budget or the 4 s step cap out before the refusal under test, failing 1-5 tests a run and one `release.sh` run. No limit changed and `src/` is untouched. Those tests get a 60 s wall-clock timeout, and the cancellation test aborts from the third timer tick instead of after 100 ms.
+
 ## [0.8.8] — 2026-11-15
 
 ### Changed

@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import domino, { type DomElement } from "@mixmark-io/domino";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CANCELLED } from "../http.js";
 import {
   ATTRS_PER_NODE,
@@ -86,6 +86,40 @@ async function timed(html: string, budgetMs: number) {
     clearInterval(timer);
   }
 }
+
+/**
+ * Runs every test of the enclosing describe on this thread's CPU clock: the
+ * code under test and the tests' own stopwatches both read performance.now(),
+ * so budgets, deadlines, MAX_TURNDOWN_MS and the measured times all count the
+ * milliseconds this thread actually ran. Fixed work costs the same CPU time on
+ * a busy machine; on the wall clock it took several times longer there, so a budget or
+ * the step cap fired before the refusal under test, and "quickly" was not.
+ * The limits keep their values and timers still fire in real time. Only for
+ * tests whose work must finish inside a limit; the ones that run until a
+ * budget stops them stay on the wall clock, where that takes the same time
+ * however busy the machine is. The CPU clock moves in scheduler ticks
+ * (15.6 ms on Windows).
+ */
+function useCpuClock(): void {
+  // Node 22.19, the floor, may predate threadCpuUsage(); the process's CPU time is the next best.
+  const usage = (process.threadCpuUsage ?? process.cpuUsage).bind(process);
+  const cpuNow = () => {
+    const { user, system } = usage();
+    return (user + system) / 1_000;
+  };
+  let clock: { mockRestore(): void } | undefined;
+  beforeEach(() => {
+    clock = vi.spyOn(performance, "now").mockImplementation(cpuNow);
+  });
+  afterEach(() => clock?.mockRestore());
+}
+
+/**
+ * Options for a describe that calls useCpuClock(): its assertions no longer
+ * depend on how busy the machine is, so the wall-clock test timeout only has
+ * to catch a hang (two 6 MiB conversions took 24 s of wall time beside 12 busy threads).
+ */
+const CPU_CLOCKED = { timeout: 60_000 };
 
 const parseRoot = (html: string) =>
   domino.createDocument(`<x-turndown id="turndown-root">${html}</x-turndown>`).getElementById("turndown-root")!;
@@ -234,7 +268,9 @@ describe("htmlToMarkdown -- output (unchanged from npm turndown)", () => {
   });
 });
 
-describe("htmlToMarkdown -- linear on large pages", () => {
+describe("htmlToMarkdown -- linear on large pages", CPU_CLOCKED, () => {
+  useCpuClock();
+
   it("converts a flat 2 MiB article quickly (old: 8.4 s, on 2 MiB of a denser unit the node budget now refuses)", async () => {
     // 9 nodes and an attribute per 100 characters: about 195,000 of the 250,000 nodes allowed.
     const unit = "<p>hello <b>world</b> and <a href='/x'>link</a>, then a run of plain words to read on with</p>\n";
@@ -282,7 +318,9 @@ describe("htmlToMarkdown -- nesting depth", () => {
   });
 });
 
-describe("htmlToMarkdown -- node budget", () => {
+describe("htmlToMarkdown -- node budget", CPU_CLOCKED, () => {
+  useCpuClock();
+
   it("stops a page whose parse amplifies its size (old: exhausted a 4 GB heap)", async () => {
     let html = "";
     for (let i = 0; i < 2500; i++) html += `<b id=${i}><p>x`;
@@ -448,7 +486,9 @@ describe("htmlToMarkdown -- concurrency limit", () => {
   });
 });
 
-describe("htmlToMarkdown -- input ceiling", () => {
+describe("htmlToMarkdown -- input ceiling", CPU_CLOCKED, () => {
+  useCpuClock();
+
   it(`refuses a page over ${MAX_MARKDOWN_INPUT} characters before building anything (fifth review: 100 MiB took 1.5-3 GB, 8 calls OOM-crashed Node)`, async () => {
     const t0 = performance.now();
     const r = await htmlToMarkdown(`<p>${"*_".repeat(MAX_MARKDOWN_INPUT / 2)}</p>`);
@@ -483,20 +523,29 @@ describe("htmlToMarkdown -- deadline and cancellation", () => {
     expect(e).toMatch(BUDGET_ERROR);
   });
 
-  it("stops on the caller's signal, and keeps the event loop running while it parses", async () => {
-    const cancel = new AbortController();
-    let ticks = 0;
-    const timer = setInterval(() => ticks++, 10);
-    setTimeout(() => cancel.abort(), 100);
-    const t0 = performance.now();
-    try {
-      const e = await err("<ul><li>".repeat(20_000), { signal: cancel.signal });
-      expect(e).toBe(CANCELLED);
-      expect(performance.now() - t0).toBeLessThan(1_000);
-      expect(ticks).toBeGreaterThanOrEqual(3);
-    } finally {
-      clearInterval(timer);
-    }
+  describe("while it parses", CPU_CLOCKED, () => {
+    useCpuClock();
+
+    it("stops on the caller's signal, and keeps the event loop running while it parses", async () => {
+      // Cancelled from the third tick of a 10 ms timer, not after 100 ms: a busy
+      // machine gave the parse too few turns in 100 ms for three ticks. A parse
+      // that held the loop would never be cancelled, and run to its budget.
+      const cancel = new AbortController();
+      let ticks = 0;
+      const timer = setInterval(() => {
+        if (++ticks === 3) cancel.abort();
+      }, 10);
+      const t0 = performance.now();
+      try {
+        const e = await err("<ul><li>".repeat(20_000), { signal: cancel.signal });
+        expect(e).toBe(CANCELLED);
+        // Three turns of the loop and the stop, within 200 ms of this thread's time.
+        expect(performance.now() - t0).toBeLessThan(200);
+        expect(ticks).toBeGreaterThanOrEqual(3);
+      } finally {
+        clearInterval(timer);
+      }
+    });
   });
 
   it("returns at once when the signal is already aborted", async () => {
@@ -527,7 +576,9 @@ describe("htmlToMarkdown -- deadline and cancellation", () => {
   });
 });
 
-describe("htmlToMarkdown -- Turndown phase bounds", () => {
+describe("htmlToMarkdown -- Turndown phase bounds", CPU_CLOCKED, () => {
+  useCpuClock();
+
   // Found in review of the first bounded version: its Turndown phase still
   // re-read textContent per node (O(depth x nodes)), checked the deadline only
   // every 256th node, and let blockquote/list nesting rewrite the whole content
@@ -882,7 +933,9 @@ describe("htmlToMarkdown -- Turndown phase bounds", () => {
   });
 });
 
-describe("htmlToMarkdown -- whitespace nesting is linear in time and heap (patch k)", () => {
+describe("htmlToMarkdown -- whitespace nesting is linear in time and heap (patch k)", CPU_CLOCKED, () => {
+  useCpuClock();
+
   // Found in the third review: a blank element still converted its whole
   // subtree and trimmed the result, both discarded, and the per-node
   // whitespace runs (ropes shared with every ancestor's) were flattened in
